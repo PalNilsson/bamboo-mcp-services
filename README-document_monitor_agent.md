@@ -118,9 +118,20 @@ class DummyEmbedder:
 
 This agent depends on ML libraries (`sentence-transformers`, `torch`, `numpy`, etc.) that contain compiled native extensions and can cause dependency conflicts when installed with pip alone. **Conda is strongly recommended** as it distributes pre-compiled, mutually compatible binaries.
 
-### Apple Silicon (M1/M2/M3)
+### Installing Miniforge
 
-Install [Miniforge](https://github.com/conda-forge/miniforge), then:
+Miniforge is the recommended conda distribution. Do **not** use `brew install conda` — it installs a bare-bones version that won't set up your shell correctly.
+
+Instead, install the Miniforge cask and initialise your shell:
+
+```bash
+brew install --cask miniforge
+conda init zsh   # or 'conda init bash' if you use bash
+```
+
+Then restart your terminal. Alternatively, download the installer directly from [github.com/conda-forge/miniforge](https://github.com/conda-forge/miniforge).
+
+### Apple Silicon (M1/M2/M3)
 
 ```bash
 conda create -n askpanda python=3.10 -y
