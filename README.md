@@ -2,79 +2,91 @@
 
 **AskPanDA-ATLAS Agents** is a collection of cooperative, Python-based agents that power the *AskPanDA-ATLAS* plugin for the **Bamboo Toolkit**, supporting the ATLAS Experiment.
 
-> ⚠️ **Status note**
-> This repository is a **preliminary architectural plan** and scaffolding for later development.
-> Interfaces, agents, and repository layout are intentionally designed to be stable, but implementations will evolve.
+> ⚠️ **Early development**
+> This repository is a preliminary architectural plan with initial scaffolding. Only the `document-monitor-agent` is currently ready for use. Other agents are in active development or planned.
 
 ---
 
-## Goals
+## Current status
 
-- Provide a modular, testable, and pip-installable agent system for AskPanDA.
-- Separate responsibilities across focused agents (metadata, DAST, indexing, metrics, etc.).
-- Share common tooling (storage, embeddings, email parsing, metrics).
-- Integrate cleanly with the Bamboo Toolkit via a plugin adapter.
-- Support both lightweight local deployments and service-based execution.
-
----
-
-## Agents Overview
-
-### `ingestion-agent` (in development)
-- Periodically fetches ATLAS queue/site metadata.
-- Normalizes and loads data into **DuckDB** for fast local queries.
-- Optionally pulls BigPanDA task/job metadata snapshots for debugging or analytics.
-
-### `document-monitor-agent` (in development)
-
-Directory-watching agent that ingests files into ChromaDB.
-
-Documentation: [document_monitor_agent](./README-document_monitor_agent.md)
-
-- Watches a directory for new or changed documents
-- Extracts and chunks text
-- Computes deterministic chunk IDs
-- Embeds chunks
-- Stores vectors + metadata in a local ChromaDB collection.
-
-### `dast-agent` (planned)
-- Extracts DAST help-list email threads (e.g., via Outlook).
-- Converts threads into structured JSON.
-- Runs a daily *digest* pass producing:
-  - Cleaned Q/A pairs
-  - Thread summary
-  - Tags
-  - Resolution status
-- Feeds RAG corpora and optional fine-tuning datasets.
-
-### `supervisor-agent` (planned)
-- Acts as a control plane.
-- Ensures required agents/services are running.
-- Restarts agents on failure.
-- Enforces schedules.
-- Provides a single entry point to bring up the full system.
-
-### `index-builder-agent` (planned - or replace with document monitor agent)
-- Builds embedding indices for plugin corpora.
-- Sources include DAST digests, documentation, and curated knowledge.
-- Supports pluggable vector stores (e.g., ChromaDB).
-
-### `feedback-agent` (planned)
-- Captures user feedback from AskPanDA (e.g., *helpful / not helpful*).
-- Stores feedback in structured form for later analysis.
-
-### `metrics-agent` (planned)
-- Collects structured metrics from Bamboo and agents:
-  - Latency
-  - Tool usage
-  - Failures
-- Exports metrics to JSON and optionally Grafana / Prometheus-compatible backends.
+| Agent | Status |
+|---|---|
+| `document-monitor-agent` | ✅ Ready |
+| `ingestion-agent` | 🔧 In development |
+| `dast-agent` | 📋 Planned |
+| `supervisor-agent` | 📋 Planned |
+| `index-builder-agent` | 📋 Planned |
+| `feedback-agent` | 📋 Planned |
+| `metrics-agent` | 📋 Planned |
 
 ---
 
-## Minimal Agent Lifecycle Interface
+## Getting started
 
-All agents follow a **minimal, consistent lifecycle interface** to simplify supervision, testing, and orchestration.
+### Install
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
+```
+
+For development (includes pytest, flake8, pylint):
+
+```bash
+pip install -e ".[dev]"
+```
+
+> The project uses a `src/` layout, so the package must be installed before running tests or tools.
+
+### Run the document monitor agent
+
+```bash
+askpanda-document-monitor-agent --dir ./documents --poll-interval 10 --chroma-dir .chromadb
+```
+
+Full documentation: [README-document_monitor_agent.md](./README-document_monitor_agent.md)
+
+---
+
+## Agents
+
+### `document-monitor-agent` ✅ Ready
+
+Watches a directory for new or changed documents and ingests them into ChromaDB for use in RAG pipelines. Extracts and chunks text from `.pdf`, `.docx`, `.txt`, and `.md` files, computes deterministic chunk IDs, and stores vectors and metadata locally.
+
+→ [Full documentation](./README-document_monitor_agent.md)
+
+### `ingestion-agent` 🔧 In development
+
+Periodically fetches ATLAS queue and site metadata, normalises it, and loads it into DuckDB for fast local queries. Will optionally pull BigPanDA task/job metadata snapshots for debugging and analytics.
+
+### `dast-agent` 📋 Planned
+
+Will extract DAST help-list email threads (e.g. via Outlook), convert them into structured JSON, and run a daily digest pass producing cleaned Q/A pairs, thread summaries, tags, and resolution status. Output feeds RAG corpora and optional fine-tuning datasets.
+
+### `supervisor-agent` 📋 Planned
+
+Will act as a control plane — ensuring required agents and services are running, restarting agents on failure, enforcing schedules, and providing a single entry point to bring up the full system.
+
+### `index-builder-agent` 📋 Planned
+
+Will build embedding indices for plugin corpora from sources including DAST digests, documentation, and curated knowledge. May be superseded by the `document-monitor-agent`.
+
+### `feedback-agent` 📋 Planned
+
+Will capture user feedback from AskPanDA (e.g. *helpful / not helpful*) and store it in structured form for later analysis.
+
+### `metrics-agent` 📋 Planned
+
+Will collect structured metrics from Bamboo and agents (latency, tool usage, failures) and export them to JSON and optionally Grafana/Prometheus-compatible backends.
+
+---
+
+## Agent lifecycle interface
+
+All agents follow a minimal, consistent lifecycle interface to simplify supervision, testing, and orchestration:
 
 ```python
 class Agent:
@@ -91,22 +103,28 @@ class Agent:
         """Gracefully release resources and shut down."""
 ```
 
-- **Long-running agents** typically run a scheduler loop calling `tick()`.
-- **Batch agents** may run `start() → tick() → stop()` once.
-- The `supervisor-agent` interacts only through this interface.
+Long-running agents run a scheduler loop calling `tick()`. Batch agents may run `start() → tick() → stop()` once. The `supervisor-agent` will interact only through this interface.
+
+A minimal no-op `dummy-agent` is included as a template and for validating the lifecycle:
+
+```bash
+askpanda-dummy-agent --tick-interval 1.0
+```
+
+Stop with Ctrl+C or SIGTERM. When adding a new agent, register its entry point in `pyproject.toml` under `[project.scripts]`.
 
 ---
 
-## Repository Layout
+## Repository layout
 
-```text
+```
 askpanda-atlas-agents/
 ├─ README.md
 ├─ pyproject.toml
 ├─ src/
 │  └─ askpanda_atlas_agents/
 │     ├─ common/                # shared utilities (storage, panda, email, metrics)
-│     ├─ agents/                # individual agents
+│     ├─ agents/
 │     │  ├─ ingestion_agent/
 │     │  ├─ dast_agent/
 │     │  ├─ supervisor_agent/
@@ -115,17 +133,14 @@ askpanda-atlas-agents/
 │     │  └─ metrics_agent/
 │     ├─ plugin/                # Bamboo / AskPanDA plugin adapter
 │     └─ resources/             # default configs and schemas
-│
 ├─ tests/
 │  ├─ common/
 │  ├─ agents/
 │  └─ plugin/
-│
 ├─ deployments/
 │  ├─ docker/
 │  ├─ systemd/
 │  └─ k8s/
-│
 └─ .github/
    └─ workflows/
       └─ ci.yml
@@ -133,101 +148,24 @@ askpanda-atlas-agents/
 
 ---
 
-## Shared Tooling
+## Shared tooling
 
-Agents may rely on shared components located under `common/`, including:
+Agents draw on shared components in `common/`:
 
-- **Storage**
-  - DuckDB
-  - SQLite
-  - Filesystem helpers
-- **Vector stores**
-  - ChromaDB
-  - Embedding adapters
-- **PanDA / BigPanDA**
-  - Metadata fetching
-  - Snapshot downloads
-- **Email**
-  - Local Microsoft Outlook access
-  - Thread reconstruction and parsing
-- **Metrics**
-  - Structured event schemas
-  - JSON and Grafana-compatible exporters
+- **Storage** — DuckDB, SQLite, filesystem helpers
+- **Vector stores** — ChromaDB, embedding adapters
+- **PanDA / BigPanDA** — metadata fetching, snapshot downloads
+- **Email** — local Microsoft Outlook access, thread reconstruction and parsing
+- **Metrics** — structured event schemas, JSON and Grafana-compatible exporters
 
 ---
 
-## Packaging & Installation
-
-- The repository builds a single Python package:
-  **`askpanda-atlas-agents`**
-- Each agent provides a CLI entry point (e.g. `askpanda-ingestion-agent`).
-- Optional dependencies are exposed via extras (e.g. `.[email]`, `.[vector]`).
-
----
-
-## Requirements
-
-The project now provides a `requirements.txt` file for convenience.
-
-### Install runtime dependencies
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-### Install in editable mode (recommended for development)
-
-```bash
-pip install -e .
-```
-
-## Development & Testing
-
-This project uses a **`src/` layout**, so the package must be installed before running tests or tools.
-
-### Local development setup
-
-From the repository root:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install -e ".[dev]"
-```
-
-This installs the package in **editable mode** and pulls in development dependencies
-(pytest, flake8, pylint, etc.).
-
-## Dummy Agent (template)
-
-A minimal no-op agent is included as a template and for validating the agent lifecycle and supervisor integration.
-
-- Package: `askpanda_atlas_agents.agents.dummy_agent`
-- CLI: `askpanda-dummy-agent`
-
-Run it locally:
-
-```bash
-python3 -m pip install -e ".[dev]"
-askpanda-dummy-agent --tick-interval 1.0
-```
-Stop with Ctrl+C (SIGINT) or by sending SIGTERM.
-
-When a new agent is added, remember to make an entry in pyproject.toml under [project.scripts].
+## Development
 
 ### Running tests
 
-Run the full unit test suite:
-
 ```bash
 pytest
-```
-
-Run tests with coverage:
-
-```bash
 pytest --cov=askpanda_atlas_agents --cov-report=term-missing
 ```
 
@@ -240,62 +178,24 @@ pylint src/askpanda_atlas_agents
 
 ### Common pitfalls
 
-- **`ModuleNotFoundError: askpanda_atlas_agents`**
-  - Ensure you ran:
-    ```bash
-    pip install -e .
-    ```
-  - Ensure you are in the repository root (where `pyproject.toml` lives).
+**`ModuleNotFoundError: askpanda_atlas_agents`** — run `pip install -e .` from the repository root (where `pyproject.toml` lives).
 
-- **Editable install fails**
-  - Confirm the directory `src/askpanda_atlas_agents/` exists and contains
-    an `__init__.py` file.
-
-### Why editable installs?
-
-Editable installs (`pip install -e .`) are required because:
-- the project uses a `src/` layout,
-- agents are developed incrementally,
-- tests must import the package exactly as it will be installed in production.
-
+**Editable install fails** — confirm that `src/askpanda_atlas_agents/` exists and contains an `__init__.py`.
 
 ---
 
-## Continuous Integration
+## Continuous integration
 
-GitHub Actions are used for:
-
-- **Linting**
-  - `pylint`
-  - `flake8`
-- **Unit tests**
-  - `pytest`
-- All agents and shared tools must have corresponding unit tests.
+GitHub Actions runs linting (`pylint`, `flake8`) and the full unit test suite (`pytest`) on every push. All agents and shared tools must have corresponding unit tests.
 
 ---
 
 ## Relationship to Bamboo
 
-The `plugin/` package provides the integration layer between:
-- AskPanDA-ATLAS Agents
-- The Bamboo Toolkit
-
-This keeps agent logic independent of the UI or orchestration toolkit.
+The `plugin/` package provides the integration layer between AskPanDA-ATLAS Agents and the Bamboo Toolkit, keeping agent logic independent of the UI and orchestration layer.
 
 ---
 
-## Next Steps (Planned)
+## Contributing
 
-- Implement the supervisor loop.
-- Add concrete metadata normalization and DuckDB schemas.
-- Prototype DAST email digestion on a limited dataset.
-- Define stable plugin contracts with Bamboo.
-
----
-
-## Disclaimer
-
-This repository currently represents an **architectural blueprint** and initial scaffolding.
-It is intended to guide development and review before full implementation.
-
-Contributions and design feedback are welcome.
+Design feedback and contributions are welcome. This repository currently represents an architectural blueprint guiding development — interfaces are intended to be stable, but implementations will evolve.
