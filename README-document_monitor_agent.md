@@ -36,25 +36,55 @@ This prevents stale vectors from being retrieved by RAG and reduces hallucinatio
 
 ---
 
-## Installation
+## Installation & setup
 
-Add the following to `requirements.txt`:
+Follow these steps in order. The `askpanda-document-monitor-agent` command will not be available until all steps are complete.
 
-```
-chromadb>=0.4.0
-sentence-transformers>=2.2.2
-pdfminer.six>=20221105
-python-docx>=0.8.11
-```
+### Step 1 — Install Miniforge
 
-Then install:
+Miniforge is the recommended conda distribution. Do **not** use `brew install conda` — it installs a bare-bones version that won't set up your shell correctly.
 
 ```bash
-pip install -r requirements.txt
-pip install -e .
+brew install --cask miniforge
+conda init zsh   # or 'conda init bash' if you use bash
 ```
 
-> **Note:** Conda is strongly recommended over pip for this agent. See [Environment Setup](#environment-setup) below.
+Restart your terminal after running `conda init`. Alternatively, download the installer directly from [github.com/conda-forge/miniforge](https://github.com/conda-forge/miniforge).
+
+### Step 2 — Create the conda environment
+
+> Use Python 3.12 or earlier. Python 3.13+ is not yet reliably supported by ML libraries such as PyTorch and sentence-transformers.
+
+**Apple Silicon:**
+```bash
+conda create -n askpanda python=3.12 -y
+conda activate askpanda
+conda install -c conda-forge -c pytorch pytorch cpuonly -y
+```
+
+**Intel macOS:**
+```bash
+conda create -n askpanda python=3.12 -y
+conda activate askpanda
+conda install -c pytorch -c conda-forge pytorch -y
+```
+
+PyTorch is installed via conda because it provides pre-compiled binaries tested for your platform, avoiding ABI and architecture issues. The remaining packages are installed with pip because they are not well-maintained on conda channels, but install cleanly once PyTorch is in place.
+
+### Step 3 — Install remaining dependencies
+
+```bash
+pip install sentence-transformers langchain langchain-community chromadb pdfminer.six python-docx
+pip install -r requirements.txt
+```
+
+### Step 4 — Install the package
+
+This registers the `askpanda-document-monitor-agent` CLI command:
+
+```bash
+pip install -e .
+```
 
 ---
 
@@ -68,6 +98,30 @@ Or via module:
 
 ```bash
 python -m askpanda_atlas_agents.agents.document_monitor_agent.cli --dir ./documents
+```
+
+---
+
+## Starting a new session
+
+Once set up, you only need to activate the environment at the start of each session:
+
+```bash
+conda activate askpanda
+```
+
+To verify everything is in order:
+
+```bash
+conda info
+python --version
+```
+
+If a virtualenv is currently active, deactivate it first — only one environment manager should be active at a time:
+
+```bash
+deactivate
+conda activate askpanda
 ```
 
 ---
@@ -111,70 +165,3 @@ class DummyEmbedder:
     def encode(self, texts, show_progress_bar=False):
         return [[0.0] * 8 for _ in texts]
 ```
-
----
-
-## Environment setup
-
-This agent depends on ML libraries (`sentence-transformers`, `torch`, `numpy`, etc.) that contain compiled native extensions and can cause dependency conflicts when installed with pip alone. **Conda is strongly recommended** as it distributes pre-compiled, mutually compatible binaries.
-
-### Installing Miniforge
-
-Miniforge is the recommended conda distribution. Do **not** use `brew install conda` — it installs a bare-bones version that won't set up your shell correctly.
-
-Instead, install the Miniforge cask and initialise your shell:
-
-```bash
-brew install --cask miniforge
-conda init zsh   # or 'conda init bash' if you use bash
-```
-
-Then restart your terminal. Alternatively, download the installer directly from [github.com/conda-forge/miniforge](https://github.com/conda-forge/miniforge).
-
-PyTorch is installed via conda because conda provides pre-compiled binaries that are tested for your platform and architecture, avoiding common ABI and CUDA compatibility issues. The remaining packages are installed with pip because they are not available on the conda channels (or the conda versions lag behind), but they are pure Python or have wheels that install cleanly once PyTorch is already in place. As a rule: use conda for the heavy native dependencies, pip for everything else.
-
-### Apple Silicon
-
-> Use Python 3.12 or earlier. Python 3.13+ is not yet reliably supported by ML libraries such as PyTorch and sentence-transformers.
-
-```bash
-conda create -n askpanda python=3.12 -y
-conda activate askpanda
-conda install -c conda-forge -c pytorch pytorch cpuonly -y
-pip install sentence-transformers langchain langchain-community chromadb pdfminer.six python-docx
-```
-
-### Intel macOS
-
-```bash
-conda create -n askpanda python=3.12 -y
-conda activate askpanda
-conda install -c pytorch -c conda-forge pytorch -y
-pip install sentence-transformers langchain langchain-community chromadb pdfminer.six python-docx
-```
-
-### Starting a new session
-
-Once the environment is set up, you only need to activate it at the start of each session:
-
-```bash
-conda activate askpanda
-```
-
-To verify everything is in order:
-
-```bash
-conda info
-python --version
-```
-
-### Switching from a virtualenv
-
-Only one environment manager should be active at a time. If a virtualenv is currently active, deactivate it first:
-
-```bash
-deactivate
-conda activate askpanda
-```
-
-Your virtualenv remains on disk and can be reactivated at any time.
