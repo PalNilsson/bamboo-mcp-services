@@ -3,7 +3,7 @@
 **AskPanDA-ATLAS Agents** is a collection of cooperative, Python-based agents that power the *AskPanDA-ATLAS* plugin for the **Bamboo Toolkit**, supporting the ATLAS Experiment.
 
 > ⚠️ **Early development**
-> This repository is a preliminary architectural plan with initial scaffolding. Only the `document-monitor-agent` is currently ready for use. Other agents are in active development or planned.
+> This repository is under active development. The `document-monitor-agent` and `ingestion-agent` are ready for use. Other agents are planned.
 
 ---
 
@@ -12,7 +12,7 @@
 | Agent | Status |
 |---|---|
 | `document-monitor-agent` | ✅ Ready |
-| `ingestion-agent` | 🔧 In development |
+| `ingestion-agent` | ✅ Ready |
 | `dast-agent` | 📋 Planned |
 | `supervisor-agent` | 📋 Planned |
 | `index-builder-agent` | 📋 Planned |
@@ -28,11 +28,10 @@
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
 pip install -e .
 ```
 
-For development (includes pytest, flake8, pylint):
+For development (includes pytest and flake8):
 
 ```bash
 pip install -e ".[dev]"
@@ -48,6 +47,22 @@ askpanda-document-monitor-agent --dir ./documents --poll-interval 10 --chroma-di
 
 Full documentation: [README-document_monitor_agent.md](./README-document_monitor_agent.md)
 
+### Run the ingestion agent
+
+```bash
+# Download all queues once and exit:
+askpanda-ingestion-agent --config src/askpanda_atlas_agents/resources/config/ingestion-agent.yaml --once
+
+# Run as a long-lived daemon (polls every 30 minutes):
+askpanda-ingestion-agent --config src/askpanda_atlas_agents/resources/config/ingestion-agent.yaml
+
+# Inspect what was collected:
+python scripts/dump_ingestion_db.py --count
+python scripts/dump_ingestion_db.py --table jobs --queue SWT2_CPB --limit 5
+```
+
+Full documentation: [README-ingestion_agent.md](./README-ingestion_agent.md)
+
 ---
 
 ## Agents
@@ -58,9 +73,17 @@ Watches a directory for new or changed documents and ingests them into ChromaDB 
 
 → [Full documentation](./README-document_monitor_agent.md)
 
-### `ingestion-agent` 🔧 In development
+### `ingestion-agent` ✅ Ready
 
-Periodically fetches ATLAS queue and site metadata, normalises it, and loads it into DuckDB for fast local queries. Will optionally pull BigPanDA task/job metadata snapshots for debugging and analytics.
+Periodically downloads job metadata from [BigPanda](https://bigpanda.cern.ch) for a configured list of ATLAS computing queues and persists the data in a local [DuckDB](https://duckdb.org) database for downstream use by Bamboo / AskPanDA. Stores per-job records, facet summaries, and error frequency tables. Supports one-shot and long-running daemon modes.
+
+Key features:
+- Configurable queue list, poll cycle (default: 30 min), and inter-queue delay
+- Bulk DataFrame inserts — handles 10k+ jobs per queue in under 2 seconds
+- Rotating log file, `--log-level DEBUG` support, clean Ctrl-C / SIGTERM shutdown
+- `scripts/dump_ingestion_db.py` for inspecting the database from the command line
+
+→ [Full documentation](./README-ingestion_agent.md)
 
 ### `dast-agent` 📋 Planned
 
@@ -120,27 +143,41 @@ Stop with Ctrl+C or SIGTERM. When adding a new agent, register its entry point i
 ```
 askpanda-atlas-agents/
 ├─ README.md
+├─ README-document_monitor_agent.md
+├─ README-ingestion_agent.md
 ├─ pyproject.toml
+├─ requirements.txt
+├─ scripts/
+│  └─ dump_ingestion_db.py       # inspect the ingestion database from the CLI
 ├─ src/
 │  └─ askpanda_atlas_agents/
-│     ├─ common/                # shared utilities (storage, panda, email, metrics)
+│     ├─ common/
+│     │  └─ storage/
+│     │     ├─ duckdb_store.py       # low-level DuckDB helpers
+│     │     ├─ schema.py             # DDL — single source of truth for all tables
+│     │     └─ schema_annotations.py # field descriptions for LLM context
 │     ├─ agents/
+│     │  ├─ base.py                  # Agent lifecycle interface
 │     │  ├─ ingestion_agent/
-│     │  ├─ dast_agent/
-│     │  ├─ supervisor_agent/
-│     │  ├─ index_builder_agent/
-│     │  ├─ feedback_agent/
-│     │  └─ metrics_agent/
-│     ├─ plugin/                # Bamboo / AskPanDA plugin adapter
-│     └─ resources/             # default configs and schemas
+│     │  │  ├─ agent.py
+│     │  │  ├─ bigpanda_jobs_fetcher.py
+│     │  │  └─ cli.py
+│     │  ├─ document_monitor_agent/
+│     │  ├─ dummy_agent/
+│     │  ├─ dast_agent/              # planned
+│     │  ├─ supervisor_agent/        # planned
+│     │  ├─ index_builder_agent/     # planned
+│     │  ├─ feedback_agent/          # planned
+│     │  └─ metrics_agent/           # planned
+│     ├─ plugin/                     # Bamboo / AskPanDA plugin adapter
+│     └─ resources/
+│        └─ config/
+│           └─ ingestion-agent.yaml
 ├─ tests/
-│  ├─ common/
-│  ├─ agents/
-│  └─ plugin/
-├─ deployments/
-│  ├─ docker/
-│  ├─ systemd/
-│  └─ k8s/
+│  └─ agents/
+│     ├─ ingestion_agent/
+│     ├─ dummy_agent/
+│     └─ test_base_agent.py
 └─ .github/
    └─ workflows/
       └─ ci.yml
@@ -152,7 +189,7 @@ askpanda-atlas-agents/
 
 Agents draw on shared components in `common/`:
 
-- **Storage** — DuckDB, SQLite, filesystem helpers
+- **Storage** — DuckDB store, typed schema DDL (`schema.py`), field annotations for LLM context (`schema_annotations.py`)
 - **Vector stores** — ChromaDB, embedding adapters
 - **PanDA / BigPanDA** — metadata fetching, snapshot downloads
 - **Email** — local Microsoft Outlook access, thread reconstruction and parsing
