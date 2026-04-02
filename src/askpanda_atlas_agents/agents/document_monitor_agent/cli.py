@@ -72,7 +72,7 @@ def _build_agent(args: argparse.Namespace) -> DocumentMonitorAgent:
             started.
     """
     return DocumentMonitorAgent(
-        name="document_monitor_agent",
+        name="atlas_docs",
         directory=args.dir,
         poll_interval_sec=args.poll_interval,
         chunk_size=args.chunk_size,
