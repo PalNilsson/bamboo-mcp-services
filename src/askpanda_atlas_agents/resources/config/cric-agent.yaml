@@ -8,7 +8,9 @@
 #   askpanda-cric-agent --data /tmp/cric.db --once
 
 # Path to cric_pandaqueues.json on CVMFS.
-cric_path: /cvmfs/atlas.cern.ch/repo/sw/local/etc/cric_pandaqueues.json
+# cric_path: /cvmfs/atlas.cern.ch/repo/sw/local/etc/cric_pandaqueues.json
+cric_path: /Users/nilsnilsson/Development/cric_pandaqueues.json
+
 
 # How often to re-read the file and reload the database, in seconds.
 # CVMFS propagates updates from the stratum-0 every ~30 minutes, but the

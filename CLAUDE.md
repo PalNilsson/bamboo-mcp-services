@@ -76,9 +76,11 @@ askpanda-cric-agent \
 #   --log-level DEBUG
 #   --log-file ""             # disable file logging
 
-# Inspect the resulting database:
+# Inspect the resulting database (requires duckdb CLI — see note below):
 duckdb cric.db "SELECT COUNT(*) FROM queuedata"
 duckdb cric.db "SELECT queue, status, cloud, tier FROM queuedata LIMIT 10"
+# If the duckdb CLI is not installed, use Python instead:
+# python -c "import duckdb; print(duckdb.connect('cric.db', read_only=True).execute('SELECT queue, status, cloud, tier FROM queuedata LIMIT 10').df())"
 ```
 
 ---
@@ -309,6 +311,15 @@ hash-based skip pattern for file-backed sources.
 ---
 
 ## Common pitfalls
+
+**`duckdb: command not found`** — `pip install duckdb` (or `pip install -e .`)
+installs the Python package only, not the standalone CLI binary.  On macOS the
+recommended install is `brew install duckdb`.  Alternatively, download the
+binary directly into your conda env:
+`curl -L https://github.com/duckdb/duckdb/releases/download/v1.2.2/duckdb_cli-osx-universal.zip -o /tmp/duckdb_cli.zip && unzip /tmp/duckdb_cli.zip -d "$CONDA_PREFIX/bin/" && chmod +x "$CONDA_PREFIX/bin/duckdb"`.
+Note: `conda install -c conda-forge duckdb` does **not** install the CLI binary
+on macOS.  If you prefer no CLI install, query via Python:
+`python -c "import duckdb; print(duckdb.connect('cric.db', read_only=True).execute('SELECT COUNT(*) FROM queuedata').fetchone())"`.
 
 **`ModuleNotFoundError: askpanda_atlas_agents`** — run `pip install -e .` from
 the repository root.

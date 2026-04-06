@@ -199,6 +199,10 @@ duckdb /tmp/cric.db "SELECT queue, status, cloud, tier FROM queuedata LIMIT 10"
 askpanda-cric-agent --data /data/cric.db --log-file /var/log/cric-agent.log
 ```
 
+> **Note:** `duckdb` in the commands above is the standalone CLI binary, which
+> is separate from the `duckdb` Python package installed by `pip install -e .`.
+> See [Querying the database](#querying-the-database) below for how to install
+> it, or use the Python alternative if you prefer not to install the CLI.
 ---
 
 ## Querying the database
@@ -207,10 +211,66 @@ The DuckDB file can be opened directly by AskPanDA, a Jupyter notebook, or the
 `duckdb` CLI. The agent holds the file open in read-write mode while running;
 open it read-only from other processes to avoid conflicts.
 
+### Installing the DuckDB CLI
+
+`pip install duckdb` (or `pip install -e .`) installs the Python package only —
+it does **not** install the `duckdb` command-line binary. The CLI is a separate
+install.
+
+**Recommended — Homebrew (macOS):**
+
+```bash
+brew install duckdb
+```
+
+**Alternative — direct download into conda env (no Homebrew):**
+
+```bash
+curl -L https://github.com/duckdb/duckdb/releases/download/v1.2.2/duckdb_cli-osx-universal.zip \
+  -o /tmp/duckdb_cli.zip
+unzip /tmp/duckdb_cli.zip -d "$CONDA_PREFIX/bin/"
+chmod +x "$CONDA_PREFIX/bin/duckdb"
+```
+
+> **Note:** `conda install -c conda-forge duckdb` does **not** install the CLI
+> binary on macOS — it only installs the Python extension. Use Homebrew or the
+> direct download above.
+
+**Alternative — Python one-liner (no CLI install needed):**
+
+```bash
+python -c "
+import duckdb
+conn = duckdb.connect('/path/to/cric.db', read_only=True)
+print(conn.execute('SELECT queue, status, cloud, tier FROM queuedata LIMIT 10').df().to_string())
+"
+```
+
 ### DuckDB CLI
 
 ```bash
 duckdb /path/to/cric.db
+```
+
+Example output:
+
+```
+duckdb cric.db "SELECT queue, status, cloud, tier FROM queuedata LIMIT 10"
+┌────────────────────┬───────────┬─────────┬─────────┐
+│       queue        │  status   │  cloud  │  tier   │
+│      varchar       │  varchar  │ varchar │ varchar │
+├────────────────────┼───────────┼─────────┼─────────┤
+│ AGLT2              │ online    │ US      │ T2D     │
+│ AGLT2_MERGE        │ online    │ US      │ T2D     │
+│ AGLT2_TEST         │ online    │ US      │ T2D     │
+│ ALL                │ offline   │ CERN    │ T0      │
+│ AM-01-AANL         │ test      │ DE      │ T3      │
+│ ANALY_ARNES_DIRECT │ online    │ ND      │ T3      │
+│ ANALY_BNL_VP       │ online    │ US      │ T1      │
+│ ANALY_CERN-PTEST   │ brokeroff │ CERN    │ T0      │
+│ ANALY_CERN-PTESTM  │ test      │ CERN    │ T0      │
+│ ANALY_CERN_T0_ART  │ brokeroff │ CERN    │ T0      │
+└────────────────────┴───────────┴─────────┴─────────┘
 ```
 
 ```sql
