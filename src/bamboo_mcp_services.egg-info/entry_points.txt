@@ -1,5 +1,0 @@
-[console_scripts]
-bamboo-cric = bamboo_mcp_services.agents.cric_agent.cli:main
-bamboo-document-monitor = bamboo_mcp_services.agents.document_monitor_agent.cli:main
-bamboo-dummy = bamboo_mcp_services.agents.dummy_agent.cli:main
-bamboo-ingestion = bamboo_mcp_services.agents.ingestion_agent.cli:main

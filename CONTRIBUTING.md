@@ -46,6 +46,13 @@ conda activate bamboo-mcp-services
 The environment is named `bamboo-mcp-services` throughout this document.  If you choose
 a different name, substitute it wherever `bamboo-mcp-services` appears.
 
+> **Important:** run these commands one at a time, not pasted as a block.
+> If `conda activate` is pasted with a trailing `\n` or as part of a
+> multi-line paste, the shell may silently skip the activation and the
+> subsequent `pip install` will target the wrong Python.  Always verify
+> with `which python` — the path should contain `bamboo-mcp-services`
+> before continuing.
+
 ### 3 — Install Python dependencies
 
 ```bash
@@ -254,6 +261,14 @@ bamboo-mcp-services/
 ---
 
 ## Common pitfalls
+
+**`ModuleNotFoundError: bamboo_mcp_services` in pytest despite successful `python -c` import**
+The conda environment is not active for pytest.  This happens when `conda activate`
+was pasted with a trailing `\n` or as part of a multi-line block — the shell
+silently skips the activation and `pip install -e .` runs against the system
+Python instead.  Fix: run `conda activate bamboo-mcp-services` alone on its own
+line, verify with `which python` (should contain `bamboo-mcp-services` in the
+path), then re-run `pip install -e ".[dev]"` and `pytest`.
 
 **`ModuleNotFoundError: bamboo_mcp_services`**
 Run `pip install -e .` from the repository root.  The `src/` layout means the
