@@ -4,12 +4,22 @@ requests>=2.31
 pyyaml>=6.0
 pandas>=2.0
 
+# Embeddings — versions pinned for PyTorch 2.2.x compatibility on macOS/miniforge
+# torch 2.4+ is not available on this platform; sentence-transformers 3.x and
+# transformers 4.41+ require torch>=2.4 and will fail at import time.
+numpy<2                        # torch 2.2.x compiled against NumPy 1.x
+torch==2.2.2
+transformers==4.40.0
+sentence-transformers==2.7.0
+langchain-huggingface>=1.2
+langchain-community>=0.4
+
 # Agent dependencies
 chromadb>=0.4.0
-sentence-transformers>=2.2.2
 pdfminer.six>=20221105
 python-docx>=0.8.11
 
 # Development dependencies
 pytest>=8.0
 flake8>=7.0
+

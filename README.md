@@ -27,19 +27,31 @@
 
 ### Install
 
+This project uses a conda environment.  If you have not set it up yet:
+
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
+conda create -n bamboo-mcp-services python=3.12
+conda activate bamboo-mcp-services
+pip install -r requirements.txt
+pip install -e ".[dev]"
 ```
+
+On a normal working day, just activate the existing environment:
+
+```bash
+conda activate bamboo-mcp-services
+pip install -e .   # pick up any dependency or version changes
+```
+
+> **Note:** The project uses a `src/` layout, so the package must be installed
+> (with `-e`) before running tests or CLI tools.  See
+> [Common pitfalls](#common-pitfalls) if commands are not found or imports fail.
 
 For development (includes pytest and flake8):
 
 ```bash
 pip install -e ".[dev]"
 ```
-
-> The project uses a `src/` layout, so the package must be installed before running tests or tools.
 
 ### Run the document monitor agent
 
@@ -143,11 +155,12 @@ Key features:
 
 ### `github-doc-sync-agent` ✅ Ready
 
-Periodically polls one or more GitHub repositories, downloads changed `.md`
-and `.rst` documentation files, and writes normalised Markdown to a local
-directory for RAG ingestion.  Uses the GitHub REST API with commit SHA caching
-so that only repositories with new commits incur tree-fetch and download
-requests — unchanged repositories are skipped with a single API call.
+Periodically polls one or more GitHub repositories (including GitHub wikis),
+downloads changed `.md` and `.rst` documentation files, and writes normalised
+Markdown to a local directory for RAG ingestion.  Uses the GitHub REST API with
+commit SHA caching for regular repos, and `git clone --depth 1` for wiki repos
+(which are not accessible via the REST API).  Unchanged repositories are skipped
+with a single API call or clone.
 
 The agent is a **file writer only**.  It is designed to feed the
 `document-monitor-agent`, which handles chunking, embedding, and ChromaDB
@@ -156,6 +169,7 @@ insertion.  The two agents are decoupled and can run independently.
 Key features:
 - Multi-repository support via a YAML config file; per-repo branch, glob
   filters, and `within_hours` recency check
+- GitHub wiki support via `wiki: true` config flag
 - SHA-based incremental sync — full download only when new commits are detected
 - RST → Markdown conversion and YAML frontmatter injection for RAG-ready output
 - Per-repo failure isolation — one failing repository never aborts the others
@@ -310,33 +324,77 @@ pylint src/bamboo_mcp_services
 
 ### Common pitfalls
 
-**`ModuleNotFoundError: bamboo_mcp_services`** — run `pip install -e .` from the repository root (where `pyproject.toml` lives).
+**`ModuleNotFoundError: bamboo_mcp_services`** — run `pip install -e .` from the
+repository root (where `pyproject.toml` lives).
 
-**Editable install fails** — confirm that `src/bamboo_mcp_services/` exists and contains an `__init__.py`.
+**Editable install fails** — confirm that `src/bamboo_mcp_services/` exists and
+contains an `__init__.py`.
 
-**Agent logs wrong version after `bump_version.py`** — `importlib.metadata` reads the version baked in at install time. Run `pip install -e .` after every bump.
+**Agent logs wrong version after `bump_version.py`** — `importlib.metadata` reads
+the version baked in at install time. Run `pip install -e .` after every bump.
+
+**Code changes have no effect at runtime** — if `pip install .` (without `-e`) was
+ever run, a non-editable copy in `site-packages` will shadow the source tree.
+Fix with:
+```bash
+pip uninstall bamboo-mcp-services -y
+pip install -e .
+```
+Verify the right file is being imported with:
+```bash
+python -c "import bamboo_mcp_services.agents.github_doc_sync_agent.github_markdown_sync as m; print(m.__file__)"
+```
+The path should point into your development tree, not `site-packages`.
+
+**`document-monitor-agent` logs `Falling back to DummyEmbedder`** — the embedding
+stack (`torch`, `sentence-transformers`, `langchain-huggingface`) is not installed
+or has a version conflict.  Install via `pip install -r requirements.txt` and verify
+with:
+```bash
+python -c "
+from langchain_huggingface import HuggingFaceEmbeddings
+e = HuggingFaceEmbeddings(model_name='all-MiniLM-L6-v2')
+print('dims:', len(e.embed_documents(['test'])[0]))
+"
+```
+Expected output: `dims: 384`.  If you see a PyTorch or NumPy version error, see
+the embedding stack constraints in `pyproject.toml` and `requirements.txt`.
+The `DummyEmbedder` produces zero vectors — any ChromaDB data ingested while it
+was active must be deleted and re-ingested with real embeddings.
+
+**PyTorch/NumPy version conflict** — `torch==2.2.2` (the version available on
+macOS/miniforge with Python 3.12) was compiled against the NumPy 1.x ABI.
+Running it alongside NumPy 2.x produces `_ARRAY_API not found` errors.
+Fix with `pip install "numpy<2"`.
 
 ---
 
 ## Continuous integration
 
-GitHub Actions runs linting (`pylint`, `flake8`) and the full unit test suite (`pytest`) on every push. All agents and shared tools must have corresponding unit tests.
+GitHub Actions runs linting (`pylint`, `flake8`) and the full unit test suite
+(`pytest`) on every push. All agents and shared tools must have corresponding
+unit tests.
 
 ---
 
 ## Relationship to Bamboo
 
-The `plugin/` package provides the integration layer between Bamboo MCP Services and the Bamboo Toolkit, keeping service logic independent of the UI and orchestration layer.
+The `plugin/` package provides the integration layer between Bamboo MCP Services
+and the Bamboo Toolkit, keeping service logic independent of the UI and
+orchestration layer.
 
 ---
 
 ## Contributing
 
-Design feedback and contributions are welcome. This repository currently represents an architectural blueprint guiding development — interfaces are intended to be stable, but implementations will evolve.
+Design feedback and contributions are welcome. This repository currently represents
+an architectural blueprint guiding development — interfaces are intended to be
+stable, but implementations will evolve.
 
 ### Repository setup
 
-The canonical repository is at **https://github.com/BNLNPPS/bamboo-mcp-services**. Development follows a standard fork-and-pull-request workflow.
+The canonical repository is at **https://github.com/BNLNPPS/bamboo-mcp-services**.
+Development follows a standard fork-and-pull-request workflow.
 
 First-time setup:
 
