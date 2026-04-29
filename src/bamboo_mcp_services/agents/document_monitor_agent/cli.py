@@ -32,6 +32,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--poll-interval", type=int, default=10, help="Poll interval seconds")
     p.add_argument("--chroma-dir", default=".chromadb", help="ChromaDB persist directory")
     p.add_argument(
+        "--collection",
+        default="atlas_docs",
+        help="ChromaDB collection name (default: atlas_docs).",
+    )
+    p.add_argument(
         "--checkpoint-file",
         default=".document_monitor/checkpoints.json",
         help="Checkpoint file path",
@@ -72,13 +77,14 @@ def _build_agent(args: argparse.Namespace) -> DocumentMonitorAgent:
               characters.
             * ``checkpoint_file`` – path to the JSON checkpoint file.
             * ``chroma_dir`` – directory used to persist ChromaDB data.
+            * ``collection`` – ChromaDB collection name.
 
     Returns:
         DocumentMonitorAgent: Fully configured agent instance, not yet
             started.
     """
     return DocumentMonitorAgent(
-        name="atlas_docs",
+        name=args.collection,
         directory=args.dir,
         poll_interval_sec=args.poll_interval,
         chunk_size=args.chunk_size,

@@ -10,8 +10,8 @@ A production-oriented agent that watches a directory for new or changed document
 - Extracts text from `.pdf`, `.docx`, `.txt`, and `.md` files.
 - Splits text into overlapping character chunks.
 - Generates deterministic chunk IDs (stable across re-ingestion).
-- Embeds chunks using a pluggable embedder (default: `sentence-transformers`).
-- Stores vectors and metadata in ChromaDB (persistent local backend).
+- Embeds chunks using a pluggable embedder (default: `sentence-transformers/all-MiniLM-L6-v2`).
+- Stores vectors and metadata in a named ChromaDB collection (persistent local backend).
 - Maintains a JSON checkpoint store to prevent re-processing unchanged files.
 - Replaces stale vectors when file content changes.
 
@@ -74,17 +74,14 @@ PyTorch is installed via conda because it provides pre-compiled binaries tested 
 ### Step 3 — Install remaining dependencies
 
 ```bash
-pip install sentence-transformers langchain langchain-community langchain-huggingface chromadb pdfminer.six python-docx
 pip install -r requirements.txt
-```
-
-### Step 4 — Install the package
-
-This registers the `bamboo-document-monitor` CLI command:
-
-```bash
 pip install -e .
 ```
+
+> **Known version constraints:** `torch==2.2.2` (the version available on macOS/miniforge with
+> Python 3.12) was compiled against the NumPy 1.x ABI. Running it alongside NumPy 2.x produces
+> `_ARRAY_API not found` errors at import time. The `requirements.txt` pins `numpy<2` to prevent
+> this. If you see NumPy-related errors, run `pip install "numpy<2"`.
 
 ---
 
@@ -95,7 +92,7 @@ pip install -e .
 Process all new or changed files once and exit:
 
 ```bash
-bamboo-document-monitor --dir ./documents --chroma-dir .chromadb --once
+bamboo-document-monitor --dir ./documents --chroma-dir .chromadb --collection atlas_docs --once
 ```
 
 This is the recommended mode when running after `bamboo-github-sync` in a
@@ -106,7 +103,7 @@ pipeline or cron job — it processes whatever was downloaded and exits cleanly.
 Poll continuously, picking up new files as they arrive:
 
 ```bash
-bamboo-document-monitor --dir ./documents --poll-interval 10 --chroma-dir .chromadb
+bamboo-document-monitor --dir ./documents --poll-interval 10 --chroma-dir .chromadb --collection atlas_docs
 ```
 
 Stop with Ctrl-C or SIGTERM.
@@ -114,19 +111,63 @@ Stop with Ctrl-C or SIGTERM.
 ### Via module
 
 ```bash
-python -m bamboo_mcp_services.agents.document_monitor_agent.cli --dir ./documents --once
+python -m bamboo_mcp_services.agents.document_monitor_agent.cli --dir ./documents --collection atlas_docs --once
 ```
 
 > **First run on a new machine:** the agent loads the embedding model from local cache and avoids network calls on startup. This means the model must be downloaded at least once first. On a fresh machine, trigger the download by running with `HF_HUB_OFFLINE=0`:
 > ```bash
-> HF_HUB_OFFLINE=0 bamboo-document-monitor --dir ./documents --poll-interval 10 --chroma-dir .chromadb
+> HF_HUB_OFFLINE=0 bamboo-document-monitor --dir ./documents --chroma-dir .chromadb --collection atlas_docs --once
 > ```
 > Subsequent runs will use the cached model automatically and do not need the flag.
 
-> **Always use an absolute path for `--chroma-dir`** to avoid the database being written to a different location depending on the working directory:
+> **Always use absolute paths for `--dir` and `--chroma-dir`** to avoid the database being written to a different location depending on the working directory:
 > ```bash
-> bamboo-document-monitor --dir /abs/path/to/docs --chroma-dir /abs/path/to/.chromadb
+> bamboo-document-monitor \
+>   --dir /abs/path/to/docs \
+>   --chroma-dir /abs/path/to/.chromadb \
+>   --collection atlas_docs \
+>   --once
 > ```
+
+---
+
+## Multiple corpora
+
+The `--collection` flag lets you ingest separate document sets into the same
+ChromaDB directory under different collection names, or into separate ChromaDB
+directories entirely.  Each corpus needs its own `--checkpoint-file` so that
+file state is tracked independently.
+
+Example — two separate corpora:
+
+```bash
+# PanDA documentation
+bamboo-document-monitor \
+  --dir /data/panda-RAG \
+  --chroma-dir /data/chromadb-panda \
+  --collection atlas_docs \
+  --checkpoint-file /data/.monitor/panda-checkpoints.json \
+  --once
+
+# CGSim documentation
+bamboo-document-monitor \
+  --dir /data/CGSim-RAG \
+  --chroma-dir /data/chromadb-cgsim \
+  --collection cgsim_docs \
+  --checkpoint-file /data/.monitor/cgsim-checkpoints.json \
+  --once
+```
+
+Verify collection names and chunk counts at any time:
+
+```bash
+python -c "
+import chromadb
+client = chromadb.PersistentClient(path='/data/chromadb-cgsim')
+for col in client.list_collections():
+    print(col.name, '  count:', col.count())
+"
+```
 
 ---
 
@@ -137,6 +178,7 @@ Re-ingestion is required when:
 - You change `--chunk-size` or `--chunk-overlap` (existing chunks remain at the old size until wiped).
 - The ChromaDB index becomes corrupted or out of sync with the SQLite metadata.
 - You want to start fresh after adding or removing documents.
+- The agent previously ran with `DummyEmbedder` (zero vectors) — see [Embedding troubleshooting](#embedding-troubleshooting).
 
 To re-ingest cleanly:
 
@@ -145,8 +187,51 @@ To re-ingest cleanly:
 rm -rf .chromadb .document_monitor/checkpoints.json
 
 # 2. Re-run the agent — it will process all files from scratch
-bamboo-document-monitor --dir /abs/path/to/docs --chroma-dir /abs/path/to/.chromadb
+bamboo-document-monitor \
+  --dir /abs/path/to/docs \
+  --chroma-dir /abs/path/to/.chromadb \
+  --collection my_collection \
+  --once
 ```
+
+---
+
+## Embedding troubleshooting
+
+The agent logs a warning and falls back to `DummyEmbedder` (zero vectors) if
+the embedding stack is not correctly installed:
+
+```
+WARNING ... Local HF instantiation failed (will try hub or dummy): ...
+WARNING ... Falling back to DummyEmbedder for embeddings (no HF available).
+```
+
+**This is a silent data corruption issue** — the agent completes successfully,
+files are marked as ingested in the checkpoint, and ChromaDB is populated, but
+all vectors are zero.  Similarity search will return garbage results.  Any
+ChromaDB data ingested while `DummyEmbedder` was active must be deleted and
+re-ingested after fixing the embedding stack.
+
+Verify the embedding stack is working before ingesting:
+
+```bash
+python -c "
+from langchain_huggingface import HuggingFaceEmbeddings
+e = HuggingFaceEmbeddings(model_name='all-MiniLM-L6-v2')
+print('dims:', len(e.embed_documents(['test'])[0]))
+"
+```
+
+Expected output: `dims: 384`. If you see an error, install the missing packages:
+
+```bash
+pip install -r requirements.txt
+```
+
+The `requirements.txt` pins `torch==2.2.2`, `transformers==4.40.0`, and
+`sentence-transformers==2.7.0` as a tested combination for macOS/miniforge
+with Python 3.12. Installing newer versions of these packages without also
+upgrading PyTorch will produce import errors.
 
 ---
 
@@ -184,9 +269,10 @@ conda activate bamboo-mcp-services
 | Option | Default | Description |
 |---|---|---|
 | `--dir` | *(required)* | Directory to monitor (all subdirectories are included) |
+| `--collection` | `atlas_docs` | ChromaDB collection name. Use a distinct name per corpus to avoid mixing document sets. |
 | `--poll-interval` | `10` | Poll interval in seconds (daemon mode only) |
 | `--chroma-dir` | `.chromadb` | ChromaDB persistence directory |
-| `--checkpoint-file` | `.document_monitor/checkpoints.json` | JSON checkpoint path |
+| `--checkpoint-file` | `.document_monitor/checkpoints.json` | JSON checkpoint path. Use a distinct path per corpus when running multiple instances. |
 | `--chunk-size` | `3000` | Characters per chunk |
 | `--chunk-overlap` | `300` | Overlap between chunks |
 | `--once` | off | Run a single poll cycle then exit |

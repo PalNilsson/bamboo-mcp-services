@@ -11,6 +11,28 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+#### Configurable ChromaDB collection name in `document-monitor-agent`
+
+The `bamboo-document-monitor` CLI now accepts a `--collection` flag that sets
+the ChromaDB collection name at runtime.  Previously the name was hardcoded as
+`"atlas_docs"`, making it impossible to ingest separate document corpora into
+distinct collections without modifying source code.
+
+```bash
+bamboo-document-monitor \
+  --dir ../CGSim-RAG \
+  --chroma-dir ../chromadb-cgsim \
+  --collection cgsim_docs \
+  --once
+```
+
+The default remains `"atlas_docs"` so existing invocations are unaffected.
+When running multiple corpora, use a distinct `--collection` **and** a distinct
+`--checkpoint-file` per invocation to keep file state fully isolated.
+
+Implementation: `build_parser()` gains a `--collection` argument; `_build_agent()`
+passes `args.collection` to `DocumentMonitorAgent(name=...)`.
+
 #### GitHub wiki support in `github-doc-sync-agent`
 
 The `github-doc-sync-agent` can now sync **GitHub wiki repositories** in
