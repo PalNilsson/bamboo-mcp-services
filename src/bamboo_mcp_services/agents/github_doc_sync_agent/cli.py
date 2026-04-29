@@ -168,6 +168,7 @@ def _load_repo_configs(cfg: dict) -> list[RepoConfig]:
     return [
         RepoConfig(
             name=entry["name"],
+            wiki=entry.get("wiki", False),
             destination=entry["destination"],
             normalized_destination=entry.get("normalized_destination"),
             within_hours=entry.get("within_hours"),

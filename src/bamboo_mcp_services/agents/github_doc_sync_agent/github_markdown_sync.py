@@ -16,6 +16,9 @@ import json
 import logging
 import logging.handlers
 import re
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,6 +68,7 @@ class RepoConfig:
     include_patterns: List[str] = field(default_factory=list)
     exclude_patterns: List[str] = field(default_factory=list)
     normalize_for_rag: bool = False
+    wiki: bool = False
 
 
 def parse_repo(repo: str) -> Tuple[str, str]:
@@ -331,16 +335,217 @@ def _download_file(owner: str, repo: str, path: str, sha: str) -> bytes:
     return r.content
 
 
+def _git_clone_head_sha(clone_dir: Path) -> str:
+    """Return the HEAD commit SHA of a git repository on disk.
+
+    Args:
+        clone_dir: Path to the cloned repository root.
+
+    Returns:
+        Full commit SHA string.
+
+    Raises:
+        RuntimeError: If git command fails.
+    """
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=clone_dir,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git rev-parse HEAD failed: {result.stderr.strip()}"
+        )
+    return result.stdout.strip()
+
+
+def _git_clone_head_datetime(clone_dir: Path) -> datetime:
+    """Return the committer datetime of HEAD in a cloned repository.
+
+    Args:
+        clone_dir: Path to the cloned repository root.
+
+    Returns:
+        UTC-aware datetime of the HEAD commit.
+
+    Raises:
+        RuntimeError: If git command fails or output cannot be parsed.
+    """
+    result = subprocess.run(
+        ["git", "log", "-1", "--format=%cI"],
+        cwd=clone_dir,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git log failed: {result.stderr.strip()}"
+        )
+    raw = result.stdout.strip()
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"Could not parse commit date {raw!r}: {exc}") from exc
+
+
+def _wiki_clone_url(owner: str, parent_repo: str) -> str:
+    """Build the HTTPS clone URL for a GitHub wiki.
+
+    Args:
+        owner: Repository owner.
+        parent_repo: Parent repository name (without ``.wiki`` suffix).
+
+    Returns:
+        HTTPS clone URL string.
+    """
+    return f"https://github.com/{owner}/{parent_repo}.wiki.git"
+
+
+def sync_wiki_repo(cfg: RepoConfig) -> None:
+    """Sync a GitHub wiki repository by cloning it with git.
+
+    GitHub wiki repos are not accessible via the standard REST API — they
+    exist only as plain git repositories at
+    ``https://github.com/{owner}/{repo}.wiki.git``.  This function clones
+    (or re-clones) the wiki into a temporary directory, reads the HEAD SHA
+    and commit date for change detection, then copies matching files to
+    ``cfg.destination`` and optionally normalizes them into
+    ``cfg.normalized_destination``, exactly like :func:`sync_repo`.
+
+    The ``name`` field in *cfg* must be ``owner/repo.wiki``; the parent repo
+    name is derived by stripping the ``.wiki`` suffix.
+
+    Args:
+        cfg: Repository configuration.  ``cfg.wiki`` must be ``True``.
+
+    Raises:
+        ValueError: If repo name is invalid or missing ``.wiki`` suffix.
+        RuntimeError: On git clone failures or I/O errors.
+    """
+    owner, repo_name = parse_repo(cfg.name)
+    if not repo_name.endswith(".wiki"):
+        raise ValueError(
+            f"Wiki repo name must end with '.wiki', got: {cfg.name!r}"
+        )
+    parent_repo = repo_name[: -len(".wiki")]
+    clone_url = _wiki_clone_url(owner, parent_repo)
+
+    dest_root = Path(cfg.destination)
+    dest = dest_root / owner / repo_name
+    dest.mkdir(parents=True, exist_ok=True)
+    state_path = dest / ".sync_state.json"
+    state = load_state(state_path)
+
+    # Clone into a temp dir so we can inspect HEAD before committing to disk.
+    with tempfile.TemporaryDirectory(prefix="bamboo_wiki_") as tmpdir:
+        clone_dir = Path(tmpdir) / "clone"
+        logger.debug("%s: cloning wiki from %s", cfg.name, clone_url)
+        result = subprocess.run(
+            ["git", "clone", "--depth", "1", clone_url, str(clone_dir)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"git clone failed for {cfg.name}: {result.stderr.strip()}"
+            )
+
+        sha = _git_clone_head_sha(clone_dir)
+        commit_dt = _git_clone_head_datetime(clone_dir)
+
+        if cfg.within_hours is not None and state.last_commit_sha is not None:
+            now = datetime.now(tz=timezone.utc)
+            age_hours = (now - commit_dt).total_seconds() / 3600
+            if age_hours > cfg.within_hours:
+                logger.info(
+                    "%s: latest commit is %.1fh old (limit %dh) — skipping",
+                    cfg.name, age_hours, cfg.within_hours,
+                )
+                return
+
+        if sha == state.last_commit_sha:
+            logger.info("%s: already up-to-date at %s", cfg.name, sha[:12])
+            return
+
+        logger.info(
+            "%s: syncing %s → %s",
+            cfg.name,
+            (state.last_commit_sha or "none")[:12],
+            sha[:12],
+        )
+
+        # Collect all blobs from the clone dir (excluding .git).
+        all_files = [
+            p.relative_to(clone_dir)
+            for p in clone_dir.rglob("*")
+            if p.is_file() and ".git" not in p.parts
+        ]
+        matching = [
+            f for f in all_files
+            if _matches_patterns(str(f), cfg.include_patterns, cfg.exclude_patterns)
+        ]
+        logger.info("%s: %d matching files to copy", cfg.name, len(matching))
+
+        norm_dest = None
+        if cfg.normalized_destination:
+            norm_dest = Path(cfg.normalized_destination) / owner / repo_name
+            norm_dest.mkdir(parents=True, exist_ok=True)
+
+        downloaded = 0
+        for rel_path in matching:
+            src = clone_dir / rel_path
+            out_path = dest / rel_path
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, out_path)
+            downloaded += 1
+
+            if cfg.normalize_for_rag and norm_dest:
+                try:
+                    text = src.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    logger.warning(
+                        "Skipping normalization of %s (not UTF-8)", rel_path
+                    )
+                    continue
+                normalized = normalize_text(
+                    text,
+                    source_repo=cfg.name,
+                    source_path=str(rel_path),
+                    commit_sha=sha,
+                )
+                norm_path = norm_dest / rel_path
+                norm_path.parent.mkdir(parents=True, exist_ok=True)
+                norm_path.write_text(normalized, encoding="utf-8")
+
+    new_state = SyncState(
+        last_commit_sha=sha,
+        last_sync_time=datetime.now(tz=timezone.utc).isoformat(),
+        files_downloaded=downloaded,
+    )
+    save_state(state_path, new_state)
+    logger.info("%s: done, %d files saved", cfg.name, downloaded)
+
+
 def sync_repo(cfg: RepoConfig) -> None:
     """Run a full sync cycle for one repository.
+
+    Dispatches to :func:`sync_wiki_repo` when ``cfg.wiki`` is ``True``,
+    otherwise uses the standard GitHub REST API path.
 
     Args:
         cfg: Repository configuration.
 
     Raises:
         ValueError: If repo name is invalid.
-        RuntimeError: On GitHub API or network failures.
+        RuntimeError: On GitHub API, git, or network failures.
     """
+    import sys
+    print(f"DEBUG sync_repo called: wiki={cfg.wiki}, file={__file__}", file=sys.stderr)
+    if cfg.wiki:
+        sync_wiki_repo(cfg)
+        return
+
     owner, repo_name = parse_repo(cfg.name)
     dest_root = Path(cfg.destination)
 
@@ -461,6 +666,7 @@ def load_config(path: Path) -> Tuple[List[RepoConfig], Dict[str, Any]]:
             include_patterns=entry.get("include_patterns", []),
             exclude_patterns=entry.get("exclude_patterns", []),
             normalize_for_rag=entry.get("normalize_for_rag", False),
+            wiki=entry.get("wiki", False),
         )
         for entry in raw.get("repos", [])
     ]

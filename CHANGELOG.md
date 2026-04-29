@@ -7,6 +7,51 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [Unreleased]
+
+### Added
+
+#### GitHub wiki support in `github-doc-sync-agent`
+
+The `github-doc-sync-agent` can now sync **GitHub wiki repositories** in
+addition to regular repositories.  GitHub wikis are not accessible via the
+REST API, so a `git clone --depth 1` path is used instead.
+
+To enable, add `wiki: true` to any repo entry in the YAML config and use
+`owner/repo.wiki` as the `name`:
+
+```yaml
+- name: PanDAWMS/pilot3.wiki
+  wiki: true
+  destination: ../raw
+  normalized_destination: ../RAG
+  within_hours: 10
+  include_patterns:
+    - "*.md"
+  normalize_for_rag: true
+```
+
+Implementation details:
+
+- New `wiki: bool = False` field on `RepoConfig`.
+- New `sync_wiki_repo()` function in `github_markdown_sync.py` that clones the
+  wiki via `https://github.com/{owner}/{repo}.wiki.git`, reads the HEAD SHA and
+  committer datetime with `git rev-parse HEAD` / `git log -1 --format=%cI`,
+  applies the same `within_hours` and SHA-unchanged skip logic as the REST
+  path, copies matching files to `destination`, and optionally normalises them
+  into `normalized_destination`.
+- `sync_repo()` now dispatches to `sync_wiki_repo()` when `cfg.wiki` is
+  `True`, leaving the existing REST API path completely unchanged.
+- `load_config()` and `_load_repo_configs()` (CLI) both read the new `wiki`
+  field, defaulting to `False` when absent.
+- The `branch` config key is silently ignored for wiki repos — `git clone`
+  always fetches the default branch.
+- Wiki clones do not count against GitHub's REST API rate limit.
+- 8 new tests covering dispatch, URL construction, file copy and
+  normalisation, `within_hours` skip on second run, and `load_config` parsing.
+
+---
+
 ## [1.0.0] — 2026-04-08
 
 First stable release.  All four agents (`ingestion`, `cric`, `document-monitor`,
