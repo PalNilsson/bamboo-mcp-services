@@ -176,6 +176,8 @@ def _load_repo_configs(cfg: dict) -> list[RepoConfig]:
             include_patterns=entry.get("include_patterns", []),
             exclude_patterns=entry.get("exclude_patterns", []),
             normalize_for_rag=entry.get("normalize_for_rag", False),
+            git=entry.get("git", False),
+            clone_url=entry.get("clone_url"),
         )
         for entry in cfg.get("repos", [])
     ]

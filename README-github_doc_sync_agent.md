@@ -1,8 +1,13 @@
 # github-doc-sync-agent
 
 A periodic documentation sync agent that downloads changed `.md` and `.rst`
-files from one or more GitHub repositories (including **GitHub wikis**),
-normalises them for RAG ingestion, and writes the results to a local directory.
+files from one or more repositories, normalises them for RAG ingestion, and
+writes the results to a local directory.  Supported sources:
+
+- **GitHub repositories** — via the GitHub REST API
+- **GitHub wikis** — via `git clone --depth 1`
+- **Any public git repository** — GitLab, FramaGit, Bitbucket, Gitea, etc. —
+  via `git clone --depth 1` with an explicit `clone_url`
 
 The agent is a **file writer only** — it does not interact with DuckDB or
 ChromaDB directly.  Its output directory is intended to be watched by the
@@ -13,17 +18,21 @@ chunking, embedding, and ChromaDB insertion.
 
 ## What it does
 
-- Polls one or more GitHub repositories on a configurable interval (default:
-  every hour).
-- For each **regular repository**, fetches the latest commit SHA via the GitHub
-  REST API and compares it against a cached value stored in `.sync_state.json`.
-  If the SHA is unchanged the repository is skipped with no further API calls.
+- Polls one or more repositories on a configurable interval (default: every hour).
+- For each **regular GitHub repository**, fetches the latest commit SHA via the
+  GitHub REST API and compares it against a cached value stored in
+  `.sync_state.json`.  If the SHA is unchanged the repository is skipped with
+  no further API calls.
 - For each **GitHub wiki** (`wiki: true`), clones the wiki's git repository
   with `git clone --depth 1` and reads the HEAD commit SHA and date from the
   clone.  GitHub wikis are not accessible via the REST API, so the git-clone
   path is used instead.
-- When a repository has new commits, fetches the full file tree (REST) or
-  reads the cloned files (wiki), filters with configurable include/exclude glob
+- For each **generic git repository** (`git: true`), clones the repository from
+  `clone_url` with `git clone --depth 1` (optionally specifying `branch`), then
+  reads the HEAD commit SHA and date from the clone.  This path works with any
+  publicly-accessible git host.
+- When a repository has new commits, fetches the full file tree (REST) or walks
+  the cloned files (git/wiki), filters with configurable include/exclude glob
   patterns, and writes only the matching files to disk.
 - Optionally normalises each file for RAG by prepending a YAML frontmatter
   block (containing `source_repo`, `source_path`, `source_type`,
@@ -87,7 +96,7 @@ The two agents form a pipeline:
 ```
 github-doc-sync-agent        document-monitor-agent
 ─────────────────────        ──────────────────────
-polls GitHub                 watches ./data/*/normalized/
+polls repos                  watches ./data/*/normalized/
 downloads changed files  →   recurses into subdirectories
 writes to normalized/        chunks and embeds files  →  ChromaDB
 owner/repo/...               updates checkpoints
@@ -101,7 +110,7 @@ Example cron pipeline (daily at 02:00):
 
 ```cron
 0 2 * * *  bamboo-github-sync --config /path/to/repos.yaml --once
-5 2 * * *  bamboo-document-monitor --dir /path/to/RAG --chroma-dir /path/to/.chromadb --once
+5 2 * * *  bamboo-document-monitor --dir /path/to/RAG --chroma-dir /path/to/.chromadb --collection atlas_docs --once
 ```
 
 ---
@@ -126,8 +135,7 @@ pip install -e .   # pick up any dependency changes
 
 The `-e` flag is required — the project uses a `src/` layout and the package
 will not be importable without it.  See [CONTRIBUTING.md](./CONTRIBUTING.md)
-for the full first-time setup guide including pre-commit hooks and the DuckDB
-CLI.
+for the full first-time setup guide.
 
 > **Important — editable install pitfall:** If you ever run `pip install .`
 > (without `-e`) by mistake, a non-editable copy of the package is installed
@@ -148,16 +156,17 @@ bamboo-github-sync --help
 
 No additional dependencies are needed beyond those already in
 `requirements.txt` — `requests`, `pyyaml`, and `git` (system) are all that
-wiki sync requires.
+wiki and generic git sync require.
 
 ---
 
 ## GitHub API rate limits
 
 The GitHub API allows **60 unauthenticated requests per hour**.  Each sync
-cycle makes at least one request per regular repository (the commit SHA check),
-plus tree and file download requests when new commits are found.  Wiki repos
-use `git clone` instead and do not count against the REST API limit.
+cycle makes at least one request per regular GitHub repository (the commit SHA
+check), plus tree and file download requests when new commits are found.  Wiki
+and generic git repos use `git clone` instead and do **not** count against the
+REST API limit.
 
 For more than a handful of regular repositories, or for repositories with many
 changed files, you will want to authenticate.
@@ -175,9 +184,10 @@ repositories also require a token.
 
 The agent logs a confirmation at startup when `GITHUB_TOKEN` is detected.
 
-> **Note:** `GITHUB_TOKEN` is used for REST API requests only.  Git clones of
-> wiki repos use the public HTTPS URL and do not currently pass credentials.
-> Private wikis are not supported without additional configuration.
+> **Note:** `GITHUB_TOKEN` is used for REST API requests only.  Git clones
+> (wikis and generic git repos) use the public HTTPS URL and do not currently
+> pass credentials.  Private git repos are not supported without additional
+> configuration.
 
 ---
 
@@ -199,7 +209,7 @@ refresh_interval_s: 3600   # 1 hour
 tick_interval_s: 60.0
 
 repos:
-  # Standard repository — uses GitHub REST API
+  # Standard GitHub repository — uses GitHub REST API
   - name: PanDAWMS/panda-docs
     destination: ./data/panda-docs/raw
     normalized_destination: ./data/panda-docs/normalized
@@ -222,6 +232,20 @@ repos:
     include_patterns:
       - "*.md"
     normalize_for_rag: true
+
+  # Generic git repo on a non-GitHub host (FramaGit/GitLab/etc.)
+  - name: simgrid/simgrid
+    git: true
+    clone_url: https://framagit.org/simgrid/simgrid.git
+    branch: master
+    destination: ./data/simgrid/raw
+    normalized_destination: ./data/simgrid/normalized
+    within_hours: 168
+    include_patterns:
+      - "docs/source/*.rst"
+    exclude_patterns:
+      - "docs/source/changelog*"
+    normalize_for_rag: true
 ```
 
 ### Top-level options
@@ -235,13 +259,15 @@ repos:
 
 | Key | Required | Description |
 |---|---|---|
-| `name` | ✅ | Repository identifier in `owner/repo` format. For wikis, append `.wiki` — e.g. `PanDAWMS/pilot3.wiki`. |
+| `name` | ✅ | Repository identifier in `owner/repo` format. Used for logging, directory naming, and RAG metadata. For wikis, append `.wiki`. For generic git repos, any `owner/label` valid as a filesystem path works. |
 | `destination` | ✅ | Directory where raw downloaded files are written. Created if it does not exist. |
 | `wiki` | — | Set to `true` to use the git-clone path for GitHub wikis. The `name` field must end with `.wiki`. Defaults to `false`. |
+| `git` | — | Set to `true` to clone an arbitrary git repository via `clone_url`. Use for non-GitHub hosts (GitLab, FramaGit, Bitbucket, etc.). Defaults to `false`. |
+| `clone_url` | — | HTTPS clone URL. **Required when `git: true`**; ignored otherwise. Example: `https://framagit.org/simgrid/simgrid.git`. |
 | `normalized_destination` | — | Directory for RAG-normalised files. If omitted, normalisation is skipped even if `normalize_for_rag: true`. |
-| `branch` | — | Branch or ref to sync. Defaults to the repository's default branch. **Ignored for wiki repos** — wikis are always cloned from their default branch. |
+| `branch` | — | Branch or ref to sync. Defaults to the repository's default branch. Honoured for both the REST and git-clone paths. **Ignored for wiki repos** — wikis are always cloned from their default branch. |
 | `within_hours` | — | Skip this repository if its latest commit is older than this many hours. Applied after the first successful sync (first run always downloads). |
-| `include_patterns` | — | Glob patterns (e.g. `*.md`, `docs/*.rst`). Only matching files are downloaded. If empty, all files are included. |
+| `include_patterns` | — | Glob patterns (e.g. `*.md`, `docs/source/*.rst`). Only matching files are downloaded. If empty, all files are included. |
 | `exclude_patterns` | — | Glob patterns. Matching files are excluded even if they match an include pattern. |
 | `normalize_for_rag` | — | Prepend YAML frontmatter and convert RST to Markdown. Requires `normalized_destination` to be set. |
 
@@ -304,17 +330,27 @@ repos:
     include_patterns:
       - "*.md"
     normalize_for_rag: true
+
+  - name: simgrid/simgrid
+    git: true
+    clone_url: https://framagit.org/simgrid/simgrid.git
+    branch: master
+    destination: ./data/simgrid/raw
+    normalized_destination: ./data/simgrid/normalized
+    include_patterns:
+      - "docs/source/*.rst"
+    normalize_for_rag: true
 EOF
 
 # 2. Run once with debug logging to see what happens:
 bamboo-github-sync --config repos.yaml --once --log-level DEBUG
 
 # 3. Inspect the downloaded files:
-find ./data -name "*.md" | head -10
-cat ./data/pilot3-wiki/normalized/Home.md | head -20
+find ./data -name "*.rst" | head -10
+cat ./data/simgrid/normalized/simgrid/simgrid/docs/source/index.rst | head -20
 
 # 4. Check the sync state:
-cat ./data/pilot3-wiki/raw/PanDAWMS/pilot3.wiki/.sync_state.json
+cat ./data/simgrid/raw/simgrid/simgrid/.sync_state.json
 
 # 5. If everything looks good, switch to daemon mode:
 bamboo-github-sync --config repos.yaml --log-file sync.log
@@ -335,9 +371,9 @@ Each repository stores its state in `{destination}/{owner}/{repo}/.sync_state.js
 ```
 
 On each cycle the agent checks whether the HEAD SHA has changed (one API call
-for regular repos, one `git clone` for wikis).  If the SHA matches the cached
-value the repository is skipped entirely.  This makes repeated runs cheap for
-repositories that change infrequently.
+for regular repos, one `git clone` for wikis and generic git repos).  If the
+SHA matches the cached value the repository is skipped entirely.  This makes
+repeated runs cheap for repositories that change infrequently.
 
 On a first run (no state file), or after the state file is deleted, a full sync
 is performed regardless of `within_hours`.
@@ -353,9 +389,9 @@ GithubDocSyncAgent
 │   └── GithubDocSyncer.run_cycle()
 │       ├── interval check (skip if < refresh_interval_s since last attempt)
 │       └── for each RepoConfig:
-│           └── sync_repo()  ← dispatches on cfg.wiki
+│           └── sync_repo()  ← dispatches on cfg.wiki / cfg.git
 │               │
-│               ├── wiki=False (regular repo):
+│               ├── wiki=False, git=False (regular GitHub repo):
 │               │   ├── get_latest_commit()    — GitHub REST API
 │               │   ├── within_hours check     — skip if commit is too old
 │               │   ├── SHA unchanged?  →  skip
@@ -366,11 +402,22 @@ GithubDocSyncAgent
 │               │       ├── write to destination/
 │               │       └── normalize_text()  →  write to normalized_destination/
 │               │
-│               └── wiki=True (GitHub wiki):
-│                   ├── git clone --depth 1 https://github.com/{owner}/{repo}.wiki.git
-│                   ├── _git_clone_head_sha()  — git rev-parse HEAD
-│                   ├── _git_clone_head_datetime() — git log -1 --format=%cI
-│                   ├── within_hours check     — skip if commit is too old
+│               ├── wiki=True (GitHub wiki):
+│               │   ├── git clone --depth 1 https://github.com/{owner}/{repo}.wiki.git
+│               │   ├── _git_clone_head_sha()
+│               │   ├── _git_clone_head_datetime()
+│               │   ├── within_hours check
+│               │   ├── SHA unchanged?  →  skip
+│               │   └── SHA changed?
+│               │       ├── walk clone dir, _matches_patterns()
+│               │       ├── shutil.copy2() to destination/
+│               │       └── normalize_text()  →  write to normalized_destination/
+│               │
+│               └── git=True (generic git repo — GitLab, FramaGit, etc.):
+│                   ├── git clone [--depth 1] [-b branch] {clone_url}
+│                   ├── _git_clone_head_sha()
+│                   ├── _git_clone_head_datetime()
+│                   ├── within_hours check
 │                   ├── SHA unchanged?  →  skip
 │                   └── SHA changed?
 │                       ├── walk clone dir, _matches_patterns()
@@ -386,7 +433,7 @@ Key modules:
 |---|---|
 | `agents/github_doc_sync_agent/agent.py` | Agent lifecycle, `GithubDocSyncConfig` dataclass |
 | `agents/github_doc_sync_agent/github_doc_syncer.py` | Interval gate, multi-repo loop, error isolation |
-| `agents/github_doc_sync_agent/github_markdown_sync.py` | REST API calls, git clone (wikis), file download, normalisation, state persistence |
+| `agents/github_doc_sync_agent/github_markdown_sync.py` | REST API calls, git clone (wikis + generic), file download, normalisation, state persistence |
 | `agents/github_doc_sync_agent/cli.py` | CLI entry point (`bamboo-github-sync`) |
 
 `github_markdown_sync.py` is vendored from the standalone
@@ -402,7 +449,7 @@ project (MIT licence).  It is included directly in the package so that
 pytest tests/agents/github_doc_sync_agent/ -v
 ```
 
-The test suite (72 tests) covers:
+The test suite (73 tests) covers:
 
 - **Interval gate** — first call fires, second immediate call is blocked,
   call after elapsed interval fires, gate uses `time.monotonic` not wall clock.
@@ -425,7 +472,12 @@ The test suite (72 tests) covers:
   `_wiki_clone_url` produces the correct URL; files are copied and normalised
   correctly; `within_hours` gate skips stale wikis on second run; `load_config`
   reads `wiki: true` from YAML and defaults to `False` when absent.
+- **Generic git dispatch** — `sync_repo` routes to `sync_git_repo` when
+  `git=True`; wiki path unaffected; missing `clone_url` raises `ValueError`;
+  `branch` is passed as `-b` to `git clone`; files are copied and normalised
+  correctly; SHA-unchanged skip works; `load_config` reads `git: true` and
+  `clone_url` from YAML and defaults both to `False`/`None` when absent.
 
 All network I/O and subprocess calls are mocked with `unittest.mock.patch`; no
-GitHub API calls, git clones, or file system writes outside `tmp_path` occur
-during testing.
+API calls, git clones, or file system writes outside `tmp_path` occur during
+testing.

@@ -664,3 +664,269 @@ class TestWithinHoursFirstRun:
             from bamboo_mcp_services.agents.github_doc_sync_agent.github_markdown_sync import sync_repo
             sync_repo(cfg)
         mock_tree.assert_not_called()  # skipped before tree fetch
+
+
+# ===========================================================================
+# Generic git-clone sync path (git: true)
+# ===========================================================================
+
+class TestSyncGitRepo:
+    """Tests for the generic git-clone sync path (git=True / clone_url)."""
+
+    _SYNC_GIT = (
+        "bamboo_mcp_services.agents.github_doc_sync_agent"
+        ".github_markdown_sync.sync_git_repo"
+    )
+    _SYNC_WIKI = (
+        "bamboo_mcp_services.agents.github_doc_sync_agent"
+        ".github_markdown_sync.sync_wiki_repo"
+    )
+
+    def test_sync_repo_dispatches_to_git(self, tmp_path):
+        """sync_repo with git=True must call sync_git_repo."""
+        cfg = RepoConfig(
+            name="simgrid/simgrid",
+            destination=str(tmp_path),
+            git=True,
+            clone_url="https://framagit.org/simgrid/simgrid.git",
+        )
+        with patch(self._SYNC_GIT) as mock_git:
+            from bamboo_mcp_services.agents.github_doc_sync_agent.github_markdown_sync import sync_repo
+            sync_repo(cfg)
+        mock_git.assert_called_once_with(cfg)
+
+    def test_sync_repo_git_does_not_call_wiki(self, tmp_path):
+        """sync_repo with git=True must NOT call sync_wiki_repo."""
+        cfg = RepoConfig(
+            name="simgrid/simgrid",
+            destination=str(tmp_path),
+            git=True,
+            clone_url="https://framagit.org/simgrid/simgrid.git",
+        )
+        with patch(self._SYNC_GIT), patch(self._SYNC_WIKI) as mock_wiki:
+            from bamboo_mcp_services.agents.github_doc_sync_agent.github_markdown_sync import sync_repo
+            sync_repo(cfg)
+        mock_wiki.assert_not_called()
+
+    def test_sync_git_missing_clone_url_raises(self, tmp_path):
+        """sync_git_repo must raise ValueError when clone_url is not set."""
+        cfg = RepoConfig(
+            name="owner/repo",
+            destination=str(tmp_path),
+            git=True,
+        )
+        from bamboo_mcp_services.agents.github_doc_sync_agent.github_markdown_sync import sync_git_repo
+        with pytest.raises(ValueError, match="clone_url"):
+            sync_git_repo(cfg)
+
+    def test_git_false_does_not_dispatch_to_git(self, tmp_path):
+        """sync_repo with git=False must NOT call sync_git_repo."""
+        cfg = RepoConfig(name="owner/repo", destination=str(tmp_path))
+        _GET_LATEST = (
+            "bamboo_mcp_services.agents.github_doc_sync_agent"
+            ".github_markdown_sync.get_latest_commit"
+        )
+        _GET_TREE = (
+            "bamboo_mcp_services.agents.github_doc_sync_agent"
+            ".github_markdown_sync._get_tree"
+        )
+        with patch(self._SYNC_GIT) as mock_git, \
+             patch(_GET_LATEST, return_value=("abc123", datetime.now(tz=timezone.utc))), \
+             patch(_GET_TREE, return_value=[]):
+            from bamboo_mcp_services.agents.github_doc_sync_agent.github_markdown_sync import sync_repo
+            sync_repo(cfg)
+        mock_git.assert_not_called()
+
+    def test_load_config_reads_git_and_clone_url(self, tmp_path):
+        """load_config must parse git: true and clone_url from YAML."""
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(
+            "repos:\n"
+            "  - name: simgrid/simgrid\n"
+            "    destination: /tmp/raw\n"
+            "    git: true\n"
+            "    clone_url: https://framagit.org/simgrid/simgrid.git\n"
+            "    branch: master\n"
+        )
+        from bamboo_mcp_services.agents.github_doc_sync_agent.github_markdown_sync import load_config
+        repos, _ = load_config(cfg_file)
+        assert len(repos) == 1
+        assert repos[0].git is True
+        assert repos[0].clone_url == "https://framagit.org/simgrid/simgrid.git"
+        assert repos[0].branch == "master"
+
+    def test_load_config_git_defaults_false(self, tmp_path):
+        """load_config must default git to False when not specified."""
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(
+            "repos:\n"
+            "  - name: owner/repo\n"
+            "    destination: /tmp/raw\n"
+        )
+        from bamboo_mcp_services.agents.github_doc_sync_agent.github_markdown_sync import load_config
+        repos, _ = load_config(cfg_file)
+        assert repos[0].git is False
+        assert repos[0].clone_url is None
+
+    def test_git_files_copied_and_normalized(self, tmp_path):
+        """sync_git_repo copies matching files and writes normalized output."""
+        dest = tmp_path / "raw"
+        norm_dest = tmp_path / "rag"
+        cfg = RepoConfig(
+            name="simgrid/simgrid",
+            destination=str(dest),
+            normalized_destination=str(norm_dest),
+            include_patterns=["docs/source/*.rst"],
+            normalize_for_rag=True,
+            git=True,
+            clone_url="https://framagit.org/simgrid/simgrid.git",
+            branch="master",
+        )
+
+        # Build a fake clone with one matching and one non-matching file.
+        clone_target = tmp_path / "clone_base" / "clone"
+        (clone_target / ".git").mkdir(parents=True)
+        (clone_target / "docs" / "source").mkdir(parents=True)
+        (clone_target / "docs" / "source" / "index.rst").write_text(
+            "SimGrid Docs\n============\n", encoding="utf-8"
+        )
+        (clone_target / "README.md").write_text("not matched", encoding="utf-8")
+
+        fake_sha = "cafebabe" * 5
+        _GIT_CLONE_HEAD_SHA = (
+            "bamboo_mcp_services.agents.github_doc_sync_agent"
+            ".github_markdown_sync._git_clone_head_sha"
+        )
+        _GIT_CLONE_HEAD_DT = (
+            "bamboo_mcp_services.agents.github_doc_sync_agent"
+            ".github_markdown_sync._git_clone_head_datetime"
+        )
+
+        import subprocess as _sp
+
+        completed = _sp.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+        class FakeTmpDir:
+            def __enter__(self):
+                return str(tmp_path / "clone_base")
+
+            def __exit__(self, *a):
+                pass
+
+        from bamboo_mcp_services.agents.github_doc_sync_agent.github_markdown_sync import sync_git_repo
+        with patch("subprocess.run", return_value=completed), \
+             patch("tempfile.TemporaryDirectory", return_value=FakeTmpDir()), \
+             patch(_GIT_CLONE_HEAD_SHA, return_value=fake_sha), \
+             patch(_GIT_CLONE_HEAD_DT, return_value=datetime.now(tz=timezone.utc)):
+            sync_git_repo(cfg)
+
+        out_file = dest / "simgrid" / "simgrid" / "docs" / "source" / "index.rst"
+        assert out_file.exists(), "index.rst should be copied to dest"
+        readme = dest / "simgrid" / "simgrid" / "README.md"
+        assert not readme.exists(), "README.md should not be copied (not in include_patterns)"
+        norm_file = norm_dest / "simgrid" / "simgrid" / "docs" / "source" / "index.rst"
+        assert norm_file.exists(), "index.rst should be normalized to norm_dest"
+        norm_text = norm_file.read_text()
+        assert "source_repo: simgrid/simgrid" in norm_text
+
+    def test_git_branch_passed_to_clone(self, tmp_path):
+        """sync_git_repo must pass -b {branch} to git clone when branch is set."""
+        cfg = RepoConfig(
+            name="simgrid/simgrid",
+            destination=str(tmp_path),
+            git=True,
+            clone_url="https://framagit.org/simgrid/simgrid.git",
+            branch="master",
+        )
+        import subprocess as _sp
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return _sp.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        clone_target = tmp_path / "clone_base" / "clone"
+        clone_target.mkdir(parents=True)
+        (clone_target / ".git").mkdir()
+
+        _GIT_CLONE_HEAD_SHA = (
+            "bamboo_mcp_services.agents.github_doc_sync_agent"
+            ".github_markdown_sync._git_clone_head_sha"
+        )
+        _GIT_CLONE_HEAD_DT = (
+            "bamboo_mcp_services.agents.github_doc_sync_agent"
+            ".github_markdown_sync._git_clone_head_datetime"
+        )
+
+        class FakeTmpDir:
+            def __enter__(self):
+                return str(tmp_path / "clone_base")
+
+            def __exit__(self, *a):
+                pass
+
+        from bamboo_mcp_services.agents.github_doc_sync_agent.github_markdown_sync import sync_git_repo
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch("tempfile.TemporaryDirectory", return_value=FakeTmpDir()), \
+             patch(_GIT_CLONE_HEAD_SHA, return_value="aabbcc"), \
+             patch(_GIT_CLONE_HEAD_DT, return_value=datetime.now(tz=timezone.utc)):
+            sync_git_repo(cfg)
+
+        clone_call = calls[0]
+        assert "-b" in clone_call
+        assert "master" in clone_call
+        assert "https://framagit.org/simgrid/simgrid.git" in clone_call
+
+    def test_git_second_run_skips_unchanged_sha(self, tmp_path):
+        """sync_git_repo with matching SHA must skip without copying files."""
+        import json
+        dest_root = tmp_path / "raw"
+        per_repo = dest_root / "simgrid" / "simgrid"
+        per_repo.mkdir(parents=True)
+        state_path = per_repo / ".sync_state.json"
+        known_sha = "deadbeef" * 5
+        state_path.write_text(json.dumps({
+            "last_commit_sha": known_sha,
+            "last_sync_time": "2026-01-01T00:00:00+00:00",
+            "files_downloaded": 10,
+        }))
+        cfg = RepoConfig(
+            name="simgrid/simgrid",
+            destination=str(dest_root),
+            git=True,
+            clone_url="https://framagit.org/simgrid/simgrid.git",
+        )
+        import subprocess as _sp
+        completed = _sp.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+        clone_target = tmp_path / "clone_base" / "clone"
+        clone_target.mkdir(parents=True)
+        (clone_target / ".git").mkdir()
+
+        _GIT_CLONE_HEAD_SHA = (
+            "bamboo_mcp_services.agents.github_doc_sync_agent"
+            ".github_markdown_sync._git_clone_head_sha"
+        )
+        _GIT_CLONE_HEAD_DT = (
+            "bamboo_mcp_services.agents.github_doc_sync_agent"
+            ".github_markdown_sync._git_clone_head_datetime"
+        )
+
+        class FakeTmpDir:
+            def __enter__(self):
+                return str(tmp_path / "clone_base")
+
+            def __exit__(self, *a):
+                pass
+
+        from bamboo_mcp_services.agents.github_doc_sync_agent.github_markdown_sync import sync_git_repo
+        with patch("subprocess.run", return_value=completed), \
+             patch("tempfile.TemporaryDirectory", return_value=FakeTmpDir()), \
+             patch(_GIT_CLONE_HEAD_SHA, return_value=known_sha), \
+             patch(_GIT_CLONE_HEAD_DT, return_value=datetime.now(tz=timezone.utc)):
+            sync_git_repo(cfg)
+
+        # State file must be unchanged.
+        saved = json.loads(state_path.read_text())
+        assert saved["files_downloaded"] == 10

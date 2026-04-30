@@ -50,14 +50,26 @@ class RepoConfig:
     """Configuration for a single repository.
 
     Attributes:
-        name: Repository in 'owner/repo' format.
+        name: Repository in 'owner/repo' format.  Used for logging, directory
+            naming, and RAG metadata.  For git-clone repos this does not need
+            to match a real GitHub owner/repo — any ``owner/label`` that is
+            valid as a filesystem path component works.
         destination: Directory for raw downloaded files.
         normalized_destination: Directory for RAG-normalized files.
         within_hours: Skip if latest commit is older than this many hours.
-        branch: Branch to sync (None = repo default).
+        branch: Branch to sync (None = repo default).  Honoured for both the
+            GitHub REST path and the git-clone path; ignored for wiki repos.
         include_patterns: Glob patterns; only matching files are synced.
         exclude_patterns: Glob patterns; matching files are excluded.
-        normalize_for_rag: Prepend metadata frontmatter and convert RST→MD.
+        normalize_for_rag: Prepend metadata frontmatter and convert RST->MD.
+        wiki: If True, clone the GitHub wiki at
+            ``https://github.com/{owner}/{parent}.wiki.git`` instead of using
+            the REST API.  The ``name`` field must end with ``.wiki``.
+        git: If True, clone an arbitrary git repository specified by
+            ``clone_url`` instead of using the GitHub REST API.  Use this for
+            non-GitHub hosts (GitLab, FramaGit, Bitbucket, etc.).
+        clone_url: HTTPS clone URL used when ``git=True``.  Required when
+            ``git=True``; ignored otherwise.
     """
 
     name: str
@@ -69,6 +81,8 @@ class RepoConfig:
     exclude_patterns: List[str] = field(default_factory=list)
     normalize_for_rag: bool = False
     wiki: bool = False
+    git: bool = False
+    clone_url: Optional[str] = None
 
 
 def parse_repo(repo: str) -> Tuple[str, str]:
@@ -527,23 +541,152 @@ def sync_wiki_repo(cfg: RepoConfig) -> None:
     logger.info("%s: done, %d files saved", cfg.name, downloaded)
 
 
+def sync_git_repo(cfg: RepoConfig) -> None:
+    """Sync an arbitrary git repository by cloning it with git.
+
+    Unlike :func:`sync_wiki_repo`, which is specific to GitHub wikis, this
+    function works with any publicly-accessible git repository: GitLab,
+    FramaGit, Bitbucket, Gitea, or any other host.  The clone URL must be
+    supplied explicitly via ``cfg.clone_url``.
+
+    The ``branch`` field is respected: when set, the clone uses
+    ``git clone -b {branch} --depth 1``; otherwise the remote default branch
+    is used.
+
+    All other behaviour — ``within_hours`` gating, SHA-unchanged skip, glob
+    filtering, file copy, and RAG normalisation — is identical to
+    :func:`sync_wiki_repo`.
+
+    Args:
+        cfg: Repository configuration.  ``cfg.git`` must be ``True`` and
+            ``cfg.clone_url`` must be a non-empty string.
+
+    Raises:
+        ValueError: If ``clone_url`` is missing.
+        RuntimeError: On git clone failures or I/O errors.
+    """
+    if not cfg.clone_url:
+        raise ValueError(
+            f"git=True requires clone_url to be set for repo {cfg.name!r}"
+        )
+
+    owner, repo_name = parse_repo(cfg.name)
+    dest_root = Path(cfg.destination)
+    dest = dest_root / owner / repo_name
+    dest.mkdir(parents=True, exist_ok=True)
+    state_path = dest / ".sync_state.json"
+    state = load_state(state_path)
+
+    clone_cmd = ["git", "clone", "--depth", "1"]
+    if cfg.branch:
+        clone_cmd += ["-b", cfg.branch]
+    clone_cmd += [cfg.clone_url]
+
+    with tempfile.TemporaryDirectory(prefix="bamboo_git_") as tmpdir:
+        clone_dir = Path(tmpdir) / "clone"
+        clone_cmd.append(str(clone_dir))
+        logger.debug("%s: cloning from %s", cfg.name, cfg.clone_url)
+        result = subprocess.run(clone_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"git clone failed for {cfg.name}: {result.stderr.strip()}"
+            )
+
+        sha = _git_clone_head_sha(clone_dir)
+        commit_dt = _git_clone_head_datetime(clone_dir)
+
+        if cfg.within_hours is not None and state.last_commit_sha is not None:
+            now = datetime.now(tz=timezone.utc)
+            age_hours = (now - commit_dt).total_seconds() / 3600
+            if age_hours > cfg.within_hours:
+                logger.info(
+                    "%s: latest commit is %.1fh old (limit %dh) — skipping",
+                    cfg.name, age_hours, cfg.within_hours,
+                )
+                return
+
+        if sha == state.last_commit_sha:
+            logger.info("%s: already up-to-date at %s", cfg.name, sha[:12])
+            return
+
+        logger.info(
+            "%s: syncing %s -> %s",
+            cfg.name,
+            (state.last_commit_sha or "none")[:12],
+            sha[:12],
+        )
+
+        all_files = [
+            p.relative_to(clone_dir)
+            for p in clone_dir.rglob("*")
+            if p.is_file() and ".git" not in p.parts
+        ]
+        matching = [
+            f for f in all_files
+            if _matches_patterns(str(f), cfg.include_patterns, cfg.exclude_patterns)
+        ]
+        logger.info("%s: %d matching files to copy", cfg.name, len(matching))
+
+        norm_dest = None
+        if cfg.normalized_destination:
+            norm_dest = Path(cfg.normalized_destination) / owner / repo_name
+            norm_dest.mkdir(parents=True, exist_ok=True)
+
+        downloaded = 0
+        for rel_path in matching:
+            src = clone_dir / rel_path
+            out_path = dest / rel_path
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, out_path)
+            downloaded += 1
+
+            if cfg.normalize_for_rag and norm_dest:
+                try:
+                    text_content = src.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    logger.warning(
+                        "Skipping normalization of %s (not UTF-8)", rel_path
+                    )
+                    continue
+                normalized = normalize_text(
+                    text_content,
+                    source_repo=cfg.name,
+                    source_path=str(rel_path),
+                    commit_sha=sha,
+                )
+                norm_path = norm_dest / rel_path
+                norm_path.parent.mkdir(parents=True, exist_ok=True)
+                norm_path.write_text(normalized, encoding="utf-8")
+
+    new_state = SyncState(
+        last_commit_sha=sha,
+        last_sync_time=datetime.now(tz=timezone.utc).isoformat(),
+        files_downloaded=downloaded,
+    )
+    save_state(state_path, new_state)
+    logger.info("%s: done, %d files saved", cfg.name, downloaded)
+
+
 def sync_repo(cfg: RepoConfig) -> None:
     """Run a full sync cycle for one repository.
 
     Dispatches to :func:`sync_wiki_repo` when ``cfg.wiki`` is ``True``,
-    otherwise uses the standard GitHub REST API path.
+    to :func:`sync_git_repo` when ``cfg.git`` is ``True``, or otherwise
+    uses the standard GitHub REST API path.
 
     Args:
         cfg: Repository configuration.
 
     Raises:
-        ValueError: If repo name is invalid.
+        ValueError: If repo name is invalid or required fields are missing.
         RuntimeError: On GitHub API, git, or network failures.
     """
-    import sys
-    print(f"DEBUG sync_repo called: wiki={cfg.wiki}, file={__file__}", file=sys.stderr)
     if cfg.wiki:
         sync_wiki_repo(cfg)
+        return
+
+    if cfg.git:
+        sync_git_repo(cfg)
         return
 
     owner, repo_name = parse_repo(cfg.name)
@@ -667,6 +810,8 @@ def load_config(path: Path) -> Tuple[List[RepoConfig], Dict[str, Any]]:
             exclude_patterns=entry.get("exclude_patterns", []),
             normalize_for_rag=entry.get("normalize_for_rag", False),
             wiki=entry.get("wiki", False),
+            git=entry.get("git", False),
+            clone_url=entry.get("clone_url"),
         )
         for entry in raw.get("repos", [])
     ]

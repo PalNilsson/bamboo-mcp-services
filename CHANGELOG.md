@@ -33,6 +33,47 @@ When running multiple corpora, use a distinct `--collection` **and** a distinct
 Implementation: `build_parser()` gains a `--collection` argument; `_build_agent()`
 passes `args.collection` to `DocumentMonitorAgent(name=...)`.
 
+#### Generic git repository support in `github-doc-sync-agent`
+
+The `github-doc-sync-agent` can now sync documentation from **any publicly-accessible
+git repository**, not just GitHub or GitHub wikis.  This includes GitLab,
+FramaGit, Bitbucket, Gitea, and any other host that exposes a public HTTPS clone URL.
+
+To enable, set `git: true` and provide a `clone_url` in the repo entry:
+
+```yaml
+- name: simgrid/simgrid
+  git: true
+  clone_url: https://framagit.org/simgrid/simgrid.git
+  branch: master
+  destination: ./data/simgrid/raw
+  normalized_destination: ./data/simgrid/normalized
+  within_hours: 168
+  include_patterns:
+    - "docs/source/*.rst"
+  normalize_for_rag: true
+```
+
+The `name` field is used for logging, directory naming, and RAG metadata only
+— it does not need to match an actual GitHub owner/repo path.  The `branch`
+field is respected and passed as `-b` to `git clone`.
+
+Implementation details:
+
+- New `git: bool = False` and `clone_url: Optional[str] = None` fields on `RepoConfig`.
+- New `sync_git_repo()` function in `github_markdown_sync.py` that clones the
+  repository via `clone_url`, reads the HEAD SHA and committer datetime, applies
+  the same `within_hours` and SHA-unchanged skip logic as the other paths, and
+  copies and normalises matching files identically to `sync_wiki_repo()`.
+- `sync_repo()` dispatch order: `wiki=True` → `sync_wiki_repo()`, `git=True` →
+  `sync_git_repo()`, otherwise → GitHub REST API path.
+- `load_config()` and `_load_repo_configs()` (CLI) both read the new fields,
+  defaulting to `False`/`None` when absent.
+- Generic git clones do not count against the GitHub REST API rate limit.
+- 9 new tests covering dispatch routing, missing `clone_url` validation, branch
+  flag passing, file copy and normalisation, SHA-unchanged skip, and
+  `load_config` YAML parsing.
+
 #### GitHub wiki support in `github-doc-sync-agent`
 
 The `github-doc-sync-agent` can now sync **GitHub wiki repositories** in
