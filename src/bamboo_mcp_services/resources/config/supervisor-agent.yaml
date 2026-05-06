@@ -1,0 +1,107 @@
+# supervisor-agent.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+# Bamboo MCP Services — Supervisor Agent Configuration
+#
+# The supervisor starts and monitors all other Bamboo agents.  Run it with:
+#
+#   bamboo-supervisor --config supervisor-agent.yaml
+#
+# Or use the bundled default by just running:
+#
+#   bamboo-supervisor
+#
+# Each agent entry supports the following keys:
+#
+#   name            (required) Unique identifier used in logs and health reports.
+#   mode            (required) "daemon" — long-running, auto-restarted on exit.
+#                              "scheduled" — short-lived --once run on an interval.
+#   command         (required) Argument list passed verbatim to the OS.
+#   enabled         (optional, default true) Set to false to skip this agent.
+#   interval_s      (required for mode=scheduled) Seconds between one-shot runs.
+#   depends_on_file (optional) Path that must exist before this agent is started.
+#   depends_timeout_s (optional, default 120) Seconds to wait for depends_on_file.
+#   run_timeout_s   (optional) Kill scheduled one-shots that exceed this duration.
+#                              Defaults to interval_s * 2 (minimum 60s).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+# How often the supervisor polls daemon health and dispatches scheduled jobs.
+health_poll_interval_s: 30
+
+# Seconds to wait for child processes to exit after SIGTERM before SIGKILL.
+stop_timeout_s: 30
+
+# Supervisor's own rotating log file.
+# The --log-file CLI flag overrides this value.
+log_file: supervisor-agent.log
+log_level: INFO
+
+agents:
+
+  # ── cric-agent ──────────────────────────────────────────────────────────────
+  # Reads ATLAS queue metadata from CVMFS and stores it in cric.duckdb.
+  # Runs as a long-lived daemon; re-reads the CVMFS file every 10 minutes.
+  # The ingestion agent depends on this file, so cric is started first.
+  - name: cric
+    enabled: true
+    mode: daemon
+    command:
+      - bamboo-cric
+      - --config
+      - src/bamboo_mcp_services/resources/config/cric-agent.yaml
+      - --data
+      - cric.duckdb
+      - --log-file
+      - cric-agent.log
+
+  # ── ingestion-agent ─────────────────────────────────────────────────────────
+  # Downloads job metadata from BigPanda for all ATLAS queues; stores results
+  # in jobs.duckdb.  Consumes the CRIC queue list from cric.duckdb.
+  # Waits up to 120 s for cric.duckdb to appear before starting.
+  - name: ingestion
+    enabled: true
+    mode: daemon
+    depends_on_file: cric.duckdb
+    depends_timeout_s: 120
+    command:
+      - bamboo-ingestion
+      - --config
+      - src/bamboo_mcp_services/resources/config/ingestion-agent.yaml
+      - --log-file
+      - ingestion-agent.log
+
+  # ── github-doc-sync-agent ───────────────────────────────────────────────────
+  # Polls configured GitHub repositories for documentation changes and writes
+  # normalised Markdown to the local data directory for RAG ingestion.
+  # Run as a scheduled one-shot every hour.
+  - name: github-sync
+    enabled: true
+    mode: scheduled
+    interval_s: 3600
+    command:
+      - bamboo-github-sync
+      - --config
+      - src/bamboo_mcp_services/resources/config/github-doc-sync-agent.yaml
+      - --once
+      - --log-file
+      - github-doc-sync-agent.log
+
+  # ── document-monitor-agent ──────────────────────────────────────────────────
+  # Monitors the normalised documentation directory for new or changed files
+  # and ingests them into ChromaDB for RAG queries.
+  # Adjust --dir to match the normalized_destination in github-doc-sync-agent.yaml.
+  # Run as a scheduled one-shot every 10 minutes so ChromaDB stays fresh after
+  # each github-sync run.
+  - name: document-monitor
+    enabled: true
+    mode: scheduled
+    interval_s: 600
+    command:
+      - bamboo-document-monitor
+      - --dir
+      - ./data/panda-docs/normalized
+      - --chroma-dir
+      - .chromadb
+      - --once
+      - --log-file
+      - document-monitor-agent.log

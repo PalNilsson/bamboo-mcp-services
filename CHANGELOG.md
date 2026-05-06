@@ -9,6 +9,87 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [Unreleased]
+
+### Added
+
+#### `supervisor-agent` — single entry point for the full system
+
+A new `supervisor-agent` manages all other Bamboo MCP Services agents as child
+subprocesses.  Operators no longer need to start, monitor, or restart individual
+agents manually.
+
+```bash
+bamboo-supervisor --config supervisor-agent.yaml
+```
+
+**Two operating modes, configurable per agent:**
+
+* **`daemon`** — the agent process runs indefinitely.  The supervisor polls it
+  every `health_poll_interval_s` seconds and restarts it if it exits.
+  Rapid-restart loops trigger exponential back-off (5 s → 10 s → 20 s … capped
+  at 300 s) to prevent hammering a failing dependency.
+
+* **`scheduled`** — a short-lived `--once` process is launched on a fixed
+  `interval_s` cadence.  The supervisor waits for it to complete, records the
+  exit code, then schedules the next run.  Runs that exceed `run_timeout_s` are
+  killed and an error is logged.
+
+**Default configuration** (in `supervisor-agent.yaml`) starts:
+
+| Agent | Mode | Cadence |
+|---|---|---|
+| `cric` | daemon | continuous |
+| `ingestion` | daemon | continuous (waits for `cric.duckdb`) |
+| `github-sync` | scheduled | every hour |
+| `document-monitor` | scheduled | every 10 minutes |
+
+**Dependency ordering** — the `depends_on_file` / `depends_timeout_s` config
+keys allow an agent to wait for a file written by another agent before starting.
+Used to ensure `cric.duckdb` is populated before the ingestion agent reads it.
+
+**Operational features:**
+
+* `bamboo-supervisor --status` prints a JSON config summary and exits — no
+  processes are started.  Useful for verifying configuration on a new machine.
+* `bamboo-supervisor --once` starts all agents, runs one health-poll tick
+  (dispatching due scheduled jobs), logs the health report as JSON, then stops
+  cleanly.
+* Rotating log file (`supervisor-agent.log`, 10 MB × 5 backups); each managed
+  agent continues writing to its own separate log.
+* Clean SIGTERM / SIGINT propagation: the supervisor forwards SIGTERM to all
+  children and waits `stop_timeout_s` before escalating to SIGKILL.
+
+**Future extension point** — a lightweight HTTP health endpoint
+(`GET /health → JSON`) is planned for remote deployments.  The data structure
+is already fully defined in `SupervisorAgent.health()`; the HTTP layer will be
+a thin wrapper added in a future release.  See `TODO: HTTP health endpoint`
+comments in `agent.py`.
+
+**New files:**
+
+* `src/bamboo_mcp_services/agents/supervisor_agent/__init__.py`
+* `src/bamboo_mcp_services/agents/supervisor_agent/scheduler.py` — per-agent
+  scheduling state (`DaemonState`, `ScheduledState`, `AgentConfig`).  Pure
+  Python with no subprocess calls, making it fully unit-testable in isolation.
+* `src/bamboo_mcp_services/agents/supervisor_agent/agent.py` — `SupervisorAgent`
+  implementation.
+* `src/bamboo_mcp_services/agents/supervisor_agent/cli.py` — `bamboo-supervisor`
+  entry point.
+* `src/bamboo_mcp_services/resources/config/supervisor-agent.yaml` — default
+  config covering all four production agents.
+* `tests/agents/supervisor_agent/test_supervisor_agent.py` — 22 tests covering
+  daemon start/restart/back-off/stop, scheduled dispatch/skip/timeout/advance,
+  dependency waiting, config loading, and the `--status` / `--once` CLI flags.
+  All subprocess interaction is mocked.
+* `README-supervisor-agent.md` — full operator guide.
+
+**`pyproject.toml`** — added `bamboo-supervisor` entry point.
+
+**`README.md`** — updated status table (supervisor-agent now ✅ Ready), added
+"Run the supervisor" section to Getting started, updated repository layout,
+added link to `README-supervisor-agent.md`.
+
 ### Added
 
 #### Configurable ChromaDB collection name in `document-monitor-agent`

@@ -3,7 +3,7 @@
 **Bamboo MCP Services** is a collection of cooperative, Python-based services that feed data into the **Bamboo Toolkit**, supporting the ATLAS Experiment at CERN.
 
 > ⚠️ **Early development**
-> This repository is under active development. The `document-monitor`, `ingestion`, and `cric` services are ready for use. Other agents are planned.
+> This repository is under active development. The `document-monitor`, `ingestion`, `cric`, `github-doc-sync`, and `supervisor` services are ready for use. Other agents are planned.
 
 ---
 
@@ -15,8 +15,8 @@
 | `ingestion-agent` | ✅ Ready |
 | `cric-agent` | ✅ Ready |
 | `github-doc-sync-agent` | ✅ Ready |
+| `supervisor-agent` | ✅ Ready |
 | `dast-agent` | 📋 Planned |
-| `supervisor-agent` | 📋 Planned |
 | `index-builder-agent` | 📋 Planned |
 | `feedback-agent` | 📋 Planned |
 | `metrics-agent` | 📋 Planned |
@@ -52,6 +52,28 @@ For development (includes pytest and flake8):
 ```bash
 pip install -e ".[dev]"
 ```
+
+### Run all agents with the supervisor (recommended)
+
+The supervisor is the easiest way to run the full system.  It starts every agent,
+monitors daemons for unexpected exits, and dispatches scheduled jobs — no manual
+juggling of individual processes needed.
+
+```bash
+# Copy and edit the bundled config (first time only)
+cp src/bamboo_mcp_services/resources/config/supervisor-agent.yaml ./supervisor-agent.yaml
+$EDITOR supervisor-agent.yaml   # adjust paths, enable/disable agents as needed
+
+# Start everything
+bamboo-supervisor --config supervisor-agent.yaml
+
+# Verify the config without starting anything
+bamboo-supervisor --config supervisor-agent.yaml --status
+```
+
+Stop with **Ctrl-C** or `kill -TERM <pid>`.
+
+Full documentation: [README-supervisor-agent.md](./README-supervisor-agent.md)
 
 ### Run the document monitor agent
 
@@ -177,11 +199,29 @@ Key features:
 
 → [Full documentation](./README-github_doc_sync_agent.md)
 
+### `supervisor-agent` ✅ Ready
+
+Acts as the control plane for the full Bamboo MCP Services system.  Starts all
+other agents as child subprocesses, monitors long-running (daemon) agents and
+restarts them on failure with exponential back-off, and dispatches
+short-lived (scheduled) agents on a configurable interval.  Provides a single
+`bamboo-supervisor` command to bring up the entire system.
+
+Key features:
+- Mixed daemon/scheduled mode: each agent independently configured as a
+  long-running daemon or a periodic one-shot
+- Exponential back-off on rapid restarts (5 s → 300 s cap)
+- Dependency ordering via `depends_on_file` — ensures `cric.duckdb` exists
+  before the ingestion agent starts
+- `--status` flag prints a JSON config summary without starting any processes
+- Clean SIGTERM propagation and configurable `stop_timeout_s` before SIGKILL
+- Extensible health reporting (HTTP endpoint planned for remote deployments)
+
+→ [Full documentation](./README-supervisor-agent.md)
+
+### `dast-agent` 📋 Planned
+
 Will extract DAST help-list email threads (e.g. via Outlook), convert them into structured JSON, and run a daily digest pass producing cleaned Q/A pairs, thread summaries, tags, and resolution status. Output feeds RAG corpora and optional fine-tuning datasets.
-
-### `supervisor-agent` 📋 Planned
-
-Will act as a control plane — ensuring required agents and services are running, restarting agents on failure, enforcing schedules, and providing a single entry point to bring up the full system.
 
 ### `index-builder-agent` 📋 Planned
 
@@ -216,7 +256,7 @@ class Agent:
         """Gracefully release resources and shut down."""
 ```
 
-Long-running agents run a scheduler loop calling `tick()`. Batch agents may run `start() → tick() → stop()` once. The `supervisor-agent` will interact only through this interface.
+Long-running agents run a scheduler loop calling `tick()`. Batch agents may run `start() → tick() → stop()` once. The `supervisor-agent` interacts with child processes through their CLI entry points rather than this interface directly, but follows the same lifecycle itself.
 
 A minimal no-op `dummy-agent` is included as a template and for validating the lifecycle:
 
@@ -233,11 +273,12 @@ Stop with Ctrl+C or SIGTERM. When adding a new agent, register its entry point i
 ```
 bamboo-mcp-services/
 ├─ README.md
-├─ CHANGELOG.md
+├─ README-supervisor-agent.md
 ├─ README-document_monitor_agent.md
 ├─ README-ingestion_agent.md
 ├─ README-cric_agent.md
 ├─ README-github_doc_sync_agent.md
+├─ CHANGELOG.md
 ├─ pyproject.toml
 ├─ requirements.txt
 ├─ scripts/
@@ -267,9 +308,13 @@ bamboo-mcp-services/
 │     │  │  ├─ github_markdown_sync.py  # vendored from github-documentation-sync
 │     │  │  └─ cli.py
 │     │  ├─ document_monitor_agent/
+│     │  ├─ supervisor_agent/
+│     │  │  ├─ __init__.py
+│     │  │  ├─ agent.py               # SupervisorAgent
+│     │  │  ├─ scheduler.py           # per-agent scheduling state
+│     │  │  └─ cli.py                 # bamboo-supervisor entry point
 │     │  ├─ dummy_agent/
 │     │  ├─ dast_agent/              # planned
-│     │  ├─ supervisor_agent/        # planned
 │     │  ├─ index_builder_agent/     # planned
 │     │  ├─ feedback_agent/          # planned
 │     │  └─ metrics_agent/           # planned
@@ -278,12 +323,15 @@ bamboo-mcp-services/
 │        └─ config/
 │           ├─ ingestion-agent.yaml
 │           ├─ cric-agent.yaml
-│           └─ github-doc-sync-agent.yaml
+│           ├─ github-doc-sync-agent.yaml
+│           └─ supervisor-agent.yaml
 ├─ tests/
 │  └─ agents/
 │     ├─ ingestion_agent/
 │     ├─ cric_agent/
 │     ├─ github_doc_sync_agent/
+│     ├─ supervisor_agent/
+│     │  └─ test_supervisor_agent.py
 │     ├─ dummy_agent/
 │     └─ test_base_agent.py
 └─ .github/
