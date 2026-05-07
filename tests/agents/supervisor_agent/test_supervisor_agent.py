@@ -245,11 +245,12 @@ class TestSupervisorAgentDaemon(unittest.TestCase):
     @patch("bamboo_mcp_services.agents.supervisor_agent.agent.subprocess.Popen")
     def test_daemon_restarted_on_exit(self, mock_popen):
         """When a daemon process exits, the next tick should restart it."""
-        live_proc = _make_mock_proc(pid=200, returncode=None)
-        dead_proc = _make_mock_proc(pid=201, returncode=1)
+        flaky_proc = _make_mock_proc(pid=200, returncode=None)
+        stable_proc = _make_mock_proc(pid=201, returncode=None)
         restarted_proc = _make_mock_proc(pid=202, returncode=None)
 
-        mock_popen.side_effect = [live_proc, dead_proc, restarted_proc]
+        # start() launches flaky then stable; tick() restarts flaky after it dies.
+        mock_popen.side_effect = [flaky_proc, stable_proc, restarted_proc]
 
         cfg = SupervisorConfig(agents=[
             _daemon_cfg(name="flaky"),
@@ -461,7 +462,7 @@ class TestSupervisorAgentDependency(unittest.TestCase):
         """Agent with a depends_on_file that already exists should start immediately."""
         mock_popen.return_value = _make_mock_proc(pid=1000)
 
-        with patch("os.path.exists", return_value=True):
+        with patch("bamboo_mcp_services.agents.supervisor_agent.agent.os.path.exists", return_value=True):
             cfg = SupervisorConfig(agents=[
                 _daemon_cfg(name="dependent", depends_on_file="/some/cric.duckdb")
             ])
@@ -476,8 +477,12 @@ class TestSupervisorAgentDependency(unittest.TestCase):
         """Agent should start once the dependency file appears mid-wait."""
         mock_popen.return_value = _make_mock_proc(pid=1001)
 
-        # exists() returns False once, then True.
-        with patch("os.path.exists", side_effect=[False, True]):
+        # _wait_for_dependency: first call (immediate check) → False,
+        # then inside the loop after sleep → True.
+        with patch(
+            "bamboo_mcp_services.agents.supervisor_agent.agent.os.path.exists",
+            side_effect=[False, True],
+        ):
             cfg = SupervisorConfig(agents=[
                 _daemon_cfg(
                     name="waiter",
@@ -497,12 +502,17 @@ class TestSupervisorAgentDependency(unittest.TestCase):
         """After depends_timeout_s, the agent starts even without the file."""
         mock_popen.return_value = _make_mock_proc(pid=1002)
 
-        # Simulate monotonic advancing past the deadline quickly.
+        # _wait_for_dependency calls monotonic() twice before the while loop
+        # (once for deadline = monotonic() + timeout, once for the while condition),
+        # then the while condition fires again with a value past the deadline.
         start = 1000.0
         timeout = 5.0
         mock_mono.side_effect = [start, start, start + timeout + 1]
 
-        with patch("os.path.exists", return_value=False):
+        with patch(
+            "bamboo_mcp_services.agents.supervisor_agent.agent.os.path.exists",
+            return_value=False,
+        ):
             cfg = SupervisorConfig(agents=[
                 _daemon_cfg(
                     name="impatient",

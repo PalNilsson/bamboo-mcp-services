@@ -180,29 +180,32 @@ class SupervisorAgent(Agent):
         After ``config.stop_timeout_s`` any process that has not exited receives
         SIGKILL.
         """
-        # Collect every live process handle.
-        all_procs: list[tuple[str, subprocess.Popen]] = []
+        live_procs = [
+            (name, proc)
+            for name, proc in self._daemon_procs.items()
+            if proc.poll() is None
+        ]
+        self._sigterm_scheduled()
+        self._sigterm_daemons(live_procs)
+        self._wait_for_daemons(live_procs)
 
-        for name, proc in list(self._daemon_procs.items()):
-            if proc.poll() is None:
-                all_procs.append((name, proc))
-
+    def _sigterm_scheduled(self) -> None:
+        """Send SIGTERM to any scheduled one-shot processes currently in flight."""
         for name, state in self._scheduled_states.items():
-            # A scheduled one-shot may be in flight.
-            if state.running_pid is not None:
-                # We don't keep the Popen handle for scheduled processes after
-                # wait() returns, so we use os.kill directly.
-                try:
-                    os.kill(state.running_pid, signal.SIGTERM)
-                    logger.info(
-                        "Sent SIGTERM to scheduled agent '%s' (pid=%d).",
-                        name, state.running_pid,
-                    )
-                except ProcessLookupError:
-                    pass
+            if state.running_pid is None:
+                continue
+            try:
+                os.kill(state.running_pid, signal.SIGTERM)
+                logger.info(
+                    "Sent SIGTERM to scheduled agent '%s' (pid=%d).",
+                    name, state.running_pid,
+                )
+            except ProcessLookupError:
+                pass
 
-        # SIGTERM to daemon processes.
-        for name, proc in all_procs:
+    def _sigterm_daemons(self, live_procs: list) -> None:
+        """Send SIGTERM to each live daemon process."""
+        for name, proc in live_procs:
             logger.info(
                 "Sending SIGTERM to daemon agent '%s' (pid=%d).", name, proc.pid
             )
@@ -211,16 +214,17 @@ class SupervisorAgent(Agent):
             except ProcessLookupError:
                 pass
 
-        # Wait up to stop_timeout_s for graceful shutdown.
+    def _wait_for_daemons(self, live_procs: list) -> None:
+        """Wait for daemon processes to exit; escalate to SIGKILL on timeout."""
         deadline = time.monotonic() + self._config.stop_timeout_s
-        for name, proc in all_procs:
+        for name, proc in live_procs:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
             try:
                 proc.wait(timeout=remaining)
                 logger.info(
-                    "Daemon agent '%s' exited (rc=%d).", name, proc.returncode
+                    "Daemon agent '%s' exited (rc=%s).", name, proc.returncode
                 )
             except subprocess.TimeoutExpired:
                 logger.warning(
@@ -228,7 +232,10 @@ class SupervisorAgent(Agent):
                     name, self._config.stop_timeout_s,
                 )
                 proc.kill()
-                proc.wait()
+                try:
+                    proc.wait()
+                except Exception:
+                    pass
 
     def _health_details(self) -> Mapping[str, Any]:
         """Return per-agent health details for inclusion in the ``HealthReport``.
@@ -360,7 +367,10 @@ class SupervisorAgent(Agent):
                     name, timeout,
                 )
                 proc.kill()
-                proc.wait()
+                try:
+                    proc.wait()
+                except Exception:
+                    pass
                 state.record_completion(exit_code=-1)
 
     # ── Dependency helpers ─────────────────────────────────────────────────────
