@@ -473,12 +473,23 @@ class TestSupervisorAgentDependency(unittest.TestCase):
 
     @patch("bamboo_mcp_services.agents.supervisor_agent.agent.subprocess.Popen")
     @patch("bamboo_mcp_services.agents.supervisor_agent.agent.time.sleep")
-    def test_dependency_file_appears_during_wait(self, mock_sleep, mock_popen):
+    @patch("bamboo_mcp_services.agents.supervisor_agent.agent.time.monotonic")
+    def test_dependency_file_appears_during_wait(self, mock_mono, mock_sleep, mock_popen):
         """Agent should start once the dependency file appears mid-wait."""
         mock_popen.return_value = _make_mock_proc(pid=1001)
 
-        # _wait_for_dependency: first call (immediate check) → False,
-        # then inside the loop after sleep → True.
+        # monotonic() calls in _wait_for_dependency + _launch_daemon:
+        #   1. deadline = monotonic() + timeout          → t0
+        #   2. while monotonic() < deadline (iter 1)     → t0       (enters loop)
+        #   3. while monotonic() < deadline (iter 2)     → t0       (exits — exists() returned True)
+        # Actually exists() returns True on 2nd call so the loop body returns before
+        # the while condition is re-evaluated; _launch_daemon then calls monotonic() once.
+        t0 = 1000.0
+        mock_mono.side_effect = [t0, t0, t0, t0]
+
+        # _wait_for_dependency calls os.path.exists twice:
+        #   1. initial check (line 391) → False  (enters wait loop)
+        #   2. inside loop after sleep  → True   (returns immediately)
         with patch(
             "bamboo_mcp_services.agents.supervisor_agent.agent.os.path.exists",
             side_effect=[False, True],
@@ -502,12 +513,14 @@ class TestSupervisorAgentDependency(unittest.TestCase):
         """After depends_timeout_s, the agent starts even without the file."""
         mock_popen.return_value = _make_mock_proc(pid=1002)
 
-        # _wait_for_dependency calls monotonic() twice before the while loop
-        # (once for deadline = monotonic() + timeout, once for the while condition),
-        # then the while condition fires again with a value past the deadline.
-        start = 1000.0
+        # monotonic() calls through _wait_for_dependency and into _launch_daemon:
+        #   1. deadline = monotonic() + timeout                  → t0
+        #   2. while monotonic() < deadline  (enters loop)       → t0        (t0 < t0+5 → True)
+        #   3. while monotonic() < deadline  (exits loop)        → t0+6      (t0+6 < t0+5 → False)
+        #   4. _launch_daemon: if monotonic() < next_restart_after → t0+6    (0.0 → no back-off)
+        t0 = 1000.0
         timeout = 5.0
-        mock_mono.side_effect = [start, start, start + timeout + 1]
+        mock_mono.side_effect = [t0, t0, t0 + timeout + 1, t0 + timeout + 1]
 
         with patch(
             "bamboo_mcp_services.agents.supervisor_agent.agent.os.path.exists",
