@@ -478,26 +478,30 @@ class TestSupervisorAgentDependency(unittest.TestCase):
         """Agent should start once the dependency file appears mid-wait."""
         mock_popen.return_value = _make_mock_proc(pid=1001)
 
-        # monotonic() calls in _wait_for_dependency + _launch_daemon:
-        #   1. deadline = monotonic() + timeout          → t0
-        #   2. while monotonic() < deadline (iter 1)     → t0       (enters loop)
-        #   3. while monotonic() < deadline (iter 2)     → t0       (exits — exists() returned True)
-        # Actually exists() returns True on 2nd call so the loop body returns before
-        # the while condition is re-evaluated; _launch_daemon then calls monotonic() once.
         t0 = 1000.0
         mock_mono.side_effect = [t0, t0, t0, t0]
 
-        # _wait_for_dependency calls os.path.exists twice:
-        #   1. initial check (line 391) → False  (enters wait loop)
-        #   2. inside loop after sleep  → True   (returns immediately)
+        dep_path = "/tmp/cric-test-sentinel.duckdb"
+        # Call counter: first call to dep_path → False, subsequent → True.
+        # All other paths (e.g. logging handler checking its own log file) are
+        # passed through to the real os.path.exists so they never exhaust a list.
+        import os as _real_os
+        dep_call_count = [0]
+
+        def _exists_side_effect(path):
+            if path == dep_path:
+                dep_call_count[0] += 1
+                return dep_call_count[0] > 1
+            return _real_os.path.exists(path)
+
         with patch(
             "bamboo_mcp_services.agents.supervisor_agent.agent.os.path.exists",
-            side_effect=[False, True],
+            side_effect=_exists_side_effect,
         ):
             cfg = SupervisorConfig(agents=[
                 _daemon_cfg(
                     name="waiter",
-                    depends_on_file="/tmp/cric.duckdb",
+                    depends_on_file=dep_path,
                     depends_timeout_s=10.0,
                 )
             ])
