@@ -49,6 +49,11 @@ from bamboo_mcp_services.agents.supervisor_agent.cli import (
     build_parser,
 )
 
+# Capture the real Popen class at import time, before any @patch decorator
+# replaces subprocess.Popen with a MagicMock.  Speccing a Mock against another
+# Mock raises InvalidSpecError in Python 3.12+.
+_REAL_POPEN = subprocess.Popen
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -76,8 +81,14 @@ def _scheduled_cfg(name="test-scheduled", command=None, interval_s=60.0, enabled
 
 
 def _make_mock_proc(pid=1234, returncode=None):
-    """Return a MagicMock that behaves like a subprocess.Popen object."""
-    proc = MagicMock(spec=subprocess.Popen)
+    """Return a MagicMock that behaves like a subprocess.Popen object.
+
+    Specs against _REAL_POPEN (the class captured at import time) rather than
+    subprocess.Popen, which may have been replaced by a MagicMock by the time
+    this helper is called inside a @patch-decorated test.  Speccing a Mock
+    against another Mock raises InvalidSpecError in Python 3.12+.
+    """
+    proc = MagicMock(spec=_REAL_POPEN)
     proc.pid = pid
     proc.returncode = returncode
     proc.poll.return_value = returncode
@@ -636,10 +647,10 @@ agents:
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_config(tmp, """
 agents:
-  - name: off
+  - name: "off"
     mode: daemon
     enabled: false
-    command: [echo, off]
+    command: [echo, "off"]
 """)
             cfg = _load_config(path)
 

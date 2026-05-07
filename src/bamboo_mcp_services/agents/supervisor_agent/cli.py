@@ -190,9 +190,10 @@ def _load_config(config_path: str) -> Optional[SupervisorConfig]:
     agent_cfgs: list[AgentConfig] = []
     for entry in raw.get("agents", []):
         name = entry.get("name")
-        if not name:
+        if name is None or str(name).strip() == "":
             logger.warning("Skipping agent entry with no 'name': %r", entry)
             continue
+        name = str(name)
 
         mode = entry.get("mode", MODE_DAEMON)
         if mode not in (MODE_DAEMON, MODE_SCHEDULED):
