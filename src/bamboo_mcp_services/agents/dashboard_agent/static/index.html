@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bamboo Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    .card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+    }
+    .card-inner {
+      background: #0f172a;
+      border: 1px solid #1e293b;
+      border-radius: 8px;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    .spin { animation: spin 1s linear infinite; }
+    @keyframes pulse-dot {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
+    .pulse-dot { animation: pulse-dot 2s ease-in-out infinite; }
+    .skeleton {
+      background: linear-gradient(90deg, #1e293b 25%, #273449 50%, #1e293b 75%);
+      background-size: 200% 100%;
+      animation: shimmer 1.5s infinite;
+      border-radius: 4px;
+    }
+    @keyframes shimmer {
+      0% { background-position: 200% 0; }
+      100% { background-position: -200% 0; }
+    }
+    .stat-value {
+      font-variant-numeric: tabular-nums;
+      font-feature-settings: 'tnum';
+    }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0f172a; }
+    ::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #475569; }
+    .error-badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 8px;
+      border-radius: 9999px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    tr:hover td { background: rgba(99, 102, 241, 0.05); }
+  </style>
+</head>
+<body style="background: #0f172a; color: #e2e8f0; min-height: 100vh;">
+
+<!-- ── Header ─────────────────────────────────────────────────────────────── -->
+<header style="background: rgba(30,41,59,0.8); border-bottom: 1px solid #334155; position: sticky; top: 0; z-index: 50; backdrop-filter: blur(12px);">
+  <div style="max-width: 1600px; margin: 0 auto; padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; gap: 16px;">
+    <div style="display: flex; align-items: center; gap: 12px;">
+      <div style="width: 36px; height: 36px; background: linear-gradient(135deg, #22c55e, #15803d); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0;">🎋</div>
+      <div>
+        <div style="font-size: 16px; font-weight: 700; color: #f1f5f9; line-height: 1.2;">Bamboo Dashboard</div>
+        <div style="font-size: 11px; color: #64748b; letter-spacing: 0.03em;">ATLAS PanDA Computing Monitor</div>
+      </div>
+    </div>
+
+    <div style="display: flex; align-items: center; gap: 20px; flex-wrap: wrap;">
+      <!-- DB status -->
+      <div style="display: flex; align-items: center; gap: 8px;" id="db-status-block">
+        <div id="jobs-indicator" style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;">
+          <div class="pulse-dot" style="width:7px;height:7px;border-radius:50%;background:#64748b;flex-shrink:0;" id="jobs-dot"></div>
+          <span id="jobs-db-label">jobs.duckdb</span>
+        </div>
+        <div style="width:1px;height:14px;background:#334155;"></div>
+        <div id="cric-indicator" style="display:flex;align-items:center;gap:5px;font-size:12px;color:#94a3b8;">
+          <div class="pulse-dot" style="width:7px;height:7px;border-radius:50%;background:#64748b;flex-shrink:0;" id="cric-dot"></div>
+          <span id="cric-db-label">cric.duckdb</span>
+        </div>
+      </div>
+
+      <!-- Last updated -->
+      <div style="font-size: 12px; color: #64748b;">
+        Updated <span style="color: #94a3b8;" id="last-update">—</span>
+      </div>
+
+      <!-- Countdown + refresh -->
+      <div style="display:flex;align-items:center;gap:8px;">
+        <div style="font-size:12px;color:#64748b;">
+          Next in <span style="color:#cbd5e1;font-variant-numeric:tabular-nums;" id="countdown">—</span>s
+        </div>
+        <button onclick="doRefresh()" id="refresh-btn"
+          style="display:flex;align-items:center;gap:6px;padding:6px 14px;background:#4f46e5;color:#fff;border:none;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;transition:background 0.15s;">
+          <svg id="refresh-icon" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/>
+            <path d="M21 3v5h-5"/>
+            <path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/>
+            <path d="M8 16H3v5"/>
+          </svg>
+          Refresh
+        </button>
+      </div>
+    </div>
+  </div>
+</header>
+
+<!-- ── Main ───────────────────────────────────────────────────────────────── -->
+<main style="max-width: 1600px; margin: 0 auto; padding: 24px; display: flex; flex-direction: column; gap: 24px;">
+
+  <!-- ── Stat Cards ── -->
+  <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px;" id="stat-grid">
+
+    <div class="card" style="padding: 20px;">
+      <div style="font-size:11px;font-weight:600;color:#64748b;letter-spacing:0.07em;text-transform:uppercase;margin-bottom:8px;">Total Jobs</div>
+      <div class="stat-value" style="font-size:32px;font-weight:700;color:#f1f5f9;line-height:1;" id="stat-total">—</div>
+      <div style="font-size:12px;color:#64748b;margin-top:6px;" id="stat-total-sub">across all queues</div>
+    </div>
+
+    <div class="card" style="padding: 20px;">
+      <div style="font-size:11px;font-weight:600;color:#64748b;letter-spacing:0.07em;text-transform:uppercase;margin-bottom:8px;">Running</div>
+      <div class="stat-value" style="font-size:32px;font-weight:700;color:#38bdf8;line-height:1;" id="stat-running">—</div>
+      <div style="font-size:12px;color:#64748b;margin-top:6px;" id="stat-running-pct">— of total</div>
+    </div>
+
+    <div class="card" style="padding: 20px;">
+      <div style="font-size:11px;font-weight:600;color:#64748b;letter-spacing:0.07em;text-transform:uppercase;margin-bottom:8px;">Failed</div>
+      <div class="stat-value" style="font-size:32px;font-weight:700;color:#f87171;line-height:1;" id="stat-failed">—</div>
+      <div style="font-size:12px;color:#64748b;margin-top:6px;" id="stat-failed-pct">— failure rate</div>
+    </div>
+
+    <div class="card" style="padding: 20px;">
+      <div style="font-size:11px;font-weight:600;color:#64748b;letter-spacing:0.07em;text-transform:uppercase;margin-bottom:8px;">CRIC Queues</div>
+      <div class="stat-value" style="font-size:32px;font-weight:700;color:#4ade80;line-height:1;" id="stat-queues">—</div>
+      <div style="font-size:12px;color:#64748b;margin-top:6px;" id="stat-queues-sub">registered sites</div>
+    </div>
+
+  </div>
+
+  <!-- ── Charts Row ── -->
+  <div style="display: grid; grid-template-columns: 1fr 2fr; gap: 16px;" id="charts-row">
+
+    <!-- Job Status Donut -->
+    <div class="card" style="padding: 20px;">
+      <div style="font-size:13px;font-weight:600;color:#cbd5e1;margin-bottom:16px;">Job Status Distribution</div>
+      <div style="position:relative;height:220px;display:flex;align-items:center;justify-content:center;">
+        <canvas id="status-chart"></canvas>
+        <div style="position:absolute;pointer-events:none;text-align:center;" id="donut-center">
+          <div class="stat-value" style="font-size:22px;font-weight:700;color:#f1f5f9;" id="donut-total">—</div>
+          <div style="font-size:11px;color:#64748b;">jobs</div>
+        </div>
+      </div>
+      <div style="margin-top:16px;display:flex;flex-direction:column;gap:6px;" id="status-legend"></div>
+    </div>
+
+    <!-- Top Queues Bar -->
+    <div class="card" style="padding: 20px;">
+      <div style="font-size:13px;font-weight:600;color:#cbd5e1;margin-bottom:16px;">Top Queues by Job Count</div>
+      <div style="height:260px;">
+        <canvas id="queue-chart"></canvas>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── Bottom Row ── -->
+  <div style="display: grid; grid-template-columns: 3fr 2fr; gap: 16px;">
+
+    <!-- Errors Table -->
+    <div class="card" style="padding: 20px;">
+      <div style="font-size:13px;font-weight:600;color:#cbd5e1;margin-bottom:16px;">Top Errors</div>
+      <div style="overflow-x:auto;">
+        <table style="width:100%;border-collapse:collapse;font-size:13px;">
+          <thead>
+            <tr style="border-bottom:1px solid #334155;">
+              <th style="text-align:left;padding:8px 10px;font-size:11px;font-weight:600;color:#64748b;letter-spacing:0.06em;text-transform:uppercase;white-space:nowrap;">Category</th>
+              <th style="text-align:left;padding:8px 10px;font-size:11px;font-weight:600;color:#64748b;letter-spacing:0.06em;text-transform:uppercase;white-space:nowrap;">Code</th>
+              <th style="text-align:left;padding:8px 10px;font-size:11px;font-weight:600;color:#64748b;letter-spacing:0.06em;text-transform:uppercase;">Diagnostic</th>
+              <th style="text-align:right;padding:8px 10px;font-size:11px;font-weight:600;color:#64748b;letter-spacing:0.06em;text-transform:uppercase;white-space:nowrap;">Count</th>
+            </tr>
+          </thead>
+          <tbody id="errors-tbody">
+            <tr><td colspan="4" style="text-align:center;padding:32px;color:#475569;">Loading errors...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Queue Status & Cloud -->
+    <div class="card" style="padding: 20px; display: flex; flex-direction: column; gap: 20px;">
+      <div>
+        <div style="font-size:13px;font-weight:600;color:#cbd5e1;margin-bottom:12px;">Queue Status</div>
+        <div id="queue-status-list" style="display:flex;flex-direction:column;gap:6px;"></div>
+      </div>
+      <div>
+        <div style="font-size:13px;font-weight:600;color:#cbd5e1;margin-bottom:12px;">Queues by Cloud</div>
+        <div style="height:180px;">
+          <canvas id="cloud-chart"></canvas>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── Data freshness footer ── -->
+  <div style="text-align:center;font-size:11px;color:#334155;padding-bottom:8px;" id="data-footer">
+    —
+  </div>
+
+</main>
+
+<script>
+// ── Constants ────────────────────────────────────────────────────────────────
+const REFRESH_INTERVAL = __REFRESH_INTERVAL__;
+
+const STATUS_COLORS = {
+  finished:     '#22c55e',
+  running:      '#38bdf8',
+  failed:       '#f87171',
+  activated:    '#818cf8',
+  waiting:      '#fbbf24',
+  starting:     '#34d399',
+  holding:      '#fb923c',
+  throttled:    '#c084fc',
+  closed:       '#64748b',
+  cancelled:    '#94a3b8',
+  merging:      '#a78bfa',
+  transferring: '#67e8f9',
+  stagein:      '#fdba74',
+  stageout:     '#fda4af',
+  broken:       '#ef4444',
+};
+
+const ERROR_CATEGORY_COLORS = {
+  pilot:     '#f87171',
+  exe:       '#fb923c',
+  ddm:       '#fbbf24',
+  brokerage: '#818cf8',
+  jobdispatch: '#34d399',
+  taskbuffer: '#67e8f9',
+};
+
+const CLOUD_COLORS = [
+  '#818cf8','#38bdf8','#34d399','#fbbf24','#f87171','#c084fc',
+  '#fdba74','#67e8f9','#a78bfa','#4ade80','#fb923c','#f472b6',
+  '#94a3b8','#cbd5e1','#475569',
+];
+
+// ── State ────────────────────────────────────────────────────────────────────
+let charts = {};
+let countdown = REFRESH_INTERVAL;
+let countdownTimer = null;
+let isLoading = false;
+
+// ── Formatters ───────────────────────────────────────────────────────────────
+function fmtNum(n) {
+  if (n == null || n === undefined) return '—';
+  return Number(n).toLocaleString();
+}
+
+function fmtPct(part, total) {
+  if (!total) return '0%';
+  return (part / total * 100).toFixed(1) + '%';
+}
+
+function fmtAge(isoStr) {
+  if (!isoStr) return 'unknown';
+  const now = Date.now();
+  const then = new Date(isoStr).getTime();
+  const diffMs = now - then;
+  if (isNaN(diffMs)) return isoStr;
+  const diffSec = Math.floor(diffMs / 1000);
+  if (diffSec < 60) return `${diffSec}s ago`;
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  return `${Math.floor(diffHr / 24)}d ago`;
+}
+
+function statusColor(s) {
+  return STATUS_COLORS[s] || '#64748b';
+}
+
+function capitalize(s) {
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+}
+
+function truncate(s, max) {
+  if (!s) return '—';
+  return s.length > max ? s.slice(0, max) + '…' : s;
+}
+
+// ── Chart helpers ─────────────────────────────────────────────────────────────
+function destroyChart(id) {
+  if (charts[id]) {
+    charts[id].destroy();
+    delete charts[id];
+  }
+}
+
+Chart.defaults.color = '#94a3b8';
+Chart.defaults.borderColor = '#1e293b';
+Chart.defaults.font.family = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
+
+function buildStatusChart(byStatus) {
+  destroyChart('status');
+  const ctx = document.getElementById('status-chart');
+  if (!ctx || !byStatus || !byStatus.length) return;
+  const labels = byStatus.map(d => capitalize(d.status));
+  const data = byStatus.map(d => d.count);
+  const colors = byStatus.map(d => statusColor(d.status));
+  charts['status'] = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels,
+      datasets: [{
+        data,
+        backgroundColor: colors,
+        borderColor: '#0f172a',
+        borderWidth: 2,
+        hoverBorderWidth: 3,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      cutout: '68%',
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: ctx => ` ${fmtNum(ctx.raw)} (${fmtPct(ctx.raw, ctx.dataset.data.reduce((a, b) => a + b, 0))})`,
+          },
+        },
+      },
+    },
+  });
+}
+
+function buildQueueChart(queues) {
+  destroyChart('queue');
+  const ctx = document.getElementById('queue-chart');
+  if (!ctx || !queues || !queues.length) return;
+  const labels = queues.map(q => q.queue);
+  const data = queues.map(q => q.count);
+  charts['queue'] = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Jobs',
+        data,
+        backgroundColor: 'rgba(99, 102, 241, 0.7)',
+        borderColor: 'rgba(99, 102, 241, 1)',
+        borderWidth: 1,
+        borderRadius: 3,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      indexAxis: 'y',
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: { label: ctx => ` ${fmtNum(ctx.raw)} jobs` },
+        },
+      },
+      scales: {
+        x: {
+          grid: { color: '#1e293b' },
+          ticks: { color: '#64748b', font: { size: 11 } },
+        },
+        y: {
+          grid: { display: false },
+          ticks: { color: '#94a3b8', font: { size: 11 } },
+        },
+      },
+    },
+  });
+}
+
+function buildCloudChart(byCLoud) {
+  destroyChart('cloud');
+  const ctx = document.getElementById('cloud-chart');
+  if (!ctx || !byCLoud || !byCLoud.length) return;
+  const labels = byCLoud.map(d => d.cloud || 'Unknown');
+  const data = byCLoud.map(d => d.count);
+  charts['cloud'] = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Queues',
+        data,
+        backgroundColor: CLOUD_COLORS.slice(0, labels.length),
+        borderWidth: 0,
+        borderRadius: 3,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      indexAxis: 'y',
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: ctx => ` ${fmtNum(ctx.raw)} queues` } },
+      },
+      scales: {
+        x: {
+          grid: { color: '#1e293b' },
+          ticks: { color: '#64748b', font: { size: 10 } },
+        },
+        y: {
+          grid: { display: false },
+          ticks: { color: '#94a3b8', font: { size: 10 } },
+        },
+      },
+    },
+  });
+}
+
+// ── DOM updates ───────────────────────────────────────────────────────────────
+function updateHeader(status) {
+  const setIndicator = (dotId, labelId, dbInfo, defaultLabel) => {
+    const dot = document.getElementById(dotId);
+    const label = document.getElementById(labelId);
+    if (!dbInfo) return;
+    if (dbInfo.ok) {
+      dot.style.background = '#22c55e';
+      label.textContent = defaultLabel;
+      dot.classList.remove('pulse-dot');
+    } else {
+      dot.style.background = '#f87171';
+      label.textContent = defaultLabel + ' (unavailable)';
+      dot.classList.add('pulse-dot');
+    }
+  };
+  setIndicator('jobs-dot', 'jobs-db-label', status.jobs_db, 'jobs.duckdb');
+  setIndicator('cric-dot', 'cric-db-label', status.cric_db, 'cric.duckdb');
+}
+
+function updateStats(summary, queuesData) {
+  const total = summary.total || 0;
+  const byStatus = summary.by_status || [];
+  const running = byStatus.find(s => s.status === 'running')?.count || 0;
+  const failed = byStatus.find(s => s.status === 'failed')?.count || 0;
+
+  document.getElementById('stat-total').textContent = fmtNum(total);
+  document.getElementById('stat-total-sub').textContent = `across ${byStatus.length} status types`;
+  document.getElementById('stat-running').textContent = fmtNum(running);
+  document.getElementById('stat-running-pct').textContent = total ? fmtPct(running, total) + ' of total' : '—';
+  document.getElementById('stat-failed').textContent = fmtNum(failed);
+  document.getElementById('stat-failed-pct').textContent = total ? fmtPct(failed, total) + ' failure rate' : '—';
+
+  if (queuesData && queuesData.by_status) {
+    const totalQueues = queuesData.by_status.reduce((a, b) => a + b.count, 0);
+    document.getElementById('stat-queues').textContent = fmtNum(totalQueues);
+    const online = queuesData.by_status.find(s => s.status === 'online')?.count || 0;
+    document.getElementById('stat-queues-sub').textContent = online ? `${fmtNum(online)} online` : 'registered sites';
+  }
+
+  document.getElementById('donut-total').textContent = fmtNum(total);
+}
+
+function updateStatusLegend(byStatus) {
+  const el = document.getElementById('status-legend');
+  if (!byStatus || !byStatus.length) { el.innerHTML = ''; return; }
+  const total = byStatus.reduce((a, b) => a + b.count, 0);
+  el.innerHTML = byStatus.slice(0, 8).map(d => `
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+      <div style="display:flex;align-items:center;gap:6px;min-width:0;">
+        <div style="width:8px;height:8px;border-radius:2px;flex-shrink:0;background:${statusColor(d.status)};"></div>
+        <span style="font-size:12px;color:#94a3b8;white-space:nowrap;">${capitalize(d.status)}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;">
+        <span style="font-size:12px;color:#64748b;">${fmtPct(d.count, total)}</span>
+        <span style="font-size:12px;color:#cbd5e1;font-variant-numeric:tabular-nums;">${fmtNum(d.count)}</span>
+      </div>
+    </div>
+  `).join('');
+}
+
+function updateErrorsTable(errors) {
+  const tbody = document.getElementById('errors-tbody');
+  if (!errors || !errors.length) {
+    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:32px;color:#475569;">No errors found</td></tr>';
+    return;
+  }
+  const catColor = cat => ERROR_CATEGORY_COLORS[cat] || '#64748b';
+  tbody.innerHTML = errors.map(e => `
+    <tr>
+      <td style="padding:8px 10px;border-bottom:1px solid #1e293b;">
+        <span class="error-badge" style="background:${catColor(e.error)}22;color:${catColor(e.error)};">
+          ${e.error || '—'}
+        </span>
+      </td>
+      <td style="padding:8px 10px;border-bottom:1px solid #1e293b;font-size:12px;color:#94a3b8;font-family:monospace;white-space:nowrap;">
+        ${e.codename || '—'}
+        ${e.codeval != null ? `<span style="color:#475569;margin-left:4px;">#${e.codeval}</span>` : ''}
+      </td>
+      <td style="padding:8px 10px;border-bottom:1px solid #1e293b;font-size:12px;color:#64748b;max-width:320px;">
+        ${truncate(e.diag, 80)}
+      </td>
+      <td style="padding:8px 10px;border-bottom:1px solid #1e293b;text-align:right;font-size:13px;font-weight:600;color:#f1f5f9;white-space:nowrap;font-variant-numeric:tabular-nums;">
+        ${fmtNum(e.count)}
+      </td>
+    </tr>
+  `).join('');
+}
+
+function updateQueueStatus(queuesData) {
+  const el = document.getElementById('queue-status-list');
+  if (!queuesData || !queuesData.by_status || !queuesData.by_status.length) {
+    el.innerHTML = '<div style="color:#475569;font-size:12px;">No queue data</div>';
+    return;
+  }
+  const total = queuesData.by_status.reduce((a, b) => a + b.count, 0);
+  const STATUS_DOT = {
+    online: '#22c55e',
+    offline: '#64748b',
+    brokeroff: '#f87171',
+    test: '#fbbf24',
+    drain: '#fb923c',
+    standby: '#67e8f9',
+  };
+  el.innerHTML = queuesData.by_status.map(s => `
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+      <div style="display:flex;align-items:center;gap:7px;min-width:0;">
+        <div style="width:7px;height:7px;border-radius:50%;flex-shrink:0;background:${STATUS_DOT[s.status] || '#94a3b8'};"></div>
+        <span style="font-size:12px;color:#94a3b8;">${capitalize(s.status)}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;">
+        <div style="width:80px;height:4px;background:#1e293b;border-radius:2px;overflow:hidden;">
+          <div style="height:100%;border-radius:2px;background:${STATUS_DOT[s.status] || '#94a3b8'};width:${fmtPct(s.count, total)};"></div>
+        </div>
+        <span style="font-size:12px;color:#cbd5e1;min-width:36px;text-align:right;font-variant-numeric:tabular-nums;">${fmtNum(s.count)}</span>
+      </div>
+    </div>
+  `).join('');
+}
+
+function updateFooter(summary, status) {
+  const el = document.getElementById('data-footer');
+  const parts = [];
+  if (summary && summary.last_fetched_utc) {
+    parts.push(`Jobs data: ${fmtAge(summary.last_fetched_utc)}`);
+  }
+  if (status && status.cric_db && status.cric_db.ok && status.cric_db.queue_count) {
+    parts.push(`CRIC queues: ${fmtNum(status.cric_db.queue_count)} entries`);
+  }
+  el.textContent = parts.join('  ·  ') || '—';
+}
+
+// ── Data fetching ─────────────────────────────────────────────────────────────
+async function fetchJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url} → HTTP ${r.status}`);
+  return r.json();
+}
+
+async function doRefresh() {
+  if (isLoading) return;
+  isLoading = true;
+  const btn = document.getElementById('refresh-btn');
+  const icon = document.getElementById('refresh-icon');
+  btn.disabled = true;
+  icon.classList.add('spin');
+
+  try {
+    const [status, summary, byQueue, errors, queues] = await Promise.allSettled([
+      fetchJSON('/api/status'),
+      fetchJSON('/api/jobs/summary'),
+      fetchJSON('/api/jobs/by_queue'),
+      fetchJSON('/api/errors'),
+      fetchJSON('/api/queues'),
+    ]);
+
+    const st = status.status === 'fulfilled' ? status.value : {};
+    const sm = summary.status === 'fulfilled' ? summary.value : {};
+    const bq = byQueue.status === 'fulfilled' ? byQueue.value : {};
+    const er = errors.status === 'fulfilled' ? errors.value : {};
+    const qu = queues.status === 'fulfilled' ? queues.value : {};
+
+    updateHeader(st);
+    updateStats(sm, qu);
+    updateStatusLegend(sm.by_status);
+    buildStatusChart(sm.by_status);
+    buildQueueChart(bq.queues);
+    buildCloudChart(qu.by_cloud);
+    updateErrorsTable(er.errors);
+    updateQueueStatus(qu);
+    updateFooter(sm, st);
+
+    document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+
+  } catch (e) {
+    console.error('Refresh error:', e);
+  } finally {
+    isLoading = false;
+    btn.disabled = false;
+    icon.classList.remove('spin');
+  }
+}
+
+// ── Countdown ─────────────────────────────────────────────────────────────────
+function startCountdown() {
+  countdown = REFRESH_INTERVAL;
+  clearInterval(countdownTimer);
+  countdownTimer = setInterval(() => {
+    countdown -= 1;
+    const el = document.getElementById('countdown');
+    if (el) el.textContent = String(Math.max(0, countdown));
+    if (countdown <= 0) {
+      clearInterval(countdownTimer);
+      doRefresh().then(() => startCountdown());
+    }
+  }, 1000);
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('countdown').textContent = String(REFRESH_INTERVAL);
+  doRefresh().then(() => startCountdown());
+});
+</script>
+</body>
+</html>

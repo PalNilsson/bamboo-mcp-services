@@ -3,7 +3,7 @@
 **Bamboo MCP Services** is a collection of cooperative, Python-based services that feed data into the **Bamboo Toolkit**, supporting the ATLAS Experiment at CERN.
 
 > ⚠️ **Early development**
-> This repository is under active development. The `document-monitor`, `ingestion`, `cric`, `github-doc-sync`, and `supervisor` services are ready for use. Other agents are planned.
+> This repository is under active development. The `document-monitor`, `ingestion`, `cric`, `github-doc-sync`, `supervisor`, and `dashboard` services are ready for use. Other agents are planned.
 
 ---
 
@@ -16,6 +16,7 @@
 | `cric-agent` | ✅ Ready |
 | `github-doc-sync-agent` | ✅ Ready |
 | `supervisor-agent` | ✅ Ready |
+| `dashboard-agent` | ✅ Ready |
 | `dast-agent` | 📋 Planned |
 | `index-builder-agent` | 📋 Planned |
 | `feedback-agent` | 📋 Planned |
@@ -135,7 +136,22 @@ bamboo-github-sync --config repos.yaml --once
 
 Full documentation: [README-github_doc_sync_agent.md](./README-github_doc_sync_agent.md)
 
----
+### Run the dashboard agent
+
+```bash
+# Serve the monitoring dashboard (reads jobs.duckdb and cric.duckdb by default):
+bamboo-dashboard
+
+# Custom database paths and port:
+bamboo-dashboard --jobs-db /data/jobs.duckdb --cric-db /data/cric.duckdb --port 9090
+
+# Start, verify the server is up, print the URL, then exit:
+bamboo-dashboard --once
+```
+
+Open `http://localhost:8080` in any browser to view live job metrics, queue status, and error summaries.
+
+Full documentation: [README-dashboard_agent.md](./README-dashboard_agent.md)
 
 ## Agents
 
@@ -219,6 +235,20 @@ Key features:
 
 → [Full documentation](./README-supervisor-agent.md)
 
+### `dashboard-agent` ✅ Ready
+
+Serves a live, dark-themed single-page web UI for monitoring the Bamboo MCP Services system.  Starts a [FastAPI](https://fastapi.tiangolo.com/) / [uvicorn](https://www.uvicorn.org/) HTTP server in a background daemon thread and exposes REST endpoints for job metrics, queue status, and error summaries.  The dashboard auto-refreshes on a configurable interval and queries the DuckDB databases written by the other agents — no additional processing is performed.
+
+Key features:
+- Read-only DuckDB access — safe to run alongside writing agents (MVCC snapshot isolation)
+- Dark-themed single-page dashboard with Chart.js doughnut and bar charts
+- Panels for job status breakdown, top queues by count, CRIC queue status, cloud distribution, and top 25 error codes
+- Configurable bind address, port, and auto-refresh interval
+- `--once` flag for scripted startup verification
+- Rotating log file, `--log-level DEBUG` support, clean Ctrl-C / SIGTERM shutdown
+
+→ [Full documentation](./README-dashboard_agent.md)
+
 ### `dast-agent` 📋 Planned
 
 Will extract DAST help-list email threads (e.g. via Outlook), convert them into structured JSON, and run a daily digest pass producing cleaned Q/A pairs, thread summaries, tags, and resolution status. Output feeds RAG corpora and optional fine-tuning datasets.
@@ -278,6 +308,7 @@ bamboo-mcp-services/
 ├─ README-ingestion_agent.md
 ├─ README-cric_agent.md
 ├─ README-github_doc_sync_agent.md
+├─ README-dashboard_agent.md
 ├─ CHANGELOG.md
 ├─ pyproject.toml
 ├─ requirements.txt
@@ -313,6 +344,10 @@ bamboo-mcp-services/
 │     │  │  ├─ agent.py               # SupervisorAgent
 │     │  │  ├─ scheduler.py           # per-agent scheduling state
 │     │  │  └─ cli.py                 # bamboo-supervisor entry point
+│     │  ├─ dashboard_agent/
+│     │  │  ├─ agent.py               # DashboardAgent, DashboardConfig, FastAPI app
+│     │  │  ├─ cli.py                 # bamboo-dashboard entry point
+│     │  │  └─ static/index.html      # single-page monitoring dashboard
 │     │  ├─ dummy_agent/
 │     │  ├─ dast_agent/              # planned
 │     │  ├─ index_builder_agent/     # planned

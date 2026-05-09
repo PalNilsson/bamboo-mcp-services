@@ -19,6 +19,10 @@ chromadb>=0.4.0
 pdfminer.six>=20221105
 python-docx>=0.8.11
 
+# Dashboard agent
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
 # Development dependencies
 pytest>=8.0
 flake8>=7.0

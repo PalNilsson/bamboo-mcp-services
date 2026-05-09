@@ -17,6 +17,7 @@ the Bamboo Toolkit, supporting ATLAS Experiment computing operations at CERN.
 | `cric-agent` | ✅ Ready | `bamboo-cric` |
 | `github-doc-sync-agent` | ✅ Ready | `bamboo-github-sync` |
 | `supervisor-agent` | ✅ Ready | `bamboo-supervisor` |
+| `dashboard-agent` | ✅ Ready | `bamboo-dashboard` |
 | `dast-agent` | 📋 Planned | — |
 
 ---
@@ -93,6 +94,14 @@ bamboo-ingestion \
 bamboo-cric \
   --data cric.db \
   --once
+
+# Dashboard agent — serve the monitoring web UI:
+bamboo-dashboard \
+  --jobs-db jobs.duckdb \
+  --cric-db cric.duckdb \
+  --port 8080
+# Open http://localhost:8080 in any browser.
+# --once starts, verifies the server is up, prints the URL, then exits.
 
 # All agents support --once (single tick then exit) and daemon mode (loop forever).
 # All agents support --log-level DEBUG and --log-file PATH.
@@ -185,6 +194,10 @@ bamboo-mcp-services/
 │  │  │  ├─ agent.py                   ← SupervisorAgent; _sigterm_scheduled/daemons helpers
 │  │  │  ├─ scheduler.py               ← DaemonState, ScheduledState, AgentConfig (no subprocess)
 │  │  │  └─ cli.py                     ← bamboo-supervisor; --status, --once flags
+│  │  ├─ dashboard_agent/
+│  │  │  ├─ agent.py                   ← DashboardAgent, DashboardConfig, FastAPI app builder
+│  │  │  ├─ cli.py                     ← bamboo-dashboard; --once, --port, --refresh flags
+│  │  │  └─ static/index.html          ← single-page dark-themed monitoring dashboard
 │  │  ├─ github_doc_sync_agent/
 │  │  │  ├─ agent.py                   ← GithubDocSyncAgent, GithubDocSyncConfig
 │  │  │  ├─ github_doc_syncer.py       ← interval gate, multi-repo loop
@@ -206,6 +219,8 @@ bamboo-mcp-services/
 │  └─ agents/
 │     ├─ supervisor_agent/             ← 22 tests
 │     │  └─ test_supervisor_agent.py
+│     ├─ dashboard_agent/
+│     │  └─ test_dashboard_agent.py
 │     ├─ github_doc_sync_agent/        ← 72 tests
 │     ├─ cric_agent/                   ← 46 tests
 │     ├─ ingestion_agent/              ← 21 tests
@@ -362,7 +377,8 @@ When adding a new agent:
 
 Use `cric_agent` as the simplest template (no threads, no HTTP, no background
 fetcher).  Use `github_doc_sync_agent` as the template for agents that call
-external HTTP APIs.
+external HTTP APIs.  Use `dashboard_agent` as the template for agents that run
+a persistent HTTP server in a background thread.
 
 ---
 
@@ -477,9 +493,23 @@ arguments in test YAML strings when they could be misinterpreted:
 
 ---
 
-## Common pitfalls
+## dashboard_agent — key design decisions
 
-**`ModuleNotFoundError: bamboo_mcp_services`** — run `pip install -e .` from
+**Read-only DuckDB per-request**: every API endpoint opens a `read_only=True` DuckDB connection, runs its query, and closes immediately.  This is intentionally simple — no connection pool, no persistent handle — because query frequency is low (one request per dashboard panel per refresh cycle, default 30 s).  DuckDB's MVCC guarantees a consistent committed snapshot, so the dashboard never sees torn writes from a concurrent ingestion cycle.
+
+**Background daemon thread**: uvicorn runs in a `threading.Thread(daemon=True)` started by `_start_impl`.  The `_tick_impl` method only verifies the thread is still alive; it does not query any data itself.  If the thread dies, `RuntimeError` propagates to the supervisor, which restarts the process.
+
+**FastAPI, no Swagger UI**: the app is built with `docs_url=None, redoc_url=None` so no API docs endpoint is exposed.  The dashboard is an internal operational tool, not a public API.
+
+**`__REFRESH_INTERVAL__` substitution**: `index.html` contains the literal string `__REFRESH_INTERVAL__` which is replaced at serve time by the `/` route handler before sending the response.  This avoids duplicating the refresh value in Python and JavaScript.
+
+**Static HTML, no build step**: `index.html` is self-contained and imports Tailwind CSS and Chart.js from CDNs.  No Node.js or build pipeline is required.
+
+**`--once` mode**: starts the server, sleeps 1 second, calls `tick()` to confirm the thread is alive, prints the dashboard URL, and exits.  Useful for scripted startup verification or smoke tests.
+
+---
+
+ — run `pip install -e .` from
 the repo root.
 
 **Agent still logs old version after `bump_version.py`** — `importlib.metadata`

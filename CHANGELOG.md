@@ -9,9 +9,83 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-## [Unreleased]
-
 ### Added
+
+#### `dashboard-agent` — live web monitoring dashboard
+
+A new `dashboard-agent` serves a dark-themed, single-page web UI for monitoring
+the Bamboo MCP Services system in real time.  It starts a
+[FastAPI](https://fastapi.tiangolo.com/) / [uvicorn](https://www.uvicorn.org/)
+HTTP server in a background daemon thread and exposes REST endpoints that the
+dashboard polls on a configurable auto-refresh interval.
+
+```bash
+# Serve the dashboard (reads jobs.duckdb and cric.duckdb by default):
+bamboo-dashboard
+
+# Custom paths and port:
+bamboo-dashboard --jobs-db /data/jobs.duckdb --cric-db /data/cric.duckdb --port 9090
+
+# Start, verify the server is up, print the URL, then exit:
+bamboo-dashboard --once
+```
+
+**Dashboard panels:**
+
+| Panel | Data source |
+|---|---|
+| Database status bar (header) | `/api/status` — liveness indicator for both DuckDB files |
+| Job summary (doughnut chart + badges) | `/api/jobs/summary` — total count and breakdown by status |
+| Jobs by queue (bar chart) | `/api/jobs/by_queue` — top 20 queues by job count |
+| Queue status (doughnut chart) | `/api/queues` — CRIC queue count by status |
+| Cloud distribution (bar chart) | `/api/queues` — top 15 clouds by queue count |
+| Error summary (table) | `/api/errors` — top 25 error codes from `errors_by_count` |
+
+**Design highlights:**
+
+- **Read-only DuckDB** — every endpoint opens a `read_only=True` connection per
+  request and closes it immediately.  Safe to run alongside the writing agents;
+  DuckDB's MVCC guarantees a consistent committed snapshot.
+- **Background daemon thread** — uvicorn runs in a `threading.Thread(daemon=True)`.
+  `_tick_impl` verifies the thread is still alive; a dead thread causes
+  `RuntimeError` so the supervisor can restart the process.
+- **No build step** — the dashboard UI is a self-contained `static/index.html`
+  that imports Tailwind CSS and Chart.js from CDNs.
+- **`__REFRESH_INTERVAL__` substitution** — the HTML template placeholder is
+  replaced at serve time with the configured `--refresh` value.
+- **Graceful shutdown** — `_stop_impl` sets `uvicorn.Server.should_exit = True`
+  and joins the thread with a 5-second timeout.
+
+**New files:**
+
+- `src/bamboo_mcp_services/agents/dashboard_agent/__init__.py`
+- `src/bamboo_mcp_services/agents/dashboard_agent/agent.py` — `DashboardConfig`,
+  `DashboardAgent`, and `build_app()` with five route groups.
+- `src/bamboo_mcp_services/agents/dashboard_agent/cli.py` — `bamboo-dashboard`
+  entry point.
+- `src/bamboo_mcp_services/agents/dashboard_agent/static/index.html` — the
+  single-page monitoring dashboard.
+- `tests/agents/dashboard_agent/__init__.py`
+- `tests/agents/dashboard_agent/test_dashboard_agent.py` — 25 tests covering
+  config defaults, agent lifecycle state transitions, thread-liveness checks,
+  `__REFRESH_INTERVAL__` injection, all REST endpoints (success and DB-error
+  paths), and health detail formatting.
+- `README-dashboard_agent.md` — full operator guide.
+
+**`pyproject.toml`** — added `bamboo-dashboard` entry point.
+
+**`README.md`** — updated status table (`dashboard-agent` now ✅ Ready), added
+"Run the dashboard agent" section to Getting started, added agent description
+with key features, updated repository layout.
+
+**`CLAUDE.md`** — added `dashboard-agent` to the agent table, run-instructions
+block, repository layout, tests tree, and a new `dashboard_agent — key design
+decisions` section.  Agent-creation checklist updated to cite `dashboard_agent`
+as the template for HTTP-server agents.
+
+---
+
+### Added (prior unreleased)
 
 #### `supervisor-agent` — single entry point for the full system
 
