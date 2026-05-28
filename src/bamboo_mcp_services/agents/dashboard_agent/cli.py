@@ -182,13 +182,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         agent.start()
-        logger.info("Agent started — dashboard at http://%s:%d", config.host, config.port)
+        logger.info("Agent started — dashboard at http://localhost:%d", config.port)
 
         if args.once:
             logger.info("--once flag set: verifying server is up then exiting.")
             time.sleep(1.0)
             agent.tick()
-            print(f"Dashboard running at http://{config.host}:{config.port}", flush=True)
+            print(f"Dashboard running at http://localhost:{config.port}", flush=True)
         else:
             logger.info(
                 "Serving dashboard (tick_interval=%.1fs). Press Ctrl-C or SIGTERM to stop.",
