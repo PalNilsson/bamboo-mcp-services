@@ -9,26 +9,6 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-### Fixed
-
-#### Dashboard agent — uvicorn startup race and misleading URL in logs
-
-Two bugs in `agents/dashboard_agent/agent.py` and `cli.py` that caused the
-dashboard to appear unreachable after a fresh start:
-
-- **Startup race condition** (`agent.py` `_start_impl`): `start()` returned
-  immediately after launching the uvicorn background thread, before uvicorn
-  had bound its socket.  A `--once` probe or an early browser request could
-  therefore hit a port that was not yet listening.  `_start_impl` now polls
-  `uvicorn.Server.started` in a 50 ms loop for up to 10 seconds before
-  returning; if the server does not become ready in time a `RuntimeError` is
-  raised (typically indicating the port is already in use).
-
-- **`0.0.0.0` logged as the browser URL** (`agent.py`, `cli.py`): the startup
-  log message and `--once` output both printed `http://0.0.0.0:<port>`, which
-  is a bind address understood by the OS but **not** a valid URL for a browser.
-  Both now log `http://localhost:<port>`.
-
 ### Added
 
 #### Atomic storage updates — zero-downtime reads during every write cycle

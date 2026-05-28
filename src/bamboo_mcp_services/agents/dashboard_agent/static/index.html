@@ -178,10 +178,10 @@
         <table style="width:100%;border-collapse:collapse;font-size:13px;">
           <thead>
             <tr style="border-bottom:1px solid #334155;">
-              <th data-sort-col="error" style="text-align:left;padding:8px 10px;font-size:11px;font-weight:600;color:#64748b;letter-spacing:0.06em;text-transform:uppercase;white-space:nowrap;cursor:pointer;user-select:none;" onmouseenter="this.style.color='#94a3b8'" onmouseleave="this.style.color=sortState.col==='error'?'#e2e8f0':'#64748b'">Category <span id="sort-arrow-error"></span></th>
-              <th data-sort-col="codename" style="text-align:left;padding:8px 10px;font-size:11px;font-weight:600;color:#64748b;letter-spacing:0.06em;text-transform:uppercase;white-space:nowrap;cursor:pointer;user-select:none;" onmouseenter="this.style.color='#94a3b8'" onmouseleave="this.style.color=sortState.col==='codename'?'#e2e8f0':'#64748b'">Code <span id="sort-arrow-codename"></span></th>
-              <th data-sort-col="diag" style="text-align:left;padding:8px 10px;font-size:11px;font-weight:600;color:#64748b;letter-spacing:0.06em;text-transform:uppercase;cursor:pointer;user-select:none;" onmouseenter="this.style.color='#94a3b8'" onmouseleave="this.style.color=sortState.col==='diag'?'#e2e8f0':'#64748b'">Diagnostic <span id="sort-arrow-diag"></span></th>
-              <th data-sort-col="count" style="text-align:right;padding:8px 10px;font-size:11px;font-weight:600;color:#e2e8f0;letter-spacing:0.06em;text-transform:uppercase;white-space:nowrap;cursor:pointer;user-select:none;" onmouseenter="this.style.color='#94a3b8'" onmouseleave="this.style.color=sortState.col==='count'?'#e2e8f0':'#64748b'">Count <span id="sort-arrow-count">▾</span></th>
+              <th style="text-align:left;padding:8px 10px;font-size:11px;font-weight:600;color:#64748b;letter-spacing:0.06em;text-transform:uppercase;white-space:nowrap;">Category</th>
+              <th style="text-align:left;padding:8px 10px;font-size:11px;font-weight:600;color:#64748b;letter-spacing:0.06em;text-transform:uppercase;white-space:nowrap;">Code</th>
+              <th style="text-align:left;padding:8px 10px;font-size:11px;font-weight:600;color:#64748b;letter-spacing:0.06em;text-transform:uppercase;">Diagnostic</th>
+              <th style="text-align:right;padding:8px 10px;font-size:11px;font-weight:600;color:#64748b;letter-spacing:0.06em;text-transform:uppercase;white-space:nowrap;">Count</th>
             </tr>
           </thead>
           <tbody id="errors-tbody">
@@ -256,8 +256,6 @@ let charts = {};
 let countdown = REFRESH_INTERVAL;
 let countdownTimer = null;
 let isLoading = false;
-let errorsData = [];                         // latest raw errors array from API
-let sortState = { col: 'count', dir: -1 };  // -1 = desc, 1 = asc
 
 // ── Formatters ───────────────────────────────────────────────────────────────
 function fmtNum(n) {
@@ -489,40 +487,14 @@ function updateStatusLegend(byStatus) {
   `).join('');
 }
 
-function sortErrors(data) {
-  const { col, dir } = sortState;
-  return [...data].sort((a, b) => {
-    let av = a[col], bv = b[col];
-    if (col === 'count') return dir * ((av || 0) - (bv || 0));
-    av = (av || '').toLowerCase();
-    bv = (bv || '').toLowerCase();
-    return dir * av.localeCompare(bv);
-  });
-}
-
-function updateSortArrows() {
-  ['error', 'codename', 'diag', 'count'].forEach(col => {
-    const el = document.getElementById('sort-arrow-' + col);
-    const th = el && el.closest('th');
-    if (!el) return;
-    if (col === sortState.col) {
-      el.textContent = sortState.dir === -1 ? '▾' : '▴';
-      if (th) th.style.color = '#e2e8f0';
-    } else {
-      el.textContent = '';
-      if (th) th.style.color = '#64748b';
-    }
-  });
-}
-
-function renderErrorsTable(data) {
+function updateErrorsTable(errors) {
   const tbody = document.getElementById('errors-tbody');
-  if (!data || !data.length) {
+  if (!errors || !errors.length) {
     tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:32px;color:#475569;">No errors found</td></tr>';
     return;
   }
   const catColor = cat => ERROR_CATEGORY_COLORS[cat] || '#64748b';
-  tbody.innerHTML = sortErrors(data).map(e => `
+  tbody.innerHTML = errors.map(e => `
     <tr>
       <td style="padding:8px 10px;border-bottom:1px solid #1e293b;">
         <span class="error-badge" style="background:${catColor(e.error)}22;color:${catColor(e.error)};">
@@ -541,27 +513,6 @@ function renderErrorsTable(data) {
       </td>
     </tr>
   `).join('');
-  updateSortArrows();
-}
-
-function updateErrorsTable(errors) {
-  errorsData = errors || [];
-  renderErrorsTable(errorsData);
-}
-
-function initErrorsTableSort() {
-  document.querySelectorAll('th[data-sort-col]').forEach(th => {
-    th.addEventListener('click', () => {
-      const col = th.dataset.sortCol;
-      if (sortState.col === col) {
-        sortState.dir *= -1;
-      } else {
-        sortState.col = col;
-        sortState.dir = col === 'count' ? -1 : 1;
-      }
-      renderErrorsTable(errorsData);
-    });
-  });
 }
 
 function updateQueueStatus(queuesData) {
@@ -676,7 +627,6 @@ function startCountdown() {
 // ── Init ──────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('countdown').textContent = String(REFRESH_INTERVAL);
-  initErrorsTableSort();
   doRefresh().then(() => startCountdown());
 });
 </script>

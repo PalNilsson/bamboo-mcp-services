@@ -135,33 +135,27 @@ class DocumentMonitorAgent(Agent):
 
         return True, h, prev_chunk_ids
 
-    def _ingest_file(self, path_str: str, text: str, h: str, prev_chunk_ids: list) -> None:
-        """Chunk, embed, and store a single file into ChromaDB, then update the checkpoint.
+    def _ingest_file(
+        self,
+        path_str: str,
+        text: str,
+        h: str,
+        target_col: object,
+    ) -> None:
+        """Chunk, embed, and write a single file's vectors into *target_col*.
 
-        Uses a blue/green slot swap so that readers always have a complete,
-        queryable collection available:
-
-        1. Determine the idle physical slot via :attr:`router`.
-        2. Get-or-create that idle collection; delete any stale documents from a
-           previous failed attempt so the slot is clean.
-        3. Write all new chunks (with embeddings) into the idle collection.
-        4. Call :meth:`~storage.CollectionRouter.commit_swap` which atomically
-           updates the routing sidecar (``os.replace``) and deletes the old live
-           collection.
-        5. Update :attr:`collection` to point at the newly-live physical
-           collection so subsequent queries in the same process use the right
-           object.
-
-        If any step before 4 fails the idle collection is cleaned up and the
-        live collection — still routed by the sidecar — remains untouched.
+        This method is a **pure writer** — it has no knowledge of blue/green
+        slots or routing.  Slot lifecycle (idle slot creation, promotion, and
+        cleanup on failure) is managed entirely by :meth:`_tick_impl`, which
+        calls this method for every changed file in a cycle and passes the same
+        idle collection object each time.  This ensures the idle slot
+        accumulates all changed files before being promoted as a complete corpus.
 
         Args:
             path_str: Absolute path to the file being ingested.
             text: Full extracted text of the file.
             h: SHA-256 content hash of *text*.
-            prev_chunk_ids: Chunk IDs written during the previous ingest of this
-                file (used to determine the set of IDs to pre-delete from the
-                idle slot).
+            target_col: Open ChromaDB Collection object to write into.
         """
         chunks = chunk_text(text, chunk_size=self.chunk_size, overlap=self.chunk_overlap)
         ts = datetime.now(timezone.utc).isoformat()
@@ -189,41 +183,14 @@ class DocumentMonitorAgent(Agent):
         except Exception:
             embeddings = [list(map(float, v)) for v in raw_embeddings]
 
-        # --- Blue/green slot swap -----------------------------------------
-        idle_physical = self.router.idle_name(self._logical_name)
+        self.chroma.add_documents(
+            target_col,
+            ids=ids,
+            documents=chunks,
+            metadatas=metadatas,
+            embeddings=embeddings,
+        )
 
-        # Always delete and recreate the idle collection from scratch.
-        # Using get_or_create would inherit the embedding dimension locked in
-        # during a previous cycle; if the embedder model has changed since then
-        # ChromaDB would reject the new vectors with a dimension mismatch.
-        # delete_collection is a no-op if the slot doesn't exist yet.
-        self.chroma.delete_collection(idle_physical)
-        idle_col = self.chroma.create_collection(idle_physical)
-
-        try:
-            self.chroma.add_documents(
-                idle_col,
-                ids=ids,
-                documents=chunks,
-                metadatas=metadatas,
-                embeddings=embeddings,
-            )
-        except Exception:
-            # Build failed — delete the partially-filled idle collection so the
-            # next attempt starts clean, then re-raise.
-            self.chroma.delete_collection(idle_physical)
-            raise
-
-        # Atomically promote the idle slot: updates the routing sidecar and
-        # deletes the old live collection.
-        self.router.commit_swap(self._logical_name, self.chroma)
-
-        # Update the in-process collection reference to the newly-live slot.
-        new_live_physical = self.router.live_name(self._logical_name)
-        self.collection = self.chroma.get_or_create_collection(new_live_physical)
-        # --- End blue/green slot swap ---------------------------------------
-
-        self.chroma.persist()
         self.checkpoint.mark_processed(
             path_str,
             {"content_hash": h, "processed_ts": ts, "chunks": len(chunks), "chunk_ids": ids},
@@ -231,13 +198,31 @@ class DocumentMonitorAgent(Agent):
 
         self._last_processed_file = path_str
         self._last_error = None
-        LOG.info("Processed file %s -> chunks=%d slot=%s", path_str, len(chunks), new_live_physical)
+        LOG.info("Processed file %s -> chunks=%d", path_str, len(chunks))
 
     def _tick_impl(self) -> None:
-        """Perform one polling cycle: detect new/changed files, ingest chunks into ChromaDB.
+        """Perform one polling cycle: detect new/changed files, ingest into ChromaDB.
 
-        Lists files in the monitored directory, skips unchanged files, and ingests
-        any that are new or modified. Logs a summary at the end of each cycle.
+        Blue/green slot lifecycle
+        -------------------------
+        The idle slot is managed at the **cycle** level, not the file level:
+
+        1. Scan all files; if none have changed skip slot management entirely.
+        2. Delete and recreate the idle slot once at the start of the cycle.
+           Recreating from scratch clears any embedding dimension inherited from
+           a previous cycle, guarding against dimension-mismatch errors when the
+           embedder model changes.
+        3. Write every changed file's chunks into the **same** idle collection.
+           All files accumulate into one slot before any swap occurs.
+        4. After all files are written, call :meth:`~storage.CollectionRouter.commit_swap`
+           once.  The routing sidecar is updated atomically (``os.replace``) and
+           readers are transparently redirected to the new slot.
+        5. If any file write fails the error is logged and the file is skipped,
+           but the cycle continues.  The slot is still promoted at the end with
+           whatever was successfully written — a partial update is better than no
+           update.  If *no* files were written successfully the idle slot is
+           cleaned up and no swap occurs, leaving the live slot untouched.
+
         Errors are caught per-file so one bad file does not abort the whole cycle.
         """
         try:
@@ -248,7 +233,8 @@ class DocumentMonitorAgent(Agent):
             time.sleep(self.poll_interval_sec)
             return
 
-        processed_count = 0
+        # --- First pass: identify which files need ingesting ---------------
+        candidates: list[tuple[str, str, str]] = []  # (path_str, text, hash)
         skipped_count = 0
 
         for p in files:
@@ -258,25 +244,70 @@ class DocumentMonitorAgent(Agent):
                 if not text:
                     LOG.debug("No text extracted from %s; skipping.", path_str)
                     continue
-
-                changed, h, prev_chunk_ids = self._is_file_changed(path_str, text)
+                changed, h, _ = self._is_file_changed(path_str, text)
                 if not changed:
                     skipped_count += 1
                     continue
-
-                self._ingest_file(path_str, text, h, prev_chunk_ids)
-                processed_count += 1
-
+                candidates.append((path_str, text, h))
             except Exception as exc:
-                LOG.exception("Error processing file %s: %s", path_str, exc)
+                LOG.exception("Error reading file %s: %s", path_str, exc)
                 self._last_error = str(exc)
 
-        if processed_count > 0:
-            LOG.info("Poll cycle complete: %d file(s) ingested, %d unchanged. Next poll in %ds.",
-                     processed_count, skipped_count, self.poll_interval_sec)
-        else:
-            LOG.debug("Poll cycle complete: no changes detected (%d file(s) unchanged). Next poll in %ds.",
-                      skipped_count, self.poll_interval_sec)
+        if not candidates:
+            LOG.debug(
+                "Poll cycle complete: no changes detected (%d file(s) unchanged). "
+                "Next poll in %ds.", skipped_count, self.poll_interval_sec,
+            )
+            time.sleep(self.poll_interval_sec)
+            return
+
+        # --- Open the idle slot once for the whole cycle -------------------
+        idle_physical = self.router.idle_name(self._logical_name)
+
+        # Always delete then recreate — clears any locked embedding dimension
+        # from a previous cycle so a changed embedder model never causes a
+        # dimension-mismatch error.
+        self.chroma.delete_collection(idle_physical)
+        idle_col = self.chroma.create_collection(idle_physical)
+
+        # --- Second pass: write all candidates into the idle slot ----------
+        processed_count = 0
+
+        try:
+            for path_str, text, h in candidates:
+                try:
+                    self._ingest_file(path_str, text, h, idle_col)
+                    processed_count += 1
+                except Exception as exc:
+                    LOG.exception("Error processing file %s: %s", path_str, exc)
+                    self._last_error = str(exc)
+
+            if processed_count == 0:
+                # Every file failed — clean up the idle slot and leave the live
+                # slot untouched.
+                LOG.warning(
+                    "Poll cycle: all %d candidate(s) failed; idle slot cleaned up, "
+                    "no swap performed.", len(candidates),
+                )
+                self.chroma.delete_collection(idle_physical)
+            else:
+                # Atomically promote the idle slot.  Updates the routing sidecar
+                # (os.replace) and deletes the old live collection.
+                self.router.commit_swap(self._logical_name, self.chroma)
+                new_live = self.router.live_name(self._logical_name)
+                self.collection = self.chroma.get_or_create_collection(new_live)
+                self.chroma.persist()
+                LOG.info(
+                    "Poll cycle complete: %d file(s) ingested, %d unchanged. "
+                    "Live slot: %s. Next poll in %ds.",
+                    processed_count, skipped_count, new_live, self.poll_interval_sec,
+                )
+
+        except Exception as exc:
+            # Unexpected error outside the per-file loop — clean up and bail.
+            LOG.exception("Unexpected error during poll cycle: %s", exc)
+            self._last_error = str(exc)
+            self.chroma.delete_collection(idle_physical)
 
         time.sleep(self.poll_interval_sec)
 

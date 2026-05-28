@@ -455,12 +455,13 @@ class TestChromaWrapperCreateCollection:
         mock_client.get_or_create_collection.assert_called_once_with("my_col")
         mock_client.create_collection.assert_not_called()
 
-    def test_idle_slot_is_deleted_before_create_in_ingest_file(self):
-        """_ingest_file must delete the idle collection before creating it, so
-        that any dimension lock from a previous cycle is cleared.
+    def test_idle_slot_managed_by_tick_not_ingest_file(self):
+        """Slot lifecycle (delete+create+swap) is owned by _tick_impl, not _ingest_file.
 
-        This is the critical guard against ChromaDB dimension-mismatch errors
-        when the embedder model changes between runs.
+        _ingest_file is now a pure writer: it receives a target collection and
+        writes into it without touching slot routing.  The delete-before-create
+        and commit_swap happen exactly once per cycle in _tick_impl, regardless
+        of how many files are processed.
         """
         from bamboo_mcp_services.agents.document_monitor_agent.agent import (
             DocumentMonitorAgent,
@@ -500,13 +501,85 @@ class TestChromaWrapperCreateCollection:
         agent._last_processed_file = None
         agent._last_error = None
 
-        agent._ingest_file("/some/file.md", "hello world " * 20, "abc123", [])
+        # _ingest_file now receives the target collection from _tick_impl.
+        # It must NOT call delete_collection or create_collection itself.
+        target_col = MagicMock()
+        agent._ingest_file("/some/file.md", "hello world " * 20, "abc123", target_col)
 
-        # delete must have been called on the idle slot before create.
-        assert "delete:docs__b" in call_order, "idle slot was not deleted before create"
-        assert "create:docs__b" in call_order, "idle slot was not created fresh"
-        delete_idx = call_order.index("delete:docs__b")
-        create_idx = call_order.index("create:docs__b")
-        assert delete_idx < create_idx, (
-            f"delete (pos {delete_idx}) must precede create (pos {create_idx})"
+        # _ingest_file must not touch slot management at all.
+        assert call_order == [], (
+            f"_ingest_file should not call delete/create; got: {call_order}"
         )
+        # It must write into the target collection it was given.
+        mock_chroma.add_documents.assert_called_once()
+        assert mock_chroma.add_documents.call_args[0][0] is target_col
+
+    def test_tick_impl_deletes_and_creates_idle_slot_once_per_cycle(self, tmp_path):
+        """_tick_impl deletes and creates the idle slot exactly once per cycle,
+        regardless of how many files are processed, and promotes once at the end."""
+        from bamboo_mcp_services.agents.document_monitor_agent.agent import (
+            DocumentMonitorAgent,
+        )
+
+        call_order: list[str] = []
+        idle_col = MagicMock()
+
+        mock_chroma = MagicMock(spec=ChromaWrapper)
+        mock_chroma.delete_collection.side_effect = lambda name: call_order.append(f"delete:{name}")
+        mock_chroma.create_collection.side_effect = lambda name: (
+            call_order.append(f"create:{name}") or idle_col
+        )
+        mock_chroma.get_or_create_collection.return_value = MagicMock()
+        mock_chroma.add_documents.return_value = None
+        mock_chroma.persist.return_value = None
+
+        mock_router = MagicMock()
+        mock_router.live_name.return_value = "docs__a"
+        mock_router.idle_name.return_value = "docs__b"
+
+        mock_embedder = MagicMock()
+        mock_embedder.encode.return_value = [[0.1] * 3]
+
+        mock_checkpoint = MagicMock()
+        mock_checkpoint._data = {"processed": {}}
+        mock_checkpoint.mark_processed.return_value = None
+
+        # Write three files into tmp_path.
+        for i in range(3):
+            (tmp_path / f"doc{i}.txt").write_text(f"content of document {i} " * 30)
+
+        agent = DocumentMonitorAgent.__new__(DocumentMonitorAgent)
+        agent._logical_name = "docs"
+        agent.chroma = mock_chroma
+        agent.router = mock_router
+        agent.collection = MagicMock()
+        agent._embedder = mock_embedder
+        agent.chunk_size = 200
+        agent.chunk_overlap = 20
+        agent.checkpoint = mock_checkpoint
+        agent.directory = tmp_path
+        agent.poll_interval_sec = 0
+        agent._last_processed_file = None
+        agent._last_error = None
+
+        with __import__("unittest.mock", fromlist=["patch"]).patch("time.sleep"):
+            agent._tick_impl()
+
+        # delete and create must each be called exactly once.
+        deletes = [c for c in call_order if c.startswith("delete:docs__b")]
+        creates = [c for c in call_order if c.startswith("create:docs__b")]
+        assert len(deletes) == 1, f"Expected 1 delete, got: {deletes}"
+        assert len(creates) == 1, f"Expected 1 create, got: {creates}"
+
+        # delete must precede create.
+        assert call_order.index("delete:docs__b") < call_order.index("create:docs__b")
+
+        # commit_swap must be called exactly once.
+        mock_router.commit_swap.assert_called_once_with("docs", mock_chroma)
+
+        # add_documents must have been called once per file (3 files).
+        assert mock_chroma.add_documents.call_count == 3
+
+        # Every add_documents call must have used the same idle_col object.
+        for call in mock_chroma.add_documents.call_args_list:
+            assert call[0][0] is idle_col, "add_documents was not given the idle collection"

@@ -12,8 +12,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
-import time
-
 import duckdb
 import uvicorn
 from fastapi import FastAPI
@@ -264,16 +262,7 @@ class DashboardAgent(Agent):
         self._thread: Optional[threading.Thread] = None
 
     def _start_impl(self) -> None:
-        """Start the uvicorn HTTP server in a background daemon thread.
-
-        Blocks until uvicorn has bound its socket (up to 10 seconds) so
-        that callers can be confident the server is ready to accept
-        connections immediately after ``start()`` returns.
-
-        Raises:
-            RuntimeError: If uvicorn does not report ``started`` within the
-                timeout, which typically means the port is already in use.
-        """
+        """Start the uvicorn HTTP server in a background daemon thread."""
         app = build_app(self.config)
         uv_config = uvicorn.Config(
             app,
@@ -289,23 +278,9 @@ class DashboardAgent(Agent):
             name="dashboard-uvicorn",
         )
         self._thread.start()
-
-        # Wait until uvicorn has actually bound the socket before returning.
-        # server.started is set to True by uvicorn once the event loop is
-        # running; without this guard the port may not yet be accepting
-        # connections when _tick_impl or the CLI checks liveness.
-        _STARTUP_TIMEOUT_S = 10.0
-        deadline = time.monotonic() + _STARTUP_TIMEOUT_S
-        while not self._server.started and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if not self._server.started:
-            raise RuntimeError(
-                f"uvicorn did not start within {_STARTUP_TIMEOUT_S}s — "
-                "is the port already in use?"
-            )
-
         logger.info(
-            "Dashboard server ready — open http://localhost:%d in your browser",
+            "Dashboard server starting on http://%s:%d",
+            self.config.host,
             self.config.port,
         )
 

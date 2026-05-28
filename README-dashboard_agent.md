@@ -22,9 +22,7 @@ bamboo-dashboard --once
 bamboo-dashboard --port 9090 --refresh 10
 ```
 
-Open **`http://localhost:8080`** (or `http://localhost:<PORT>` if you pass `--port`) in any browser.
-
-> **Note — `0.0.0.0` vs `localhost`:** `--host 0.0.0.0` (the default) tells the server to *listen* on all network interfaces, which is correct for most deployments. It is **not** a URL you can type into a browser. Always use `http://localhost:<port>` to connect from the same machine.
+Open `http://localhost:8080` (or whatever `--host` / `--port` you set) in any browser.
 
 Stop the server with **Ctrl-C** or `kill -TERM <pid>`.
 
@@ -113,7 +111,7 @@ The supervisor will restart the dashboard automatically if it exits unexpectedly
 
 **Read-only DuckDB connections** — every query opens a `read_only=True` connection, executes the query, and closes immediately.  This is safe to run alongside a writing agent because DuckDB's MVCC ensures consistent committed snapshots for read-only connections.
 
-**Background thread model** — uvicorn runs in a daemon thread started by `_start_impl`.  After launching the thread, `_start_impl` polls `uvicorn.Server.started` for up to 10 seconds before returning; this guarantees the port is bound and ready before the CLI logs the URL or the `--once` path exits.  If the server does not become ready in time (e.g. port already in use) a `RuntimeError` is raised immediately.  The agent's `_tick_impl` then periodically verifies the thread is still alive; if it has died, a `RuntimeError` is raised so the supervisor can restart the process.
+**Background thread model** — uvicorn runs in a daemon thread started by `_start_impl`.  The agent's `_tick_impl` simply verifies the thread is still alive; if it has died, a `RuntimeError` is raised so the supervisor can restart the process.
 
 **Static HTML, no build step** — the dashboard UI is a self-contained `static/index.html` file served directly by FastAPI.  It imports Tailwind CSS and Chart.js from CDNs.  No Node.js, bundler, or build pipeline is required.
 
