@@ -6,6 +6,68 @@ from typing import Optional, Any
 import json
 
 
+def atomic_swap_table(
+    conn: duckdb.DuckDBPyConnection,
+    staging_name: str,
+    live_name: str,
+) -> None:
+    """Atomically promote *staging_name* to become the new *live_name*.
+
+    The swap is performed inside a single transaction using ``ALTER TABLE
+    RENAME``, which is a metadata-only operation in DuckDB (no data movement).
+    Readers that hold an open read snapshot before the transaction commits will
+    continue to see the old table; any reader that opens a new transaction after
+    the commit will see the new one.  There is no window where the table is
+    absent or partially filled.
+
+    The pattern is::
+
+        BEGIN
+          [if live exists]  ALTER TABLE <live>    RENAME TO <live>_retiring
+                            ALTER TABLE <staging> RENAME TO <live>
+          [if live exists]  DROP TABLE <live>_retiring
+        COMMIT
+
+    On the very first run *live_name* does not yet exist, so the rename of the
+    old live table is skipped.  The staging table is simply renamed to *live*.
+
+    A stale ``<live>_retiring`` table (left over from a previous crash between
+    the rename and the drop) is cleaned up at the start of every call so it
+    does not block the rename.
+
+    Args:
+        conn: An open, writable DuckDB connection.
+        staging_name: Name of the fully-populated staging table to promote.
+        live_name: Logical name that callers use to query the data.
+
+    Raises:
+        Exception: Re-raises any DuckDB error after issuing ``ROLLBACK``.
+    """
+    retiring_name = f"{live_name}_retiring"
+
+    # Clean up any stale retiring table from a previous crash.
+    conn.execute(f"DROP TABLE IF EXISTS {retiring_name}")
+
+    live_exists = bool(
+        conn.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = ?",
+            [live_name],
+        ).fetchone()
+    )
+
+    conn.execute("BEGIN")
+    try:
+        if live_exists:
+            conn.execute(f"ALTER TABLE {live_name} RENAME TO {retiring_name}")
+        conn.execute(f"ALTER TABLE {staging_name} RENAME TO {live_name}")
+        if live_exists:
+            conn.execute(f"DROP TABLE {retiring_name}")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
 class DuckDBStore:
     """DuckDB-based storage for agent data and snapshots.
 
@@ -13,14 +75,14 @@ class DuckDBStore:
     and managing structured data tables.
 
     Attributes:
-        path: Database file path or ":memory:" for in-memory database.
+        path: Database file path or \":memory:\" for in-memory database.
     """
 
     def __init__(self, path: str = ":memory:") -> None:
         """Initialize the DuckDB store.
 
         Args:
-            path: Path to the DuckDB database file. Use ":memory:" for
+            path: Path to the DuckDB database file. Use \":memory:\" for
                 an in-memory database (default).
         """
         self.path = path
@@ -51,34 +113,46 @@ class DuckDBStore:
     def write_table(self, table_name: str, rows: list[dict[str, Any]], overwrite: bool = False) -> None:
         """Write data rows to a table.
 
-        When *overwrite* is ``True`` the entire DROP + CREATE + INSERT sequence
-        is wrapped in an explicit transaction so that concurrent readers always
-        observe either the previous complete table or the new one — never a torn
-        state where the table is absent or partially filled.
+        When *overwrite* is ``True`` the new rows are first written into a
+        temporary staging table (``<table_name>_staging``), then the staging
+        table is atomically promoted to become the live table via
+        :func:`atomic_swap_table`.  This ensures that concurrent readers never
+        observe a window where the table is absent or partially filled.
+
+        When *overwrite* is ``False`` the table is created if absent and rows
+        are appended directly.
 
         Args:
             table_name: Name of the target table.
             rows: List of dictionaries to insert. Each row is stored as JSON.
-            overwrite: If True, drop and recreate the table before inserting.
-                If False, create the table only if it doesn't exist.
+            overwrite: If True, replace the table contents atomically using a
+                staging swap.  If False, create the table only if it doesn't
+                exist and append rows.
         """
         if not rows:
             return
         if overwrite:
-            self._conn.execute("BEGIN")
-            try:
-                self._conn.execute(f"DROP TABLE IF EXISTS {table_name}")
-                self._conn.execute(f"CREATE TABLE IF NOT EXISTS {table_name} (data JSON, updated_utc TIMESTAMP)")
-                for r in rows:
-                    self._conn.execute("INSERT INTO {tn} VALUES (?, ?)".format(tn=table_name), [json.dumps(r, default=str), datetime.now(timezone.utc)])
-                self._conn.execute("COMMIT")
-            except Exception:
-                self._conn.execute("ROLLBACK")
-                raise
-        else:
-            self._conn.execute(f"CREATE TABLE IF NOT EXISTS {table_name} (data JSON, updated_utc TIMESTAMP)")
+            staging = f"{table_name}_staging"
+            # Clean up any leftover staging table from a previous crash.
+            self._conn.execute(f"DROP TABLE IF EXISTS {staging}")
+            self._conn.execute(
+                f"CREATE TABLE {staging} (data JSON, updated_utc TIMESTAMP)"
+            )
             for r in rows:
-                self._conn.execute("INSERT INTO {tn} VALUES (?, ?)".format(tn=table_name), [json.dumps(r, default=str), datetime.now(timezone.utc)])
+                self._conn.execute(
+                    f"INSERT INTO {staging} VALUES (?, ?)",
+                    [json.dumps(r, default=str), datetime.now(timezone.utc)],
+                )
+            atomic_swap_table(self._conn, staging, table_name)
+        else:
+            self._conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {table_name} (data JSON, updated_utc TIMESTAMP)"
+            )
+            for r in rows:
+                self._conn.execute(
+                    "INSERT INTO {tn} VALUES (?, ?)".format(tn=table_name),
+                    [json.dumps(r, default=str), datetime.now(timezone.utc)],
+                )
 
     def record_snapshot(self, snapshot_id: str, source: str, ok: bool, content_hash: Optional[str] = None, error: Optional[str] = None) -> None:
         """Record metadata for a data snapshot.

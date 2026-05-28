@@ -21,7 +21,7 @@ from .utils import (
     deterministic_chunk_id,
     CheckpointStore,
 )
-from .storage import ChromaWrapper
+from .storage import ChromaWrapper, CollectionRouter
 
 LOG = logging.getLogger(__name__)
 
@@ -64,7 +64,23 @@ class DocumentMonitorAgent(Agent):
         self.chunk_overlap = chunk_overlap
         self.checkpoint = CheckpointStore(checkpoint_file)
         self.chroma = ChromaWrapper(persist_directory=chroma_dir)
-        self.collection = self.chroma.get_or_create_collection(name)
+
+        # The router maps the logical collection name (== agent name) to one of
+        # two physical ChromaDB slot names (<name>__a or <name>__b).  Readers
+        # always address the live slot; writes go to the idle slot, which is
+        # then promoted atomically via commit_swap.
+        _sidecar = str(Path(chroma_dir) / "collection_routing.json")
+        self.router = CollectionRouter(sidecar_path=_sidecar)
+        self._logical_name = name
+
+        # Resolve (or initialise) the live physical collection on startup.
+        live_physical = self.router.live_name(name)
+        self.collection = self.chroma.get_or_create_collection(live_physical)
+        LOG.info(
+            "DocumentMonitorAgent: logical='%s' live_slot='%s'",
+            name, live_physical,
+        )
+
         self._last_processed_file: Optional[str] = None
         self._last_error: Optional[str] = None
         self._embedder = embedder
@@ -122,24 +138,40 @@ class DocumentMonitorAgent(Agent):
     def _ingest_file(self, path_str: str, text: str, h: str, prev_chunk_ids: list) -> None:
         """Chunk, embed, and store a single file into ChromaDB, then update the checkpoint.
 
-        To avoid a window where the document is invisible to concurrent readers
-        (which would occur between deleting old chunks and finishing the new
-        inserts), this method uses an atomic staging swap:
+        Uses a blue/green slot swap so that readers always have a complete,
+        queryable collection available:
 
-        1. Write all new chunks into a temporary staging collection.
-        2. Delete the old chunks from the live collection.
-        3. Add the new chunks to the live collection from the staging data.
-        4. Drop the staging collection.
+        1. Determine the idle physical slot via :attr:`router`.
+        2. Get-or-create that idle collection; delete any stale documents from a
+           previous failed attempt so the slot is clean.
+        3. Write all new chunks (with embeddings) into the idle collection.
+        4. Call :meth:`~storage.CollectionRouter.commit_swap` which atomically
+           updates the routing sidecar (``os.replace``) and deletes the old live
+           collection.
+        5. Update :attr:`collection` to point at the newly-live physical
+           collection so subsequent queries in the same process use the right
+           object.
 
-        If step 2 or 3 fails the staging collection is cleaned up and the
-        previous chunks remain intact in the live collection.
+        If any step before 4 fails the idle collection is cleaned up and the
+        live collection — still routed by the sidecar — remains untouched.
+
+        Args:
+            path_str: Absolute path to the file being ingested.
+            text: Full extracted text of the file.
+            h: SHA-256 content hash of *text*.
+            prev_chunk_ids: Chunk IDs written during the previous ingest of this
+                file (used to determine the set of IDs to pre-delete from the
+                idle slot).
         """
         chunks = chunk_text(text, chunk_size=self.chunk_size, overlap=self.chunk_overlap)
         ts = datetime.now(timezone.utc).isoformat()
 
         if not chunks:
             LOG.debug("No chunks generated for %s; recording empty checkpoint.", path_str)
-            self.checkpoint.mark_processed(path_str, {"content_hash": h, "processed_ts": ts, "chunks": 0, "chunk_ids": []})
+            self.checkpoint.mark_processed(
+                path_str,
+                {"content_hash": h, "processed_ts": ts, "chunks": 0, "chunk_ids": []},
+            )
             self._last_processed_file = path_str
             self._last_error = None
             return
@@ -157,42 +189,49 @@ class DocumentMonitorAgent(Agent):
         except Exception:
             embeddings = [list(map(float, v)) for v in raw_embeddings]
 
-        # --- Atomic staging swap -------------------------------------------
-        # Write into a staging collection first so the live collection is never
-        # in an empty/partial state when a concurrent query arrives.
-        staging_name = f"{self.collection.name}__staging"
-        self.chroma.delete_collection(staging_name)   # clean up any stale staging
-        staging = self.chroma.create_collection(staging_name)
+        # --- Blue/green slot swap -----------------------------------------
+        idle_physical = self.router.idle_name(self._logical_name)
+
+        # Always delete and recreate the idle collection from scratch.
+        # Using get_or_create would inherit the embedding dimension locked in
+        # during a previous cycle; if the embedder model has changed since then
+        # ChromaDB would reject the new vectors with a dimension mismatch.
+        # delete_collection is a no-op if the slot doesn't exist yet.
+        self.chroma.delete_collection(idle_physical)
+        idle_col = self.chroma.create_collection(idle_physical)
 
         try:
-            self.chroma.add_documents(staging, ids=ids, documents=chunks, metadatas=metadatas, embeddings=embeddings)
+            self.chroma.add_documents(
+                idle_col,
+                ids=ids,
+                documents=chunks,
+                metadatas=metadatas,
+                embeddings=embeddings,
+            )
         except Exception:
-            self.chroma.delete_collection(staging_name)
+            # Build failed — delete the partially-filled idle collection so the
+            # next attempt starts clean, then re-raise.
+            self.chroma.delete_collection(idle_physical)
             raise
 
-        # Now swap: remove old chunks from the live collection and add the new
-        # ones.  Even if the delete fails, the old chunks remain visible.
-        try:
-            if prev_chunk_ids:
-                try:
-                    self.chroma.delete_documents_by_ids(self.collection, prev_chunk_ids)
-                    LOG.debug("Deleted %d previous chunk ids for %s", len(prev_chunk_ids), path_str)
-                except Exception:
-                    LOG.exception("Failed to delete previous chunk ids for %s (best-effort)", path_str)
+        # Atomically promote the idle slot: updates the routing sidecar and
+        # deletes the old live collection.
+        self.router.commit_swap(self._logical_name, self.chroma)
 
-            # Re-read from staging to add into live (staging already has the vectors).
-            self.chroma.add_documents(self.collection, ids=ids, documents=chunks, metadatas=metadatas, embeddings=embeddings)
-        finally:
-            # Always clean up staging, whether the swap succeeded or not.
-            self.chroma.delete_collection(staging_name)
-        # --- End atomic staging swap ----------------------------------------
+        # Update the in-process collection reference to the newly-live slot.
+        new_live_physical = self.router.live_name(self._logical_name)
+        self.collection = self.chroma.get_or_create_collection(new_live_physical)
+        # --- End blue/green slot swap ---------------------------------------
 
         self.chroma.persist()
-        self.checkpoint.mark_processed(path_str, {"content_hash": h, "processed_ts": ts, "chunks": len(chunks), "chunk_ids": ids})
+        self.checkpoint.mark_processed(
+            path_str,
+            {"content_hash": h, "processed_ts": ts, "chunks": len(chunks), "chunk_ids": ids},
+        )
 
         self._last_processed_file = path_str
         self._last_error = None
-        LOG.info("Processed file %s -> chunks=%d", path_str, len(chunks))
+        LOG.info("Processed file %s -> chunks=%d slot=%s", path_str, len(chunks), new_live_physical)
 
     def _tick_impl(self) -> None:
         """Perform one polling cycle: detect new/changed files, ingest chunks into ChromaDB.
@@ -256,11 +295,14 @@ class DocumentMonitorAgent(Agent):
         """Return agent-specific health details for monitoring dashboards.
 
         Returns:
-            Dictionary with last processed file, last error, checkpoint location and collection name.
+            Dictionary with last processed file, last error, checkpoint location,
+            logical collection name, and the active physical ChromaDB slot.
         """
+        live_slot = self.router.live_name(self._logical_name)
         return {
             "last_processed_file": self._last_processed_file,
             "last_error": self._last_error,
             "checkpoint_file": str(self.checkpoint.path),
-            "chroma_collection": getattr(self.collection, "name", "<unknown>"),
+            "chroma_collection": self._logical_name,
+            "chroma_live_slot": live_slot,
         }

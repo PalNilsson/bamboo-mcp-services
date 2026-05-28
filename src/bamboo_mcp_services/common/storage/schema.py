@@ -296,6 +296,11 @@ def _migrate_composite_pk(conn: duckdb.DuckDBPyConnection) -> None:
     per-cycle snapshots that are fully replaced on the next ingestion run, so
     dropping them is safe.
 
+    Each drop is wrapped in an explicit transaction so that a concurrent reader
+    never observes the table in a transient absent state (DuckDB MVCC ensures
+    the reader keeps its snapshot until commit, but wrapping the drop makes the
+    intent explicit and guards against future engine changes).
+
     Args:
         conn: An open DuckDB connection.
     """
@@ -314,7 +319,13 @@ def _migrate_composite_pk(conn: duckdb.DuckDBPyConnection) -> None:
             # Old schema: PRIMARY KEY on id alone ("PRIMARY KEY(id)")
             # New schema: PRIMARY KEY on (id, _queue)
             if ctype == "PRIMARY KEY" and "_queue" not in (ctext or ""):
-                conn.execute(f"DROP TABLE IF EXISTS {table}")
+                conn.execute("BEGIN")
+                try:
+                    conn.execute(f"DROP TABLE IF EXISTS {table}")
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
                 break
 
 

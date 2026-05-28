@@ -46,6 +46,7 @@ from typing import Any
 import duckdb
 
 from bamboo_mcp_services.common.panda.source import BaseSource
+from bamboo_mcp_services.common.storage.duckdb_store import atomic_swap_table
 
 logger = logging.getLogger(__name__)
 
@@ -250,13 +251,24 @@ class CricQueuedataFetcher:
     def _load(self, data: dict[str, Any]) -> int:
         """Replace the ``queuedata`` table with the contents of *data*.
 
-        This is a full replacement: DROP + CREATE + INSERT.  No history is
-        kept.
+        This is a full replacement using a shadow-table rename so that
+        concurrent readers always observe either the previous complete snapshot
+        or the new one — never a window where the table is absent or only
+        partially filled.
 
-        The entire replacement is wrapped in an explicit transaction so that
-        concurrent readers (e.g. AskPanDA via the MCP tool) always observe
-        either the previous complete snapshot or the new complete snapshot —
-        never a torn state where the table is absent or only partially filled.
+        The sequence is:
+
+        1. Build all rows and infer the DuckDB schema (no I/O yet).
+        2. DROP any leftover ``queuedata_staging`` from a prior crash.
+        3. CREATE ``queuedata_staging`` and bulk-INSERT all rows into it.
+        4. Call :func:`~bamboo_mcp_services.common.storage.duckdb_store.atomic_swap_table`
+           which, in a single transaction, renames ``queuedata_staging`` →
+           ``queuedata`` (demoting the old live table to ``queuedata_retiring``
+           and immediately dropping it).
+
+        Steps 1–3 happen outside any transaction; they operate on a table that
+        no reader queries.  Only step 4 — a pure metadata rename — touches the
+        live name, and it does so atomically.
 
         Args:
             data: Top-level ``{queue_name: {field: value, ...}}`` dict as
@@ -275,14 +287,14 @@ class CricQueuedataFetcher:
         # The id column is always TEXT regardless of what inference might say.
         schema[_ID_COLUMN] = "TEXT"
 
-        self._conn.execute("BEGIN")
-        try:
-            self._create_table(schema)
-            self._insert_rows(rows)
-            self._conn.execute("COMMIT")
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
+        # --- Build staging table (not yet visible under the live name) -----
+        self._conn.execute("DROP TABLE IF EXISTS queuedata_staging")
+        self._create_staging_table(schema)
+        self._insert_rows(rows, table="queuedata_staging")
+
+        # --- Atomic promotion: staging → queuedata -------------------------
+        atomic_swap_table(self._conn, "queuedata_staging", "queuedata")
+
         return len(rows)
 
     def _build_rows(self, data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -312,23 +324,28 @@ class CricQueuedataFetcher:
             rows.append(row)
         return rows
 
-    def _create_table(self, schema: dict[str, str]) -> None:
-        """Drop and recreate the ``queuedata`` table with the inferred schema.
+    def _create_staging_table(self, schema: dict[str, str]) -> None:
+        """Create the ``queuedata_staging`` table with the inferred schema.
+
+        Unlike the old ``_create_table`` helper this method never touches the
+        live ``queuedata`` table — it only creates the staging target.
 
         Args:
             schema: ``{column_name: duckdb_type}`` mapping as returned by
                 :func:`_infer_schema`.
         """
         cols_sql = ", ".join(f'"{col}" {dtype}' for col, dtype in schema.items())
-        self._conn.execute("DROP TABLE IF EXISTS queuedata")
-        self._conn.execute(f"CREATE TABLE queuedata ({cols_sql})")
+        self._conn.execute(f"CREATE TABLE queuedata_staging ({cols_sql})")
 
-    def _insert_rows(self, rows: list[dict[str, Any]]) -> None:
-        """Bulk-insert *rows* into the ``queuedata`` table.
+    def _insert_rows(self, rows: list[dict[str, Any]], table: str = "queuedata") -> None:
+        """Bulk-insert *rows* into *table*.
 
         Args:
             rows: Coerced row dicts (all values already converted to DB-safe
                 scalars by :func:`_infer_schema`).
+            table: Target table name.  Defaults to ``"queuedata"`` for
+                backward compatibility, but callers should pass
+                ``"queuedata_staging"`` during the shadow-swap sequence.
         """
         if not rows:
             return
@@ -337,6 +354,6 @@ class CricQueuedataFetcher:
         placeholders = ", ".join("?" * len(cols))
         tuples = [tuple(r.get(c) for c in cols) for r in rows]
         self._conn.executemany(
-            f"INSERT INTO queuedata ({col_list}) VALUES ({placeholders})",
+            f"INSERT INTO {table} ({col_list}) VALUES ({placeholders})",
             tuples,
         )

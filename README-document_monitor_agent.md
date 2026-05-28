@@ -23,16 +23,51 @@ A production-oriented agent that watches a directory for new or changed document
 
 Chunk IDs are derived from `absolute_file_path + chunk_index`, hashed with SHA-256, and prefixed with `doc:`. This ensures stable IDs across re-ingestion and replace-in-place behaviour when content changes.
 
+### Zero-downtime updates — blue/green slot rotation
+
+Every update cycle uses a **blue/green slot swap** so that concurrent readers (e.g. Bamboo MCP tools performing RAG queries) never observe an empty or partially-filled collection.
+
+Two physical ChromaDB collections are maintained per logical collection name:
+
+| Slot | Physical name |
+|---|---|
+| Blue | `<collection>__a` |
+| Green | `<collection>__b` |
+
+Only one slot is live at any time.  The other is the idle build target.  On each update cycle:
+
+1. The idle slot is **deleted and recreated from scratch**.  This clears any embedding dimension locked in from a previous cycle — see [Dimension mismatch protection](#dimension-mismatch-protection) below.
+2. New chunks are embedded and written into the idle slot.  Readers still address the live slot; they are unaffected.
+3. A routing sidecar file (`<chroma-dir>/collection_routing.json`) is updated via `os.replace` — a POSIX atomic rename — to point the logical collection name at the newly-built slot.
+4. The old live slot is deleted.
+
+Between steps 2 and 4 the old slot remains fully queryable.  There is no window where the collection is empty or partially filled.
+
+#### Routing sidecar
+
+The file `<chroma-dir>/collection_routing.json` records the current live slot for each logical collection:
+
+```json
+{
+  "atlas_docs": "atlas_docs__a"
+}
+```
+
+It is written with a write-then-`os.replace` pattern, so it is never partially written.  If the file is missing or corrupt on startup the agent defaults to slot `__a` and writes a fresh sidecar.  A crash between the sidecar write and the deletion of the old slot leaves an extra collection on disk, which is deleted at the start of the next cycle.
+
+#### Dimension mismatch protection
+
+ChromaDB locks the embedding dimension of a collection on the first write.  If the embedder model ever changes (different model name, different version), the new vectors have a different dimension and ChromaDB rejects them.
+
+With the blue/green design this can never corrupt live data:
+
+- The idle slot is **always deleted and recreated** (`delete_collection` + `create_collection`) before any new vectors are written into it.  No dimension is inherited.
+- If the write into the idle slot fails for any reason — including a dimension mismatch — the idle slot is cleaned up and the **live slot remains untouched and queryable**.
+- The agent logs the error and retries on the next poll cycle.
+
 ### Replace-on-change strategy
 
-When a file's content hash changes:
-
-1. Previous chunk IDs (stored in checkpoint) are deleted from ChromaDB.
-2. New chunks and embeddings are computed.
-3. New vectors are inserted under the same stable ID scheme.
-4. Checkpoint is updated.
-
-This prevents stale vectors from being retrieved by RAG and reduces hallucination risk.
+When a file's content hash changes, the full blue/green cycle runs for that file: the idle slot is rebuilt with the new chunk set (which includes the updated file's chunks and all other files' chunks), and the swap promotes it atomically.  Stale vectors from the changed file never appear in query results.
 
 ---
 
@@ -169,6 +204,12 @@ for col in client.list_collections():
 "
 ```
 
+> **Note:** collections are now stored under slotted names (e.g. `cgsim_docs__a`
+> or `cgsim_docs__b`).  The active slot for each logical name is recorded in
+> `<chroma-dir>/collection_routing.json`.  You will normally see exactly one
+> slotted collection per logical name; a second slot may briefly appear during
+> an active update cycle.
+
 ---
 
 ## Re-ingestion
@@ -179,20 +220,32 @@ Re-ingestion is required when:
 - The ChromaDB index becomes corrupted or out of sync with the SQLite metadata.
 - You want to start fresh after adding or removing documents.
 - The agent previously ran with `DummyEmbedder` (zero vectors) — see [Embedding troubleshooting](#embedding-troubleshooting).
+- You are upgrading from a version of the agent that predates the blue/green routing (collections named `atlas_docs` rather than `atlas_docs__a` / `atlas_docs__b`) — see note below.
 
 To re-ingest cleanly:
 
 ```bash
-# 1. Wipe the vector store and checkpoint
+# 1. Wipe the vector store, routing sidecar, and checkpoint
 rm -rf .chromadb .document_monitor/checkpoints.json
 
-# 2. Re-run the agent — it will process all files from scratch
+# 2. Re-run the agent — it will process all files from scratch into slot __a
 bamboo-document-monitor \
   --dir /abs/path/to/docs \
   --chroma-dir /abs/path/to/.chromadb \
   --collection my_collection \
   --once
 ```
+
+> **Upgrading from a pre-blue/green version:** the old agent wrote vectors into
+> a collection named exactly `<collection>` (e.g. `atlas_docs`).  The new agent
+> uses `atlas_docs__a` / `atlas_docs__b` and will not find or use the old
+> collection.  After wiping and re-ingesting, the old `atlas_docs` collection
+> can be deleted manually:
+> ```python
+> import chromadb
+> client = chromadb.PersistentClient(path=".chromadb")
+> client.delete_collection("atlas_docs")   # remove the legacy unslotted collection
+> ```
 
 ---
 

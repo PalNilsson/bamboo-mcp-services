@@ -11,7 +11,123 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
-#### `dashboard-agent` — live web monitoring dashboard
+#### Atomic storage updates — zero-downtime reads during every write cycle
+
+All three storage layers used by Bamboo MCP Services now guarantee that
+concurrent readers (e.g. Bamboo MCP tools querying live data) **never observe
+a gap, a partial write, or a torn state** while an agent is updating its data.
+
+---
+
+##### ChromaDB — blue/green slot rotation (`document-monitor-agent`)
+
+The `document-monitor-agent` now maintains two physical ChromaDB collections
+per logical collection name (the *blue* and *green* slots, named
+`<collection>__a` and `<collection>__b`).  Readers always address the currently
+live slot; each update cycle writes into the idle slot and then promotes it
+atomically:
+
+1. The idle slot is **deleted and recreated from scratch** before any vectors
+   are written.  This clears any embedding dimension locked in by a previous
+   cycle, so a changed embedder model can never cause a dimension-mismatch
+   error.
+2. All chunks are embedded and written into the idle slot (no impact on
+   readers).
+3. A routing sidecar file (`<chroma-dir>/collection_routing.json`) is updated
+   via `os.replace` — a POSIX atomic operation — to point the logical name at
+   the newly-built slot.
+4. The old live slot is deleted.
+
+Between steps 2 and 4 the old slot remains fully queryable.  There is no
+window where the collection is empty or partially filled.
+
+**New class `CollectionRouter`** in
+`agents/document_monitor_agent/storage.py` manages the sidecar and slot
+selection.  It is crash-safe: a stale sidecar from a previous crash is simply
+reloaded on the next start; a corrupt or missing sidecar defaults to slot `__a`.
+
+**`ChromaWrapper.create_collection`** now calls `client.create_collection`
+rather than `client.get_or_create_collection`.  The distinction is critical:
+`get_or_create` reattaches to an existing collection and inherits its locked
+embedding dimension; `create_collection` always starts with no dimension
+constraint.
+
+The `_health_details` report now includes a `chroma_live_slot` field showing
+which physical slot is currently live (e.g. `atlas_docs__a`).
+
+---
+
+##### DuckDB — shadow-table rename (`cric-agent`, `ingestion-agent`, `duckdb_store`)
+
+A new free function **`atomic_swap_table(conn, staging_name, live_name)`** in
+`common/storage/duckdb_store.py` atomically promotes a fully-populated staging
+table to become the live table using `ALTER TABLE RENAME`, a metadata-only
+operation in DuckDB.  The entire rename is wrapped in a single short
+transaction (three DDL statements, no data movement) so readers either see the
+complete old table or the complete new one.
+
+The previous pattern — `BEGIN; DROP TABLE; CREATE TABLE; INSERT many rows;
+COMMIT` — had the DROP inside the transaction, which still creates a visible
+gap for readers that start a fresh snapshot after the DROP but before the
+COMMIT.  The rename pattern eliminates that gap entirely.
+
+**`cric_fetcher._load`**: replaced the DROP-inside-transaction block with a
+shadow-swap sequence: build into `queuedata_staging` (outside any transaction),
+then call `atomic_swap_table` to flip `queuedata_staging` → `queuedata`
+atomically.  The heavy bulk-insert work now happens entirely outside the
+transaction.
+
+**`DuckDBStore.write_table(overwrite=True)`**: same pattern — rows are written
+into `<table>_staging` first, then promoted via `atomic_swap_table`.
+
+**`schema._migrate_composite_pk`**: the bare `DROP TABLE` in the one-time
+migration is now wrapped in `BEGIN/COMMIT/ROLLBACK`.
+
+`atomic_swap_table` also cleans up any stale `<live>_retiring` table left over
+from a previous crash, so the function is safe to call repeatedly without
+manual cleanup.
+
+---
+
+**New test file `tests/test_atomic_updates.py`** — 26 tests covering:
+
+- `atomic_swap_table`: first-run (no live table), normal swap, stale-retiring
+  recovery, rollback-on-error preserves live, repeated swaps.
+- `DuckDBStore.write_table(overwrite=True)`: content correctness, concurrent
+  reader continuity (file-backed DB, dedicated read connection).
+- `CricQueuedataFetcher._load`: first load, reload replaces content, concurrent
+  reader never sees zero rows, no staging table left behind, empty-data guard.
+- `CollectionRouter`: slot defaults, sidecar persistence across instances,
+  swap alternation, crash recovery, multi-collection independence, atomic
+  `.tmp` handling.
+- `ChromaWrapper.create_collection`: verifies the client method called,
+  confirms `_ingest_file` issues delete-before-create on the idle slot.
+
+**Changed files:**
+
+- `src/bamboo_mcp_services/common/storage/duckdb_store.py` — new
+  `atomic_swap_table` function; `write_table(overwrite=True)` rewritten to use
+  shadow-swap.
+- `src/bamboo_mcp_services/agents/cric_agent/cric_fetcher.py` — `_load`
+  rewritten; `_create_table` renamed to `_create_staging_table`; `_insert_rows`
+  gains a `table` parameter.
+- `src/bamboo_mcp_services/common/storage/schema.py` — `_migrate_composite_pk`
+  DROP wrapped in transaction.
+- `src/bamboo_mcp_services/agents/document_monitor_agent/storage.py` — new
+  `CollectionRouter` class; `ChromaWrapper.create_collection` fixed to call
+  `client.create_collection`.
+- `src/bamboo_mcp_services/agents/document_monitor_agent/agent.py` —
+  `__init__` wires up `CollectionRouter`; `_ingest_file` rewritten with
+  blue/green swap; `_health_details` adds `chroma_live_slot`.
+- `tests/test_atomic_updates.py` — new, 26 tests.
+- `README-document_monitor_agent.md` — updated design guarantees, re-ingestion,
+  and operational guidance for the new storage layout.
+- `README.md` — updated `document-monitor-agent` description and common
+  pitfalls.
+
+---
+
+### Added (prior unreleased)
 
 A new `dashboard-agent` serves a dark-themed, single-page web UI for monitoring
 the Bamboo MCP Services system in real time.  It starts a

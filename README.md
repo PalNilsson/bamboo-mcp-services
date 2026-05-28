@@ -159,6 +159,8 @@ Full documentation: [README-dashboard_agent.md](./README-dashboard_agent.md)
 
 Watches a directory (including all subdirectories) for new or changed documents and ingests them into ChromaDB for use in RAG pipelines. Extracts and chunks text from `.pdf`, `.docx`, `.txt`, and `.md` files, computes deterministic chunk IDs, and stores vectors and metadata locally.
 
+Updates are performed using a **blue/green slot rotation**: vectors are written into an idle ChromaDB collection while the live collection remains fully queryable, then the routing sidecar is updated atomically via `os.replace` to promote the new slot. This means there is no window where the collection is empty or partially filled, regardless of how long embedding takes. The idle slot is always deleted and recreated from scratch before each build, which also eliminates ChromaDB dimension-mismatch errors when the embedder model changes.
+
 → [Full documentation](./README-document_monitor_agent.md)
 
 ### `ingestion-agent` ✅ Ready
@@ -181,6 +183,11 @@ Information Catalogue (via CVMFS) and stores the latest snapshot in a local
 database writes when the source file has not changed since the last cycle,
 and performs a full table replace on each changed load so the database stays
 small regardless of how long the agent runs.
+
+Table replacements use a **shadow-rename swap**: the new data is written into
+`queuedata_staging` first, then a short single-transaction `ALTER TABLE RENAME`
+promotes it to `queuedata` atomically. Readers never see a gap between the old
+and new snapshots.
 
 Key features:
 - Single `queuedata` table — one row per ATLAS computing queue, ~90 columns
@@ -429,7 +436,15 @@ python -c "import bamboo_mcp_services.agents.github_doc_sync_agent.github_markdo
 ```
 The path should point into your development tree, not `site-packages`.
 
-**`document-monitor-agent` logs `Falling back to DummyEmbedder`** — the embedding
+**`document-monitor-agent` — ChromaDB collection appears empty after upgrade** — the agent now stores vectors in slotted collection names (`atlas_docs__a` / `atlas_docs__b`) rather than the bare logical name (`atlas_docs`).  If you are upgrading from an older version, the agent will not find or use any data in the old unslotted collection.  Wipe and re-ingest:
+```bash
+rm -rf .chromadb/ .document_monitor/checkpoints.json
+bamboo-document-monitor --dir ./documents --chroma-dir .chromadb --collection atlas_docs --once
+```
+
+**`document-monitor-agent` — ChromaDB dimension mismatch error** — this used to require manually deleting the collection.  The blue/green design now handles it automatically: the idle slot is deleted and recreated from scratch before every update, so a changed embedder model can never corrupt the live collection.  If you see a dimension-mismatch error in the logs it means the current cycle failed to build into the idle slot; the live collection remains readable and the agent will retry on the next cycle.
+
+ — the embedding
 stack (`torch`, `sentence-transformers`, `langchain-huggingface`) is not installed
 or has a version conflict.  Install via `pip install -r requirements.txt` and verify
 with:
