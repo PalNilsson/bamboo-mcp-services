@@ -17,6 +17,21 @@ from bamboo_mcp_services.common.cli import log_startup_banner
 logger = logging.getLogger(__name__)
 
 
+class _SuppressNameAtInfo(logging.Filter):
+    """Blank the ``name`` field for INFO-level records.
+
+    At INFO verbosity the logger hierarchy (e.g.
+    ``bamboo_mcp_services.agents.document_monitor_agent.agent``) adds noise
+    without value — almost every line comes from the same module.  WARNING and
+    above keep the full name so that unexpected sources are still identifiable.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        if record.levelno == logging.INFO:
+            record.name = ""
+        return True
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser for the document monitor agent.
 
@@ -234,8 +249,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        format="%(asctime)s %(levelname)s %(name)s%(message)s",
     )
+    _filter = _SuppressNameAtInfo()
+    for _h in logging.root.handlers:
+        _h.addFilter(_filter)
     log_startup_banner(logger, "bamboo-document-monitor")
 
     # Suppress verbose third-party loggers — model is loaded from local cache

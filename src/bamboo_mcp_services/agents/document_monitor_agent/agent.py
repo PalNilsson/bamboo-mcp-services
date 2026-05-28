@@ -114,8 +114,21 @@ class DocumentMonitorAgent(Agent):
         LOG.info("document-monitor-agent v%s starting. Monitoring: %s", _version, self.directory)
         self.directory.mkdir(parents=True, exist_ok=True)
 
-    def _is_file_changed(self, path_str: str, text: str) -> tuple[bool, str, list]:
+    def _is_file_changed(
+        self,
+        path_str: str,
+        text: str,
+        file_num: int = 0,
+        total: int = 0,
+    ) -> tuple[bool, str, list]:
         """Check whether a file needs ingesting by comparing its content hash to the checkpoint.
+
+        Args:
+            path_str: Absolute path of the file under inspection.
+            text: Full extracted text of the file.
+            file_num: 1-based index of this file in the current scan (used in
+                log output when *total* is also provided).
+            total: Total number of files found in the current scan pass.
 
         Returns:
             Tuple of (changed, content_hash, prev_chunk_ids).
@@ -129,7 +142,10 @@ class DocumentMonitorAgent(Agent):
             return False, h, prev_chunk_ids
 
         if prev_hash is None:
-            LOG.info("New file detected: %s", path_str)
+            if file_num and total:
+                LOG.info("New file detected (#%d/%d): %s", file_num, total, path_str)
+            else:
+                LOG.info("New file detected: %s", path_str)
         else:
             LOG.info("File changed, re-ingesting: %s", path_str)
 
@@ -236,15 +252,16 @@ class DocumentMonitorAgent(Agent):
         # --- First pass: identify which files need ingesting ---------------
         candidates: list[tuple[str, str, str]] = []  # (path_str, text, hash)
         skipped_count = 0
+        total_files = len(files)
 
-        for p in files:
+        for file_num, p in enumerate(files, start=1):
             path_str = str(p.resolve())
             try:
                 text = extract_text_from_file(path_str)
                 if not text:
                     LOG.debug("No text extracted from %s; skipping.", path_str)
                     continue
-                changed, h, _ = self._is_file_changed(path_str, text)
+                changed, h, _ = self._is_file_changed(path_str, text, file_num, total_files)
                 if not changed:
                     skipped_count += 1
                     continue
