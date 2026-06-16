@@ -79,11 +79,20 @@ Full documentation: [README-supervisor-agent.md](./README-supervisor-agent.md)
 ### Run the document monitor agent
 
 ```bash
-# Process all files once and exit:
-bamboo-document-monitor --dir ./documents --chroma-dir .chromadb --once
+# Process all configured collections once and exit:
+bamboo-document-monitor \
+  --watch /data/bamboo/rag/panda_docs   panda_docs \
+  --watch /data/bamboo/rag/atlas_docs   atlas_docs \
+  --watch /data/bamboo/rag/bamboo_docs  bamboo_docs \
+  --watch /data/bamboo/rag/rucio_docs   rucio_docs \
+  --watch /data/bamboo/rag/root_docs    root_docs \
+  --chroma-dir /data/bamboo/.chromadb --once
 
 # Run as a long-lived daemon (polls every 10 seconds):
-bamboo-document-monitor --dir ./documents --poll-interval 10 --chroma-dir .chromadb
+bamboo-document-monitor \
+  --watch /data/bamboo/rag/panda_docs  panda_docs \
+  --watch /data/bamboo/rag/bamboo_docs bamboo_docs \
+  --chroma-dir /data/bamboo/.chromadb
 ```
 
 Full documentation: [README-document_monitor_agent.md](./README-document_monitor_agent.md)
@@ -157,7 +166,7 @@ Full documentation: [README-dashboard_agent.md](./README-dashboard_agent.md)
 
 ### `document-monitor-agent` ✅ Ready
 
-Watches a directory (including all subdirectories) for new or changed documents and ingests them into ChromaDB for use in RAG pipelines. Extracts and chunks text from `.pdf`, `.docx`, `.txt`, and `.md` files, computes deterministic chunk IDs, and stores vectors and metadata locally.
+Watches one or more directories for new or changed documents and ingests each into a named ChromaDB collection for use in RAG pipelines. Each `--watch DIR COLLECTION` pair (repeatable) maps a normalised output directory to a logical collection, allowing different document sources to be kept in separate collections. Extracts and chunks text from `.pdf`, `.docx`, `.txt`, and `.md` files, computes deterministic chunk IDs, and stores vectors and metadata locally.
 
 Updates are performed using a **blue/green slot rotation**: vectors are written into an idle ChromaDB collection while the live collection remains fully queryable, then the routing sidecar is updated atomically via `os.replace` to promote the new slot. This means there is no window where the collection is empty or partially filled, regardless of how long embedding takes. The idle slot is always deleted and recreated from scratch before each build, which also eliminates ChromaDB dimension-mismatch errors when the embedder model changes.
 
@@ -212,8 +221,9 @@ The agent is a **file writer only**.  It is designed to feed the
 insertion.  The two agents are decoupled and can run independently.
 
 Key features:
-- Multi-repository support via a YAML config file; per-repo branch, glob
-  filters, and `within_hours` recency check
+- Multi-repository support via a YAML config file; per-repo `collection`,
+  branch, glob filters, and `within_hours` recency check — `collection`
+  declares which ChromaDB collection a repo's normalised output belongs to
 - GitHub wiki support via `wiki: true` config flag
 - SHA-based incremental sync — full download only when new commits are detected
 - RST → Markdown conversion and YAML frontmatter injection for RAG-ready output
@@ -438,8 +448,11 @@ The path should point into your development tree, not `site-packages`.
 
 **`document-monitor-agent` — ChromaDB collection appears empty after upgrade** — the agent now stores vectors in slotted collection names (`atlas_docs__a` / `atlas_docs__b`) rather than the bare logical name (`atlas_docs`).  If you are upgrading from an older version, the agent will not find or use any data in the old unslotted collection.  Wipe and re-ingest:
 ```bash
-rm -rf .chromadb/ .document_monitor/checkpoints.json
-bamboo-document-monitor --dir ./documents --chroma-dir .chromadb --collection atlas_docs --once
+rm -rf .chromadb/ .document_monitor/
+bamboo-document-monitor \
+  --watch /data/bamboo/rag/panda_docs  panda_docs \
+  --watch /data/bamboo/rag/atlas_docs  atlas_docs \
+  --chroma-dir /data/bamboo/.chromadb --once
 ```
 
 **`document-monitor-agent` — ChromaDB dimension mismatch error** — this used to require manually deleting the collection.  The blue/green design now handles it automatically: the idle slot is deleted and recreated from scratch before every update, so a changed embedder model can never corrupt the live collection.  If you see a dimension-mismatch error in the logs it means the current cycle failed to build into the idle slot; the live collection remains readable and the agent will retry on the next cycle.

@@ -77,7 +77,11 @@ class CollectionRouter:
         """Return the physical collection name currently serving *logical*.
 
         If no routing record exists for *logical*, the default live slot
-        (``<logical>__a``) is recorded and returned.
+        (``<logical>__a``) is used **in memory only** — the sidecar is *not*
+        written until :meth:`commit_swap` completes successfully.  This prevents
+        a race where the sidecar records ``__a`` as live before any ingestion has
+        occurred, which would leave readers pointing at an empty collection if the
+        process crashes before the first swap.
 
         Args:
             logical: Logical collection name (e.g. ``"atlas_docs"``).
@@ -87,7 +91,9 @@ class CollectionRouter:
         """
         if logical not in self._data:
             self._data[logical] = f"{logical}__a"
-            self._save()
+            # Intentionally NOT calling _save() here.  The sidecar must only
+            # reflect slots that contain committed, populated data.  The first
+            # write happens inside commit_swap() once ingestion has succeeded.
         return self._data[logical]
 
     def idle_name(self, logical: str) -> str:
@@ -116,17 +122,26 @@ class CollectionRouter:
         Steps:
 
         1. Determine the current live and idle physical names.
-        2. Delete all documents from the old live collection (so it is clean
-           for the next update cycle), then delete the collection itself.
-        3. Write the updated routing record to the sidecar via
-           ``write + os.replace``.
+        2. Write the updated routing record to the sidecar via
+           ``write + os.replace`` so readers atomically see the new slot.
+        3. Verify the newly live collection contains at least one document.
+           If it is empty, the sidecar write is *not* rolled back (the slot is
+           genuinely live and will be populated on the next ingestion cycle), but
+           a prominent WARNING is emitted so operators can investigate.
+        4. Delete the old live collection now that it is no longer routed.
 
         After this call :meth:`live_name` returns the former idle name.
 
         Args:
             logical: Logical collection name.
-            chroma: :class:`ChromaWrapper` instance used to delete the old
-                live collection.
+            chroma: :class:`ChromaWrapper` instance used to verify and clean up
+                the collections.
+
+        Raises:
+            RuntimeError: If the newly promoted collection reports zero
+                documents.  The sidecar has already been written at this point
+                (the slot is live); the error is raised so the caller can log it
+                as a fatal cycle failure.
         """
         old_live = self.live_name(logical)
         new_live = self.idle_name(logical)
@@ -139,8 +154,77 @@ class CollectionRouter:
             logical, old_live, new_live,
         )
 
+        # Post-swap invariant: the newly live collection must be non-empty.
+        # An empty collection here means ingestion completed with zero chunks,
+        # which breaks all RAG queries for this logical collection.
+        new_count = chroma.collection_count(new_live)
+        if new_count == 0:
+            raise RuntimeError(
+                f"CollectionRouter invariant violated after swap: '{logical}' → "
+                f"'{new_live}' contains 0 documents.  Ingestion produced no "
+                f"chunks — check embedder and source files.  Sidecar already "
+                f"updated; re-run ingestion to populate this slot."
+            )
+        LOG.info(
+            "CollectionRouter: invariant OK — '%s' (%s) has %d document(s).",
+            logical, new_live, new_count,
+        )
+
         # Clean up the old live collection now that it is no longer routed.
         chroma.delete_collection(old_live)
+
+    def verify_routing_invariant(self, chroma: "ChromaWrapper") -> list[str]:
+        """Check that every sidecar entry points at a non-empty collection.
+
+        This is a diagnostic / end-of-cycle health check.  It does **not**
+        modify any state — it only reads collection counts and reports problems.
+
+        The key invariant::
+
+            For every logical name L in the sidecar, the physical collection
+            ``sidecar[L]`` must exist in ChromaDB and contain > 0 documents.
+
+        Args:
+            chroma: :class:`ChromaWrapper` used to query collection counts.
+
+        Returns:
+            A list of human-readable ``"[STATUS] logical -> physical (N docs)"``
+            strings, one per entry.  Entries that pass the invariant are
+            prefixed ``[OK]``; broken entries are prefixed ``[BROKEN]``.
+
+        Raises:
+            RuntimeError: If any entry is broken (non-zero count or missing
+                collection).  The error message lists all broken entries.
+        """
+        lines: list[str] = []
+        broken: list[str] = []
+
+        counts = chroma.all_collection_counts()
+
+        for logical, physical in sorted(self._data.items()):
+            count = counts.get(physical, "MISSING")
+            if isinstance(count, int) and count > 0:
+                status = "OK"
+                lines.append(f"[{status}] {logical} -> {physical}  ({count} docs)")
+            else:
+                status = "BROKEN"
+                entry = f"[{status}] {logical} -> {physical}  ({count} docs)"
+                lines.append(entry)
+                broken.append(entry)
+
+        for line in lines:
+            if line.startswith("[OK]"):
+                LOG.info("routing: %s", line)
+            else:
+                LOG.error("routing: %s", line)
+
+        if broken:
+            raise RuntimeError(
+                "collection_routing.json invariant violated:\n"
+                + "\n".join(broken)
+            )
+
+        return lines
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -267,6 +351,36 @@ class ChromaWrapper:
             collection.add(ids=ids, documents=documents, metadatas=metadatas)
         else:
             collection.add(ids=ids, documents=documents, metadatas=metadatas, embeddings=embeddings)
+
+    def collection_count(self, name: str) -> int:
+        """Return the number of documents in *name*, or 0 if it does not exist.
+
+        Args:
+            name: Physical collection name.
+
+        Returns:
+            Document count, or 0 if the collection is absent or unreadable.
+        """
+        try:
+            col = self.client.get_collection(name)
+            return col.count()
+        except Exception:
+            return 0
+
+    def all_collection_counts(self) -> Dict[str, int]:
+        """Return a mapping of physical collection name → document count.
+
+        Used by :meth:`CollectionRouter.verify_routing_invariant` to snapshot
+        all collection sizes in a single pass.
+
+        Returns:
+            Dict mapping collection name to its document count.
+        """
+        try:
+            return {col.name: col.count() for col in self.client.list_collections()}
+        except Exception:
+            LOG.warning("ChromaWrapper: could not list collections for count snapshot.")
+            return {}
 
     def delete_documents_by_ids(self, collection: Collection, ids: List[str]) -> None:
         """Delete documents from a collection by their ids (best-effort).

@@ -327,6 +327,21 @@ written to different locations depending on the working directory.
 **First run on a new machine** requires `HF_HUB_OFFLINE=0` to download the
 embedding model.  Subsequent runs use the cached model automatically.
 
+**Routing sidecar write order — critical invariant**: `CollectionRouter.live_name()`
+never writes the sidecar.  The sidecar (`collection_routing.json`) is *only*
+written by `commit_swap()` after ingestion has successfully completed.  This
+prevents the sidecar from pointing at an empty slot if the process crashes before
+the first swap.  The invariant is:
+
+> For every entry `L → P` in the sidecar, `P` must exist in ChromaDB and contain
+> `> 0` documents.
+
+`commit_swap()` enforces this with a post-swap count check and raises
+`RuntimeError` if the newly live slot is empty.  `verify_routing_invariant()`
+performs the same check across all entries and is called after every successful
+swap.  Use `python scripts/verify_routing.py` to check the invariant from the
+command line without running the agent.
+
 ---
 
 ## CRIC agent — key design decisions

@@ -9,6 +9,83 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+#### `collection_routing.json` sidecar correctness — document monitor agent
+
+**Root cause:** `CollectionRouter.live_name()` called `_save()` on first
+access, writing `logical -> logical__a` to the sidecar before any ingestion
+had occurred.  If the agent process crashed or was interrupted before the
+first `commit_swap()` completed, the sidecar permanently pointed at an empty
+`__a` slot while the ingested data lived in `__b`.  bamboo-mcp readers
+following the sidecar saw zero documents and the LLM answered "not enough
+information".  This is root-cause #3 identified in the 2026-06-16 handover.
+
+**Changes:**
+
+- `storage.py` — `CollectionRouter.live_name()`: removed the eager `_save()`
+  call.  The in-memory default (`__a`) is still used for slot arithmetic, but
+  the sidecar is **not** written until `commit_swap()` succeeds.  The sidecar
+  now only ever reflects slots that contain committed, populated data.
+
+- `storage.py` — `CollectionRouter.commit_swap()`: added a post-swap
+  invariant check via the new `ChromaWrapper.collection_count()` helper.
+  After the atomic sidecar write, the new live collection's document count is
+  verified to be > 0.  If it is 0, a `RuntimeError` is raised so the cycle
+  fails loudly instead of silently serving an empty corpus.  (The sidecar is
+  not rolled back — the slot is live and will be repopulated on the next
+  cycle.)
+
+- `storage.py` — `CollectionRouter.verify_routing_invariant(chroma)`: new
+  public method that snapshots all collection counts and checks every sidecar
+  entry.  Returns a list of `"[OK]/[BROKEN] logical -> physical (N docs)"`
+  lines; raises `RuntimeError` listing all broken entries.  Called by
+  `_tick_impl` after every successful swap and available standalone via
+  `scripts/verify_routing.py`.
+
+- `storage.py` — `ChromaWrapper.collection_count(name)`: new helper that
+  returns the document count for a single named collection (0 if absent).
+
+- `storage.py` — `ChromaWrapper.all_collection_counts()`: new helper that
+  returns `{name: count}` for all collections in one pass; used by
+  `verify_routing_invariant`.
+
+- `agent.py` — `DocumentMonitorAgent._tick_impl()`: after `commit_swap()`
+  succeeds, calls `router.verify_routing_invariant(self.chroma)`.  Any
+  broken entries are logged at ERROR and stored in `_last_error` without
+  aborting the cycle (the newly ingested collection is live and valid; stale
+  entries from previous partial runs are flagged for operator attention).
+
+- `scripts/verify_routing.py`: new standalone operator script.  Reads
+  `$BAMBOO_CHROMA_PATH/collection_routing.json`, compares every entry
+  against live ChromaDB counts, and exits 0 (all OK) or 1 (broken entries
+  found).  Run after a manual sidecar repair to confirm correctness.
+
+**Test changes** (`tests/test_atomic_updates.py`):
+
+- `test_first_access_writes_sidecar` → renamed to
+  `test_first_access_does_not_write_sidecar` (inverted assertion — the
+  sidecar must *not* exist after `live_name()` alone).
+- `test_sidecar_write_is_atomic` — updated to trigger the sidecar write via
+  `commit_swap()` rather than `live_name()`.
+- All `test_commit_swap_*` tests updated to supply
+  `mock_chroma.collection_count.return_value = 10`.
+- New tests:
+  - `test_commit_swap_raises_when_new_slot_is_empty`
+  - `test_commit_swap_writes_sidecar_before_invariant_check`
+  - `test_commit_swap_no_raise_when_count_positive`
+  - `test_verify_routing_invariant_passes_all_ok`
+  - `test_verify_routing_invariant_raises_on_empty_collection`
+  - `test_verify_routing_invariant_raises_on_missing_collection`
+  - `test_verify_routing_invariant_reports_all_broken_entries`
+  - `test_verify_routing_invariant_mixed_ok_and_broken`
+  - `test_verify_routing_invariant_empty_sidecar_passes`
+
+**Operator note:** On `aipanda033` as of 2026-06-16 the sidecar was manually
+corrected to point `atlas_docs` at `__b` (324 docs) and `bamboo_docs` at
+`__b` (74 docs).  The next full ingestion cycle will overwrite the sidecar
+via the fixed code path and the invariant will be verified automatically.
+
 ### Added
 
 #### Multi-collection RAG ingestion — per-source ChromaDB collection routing

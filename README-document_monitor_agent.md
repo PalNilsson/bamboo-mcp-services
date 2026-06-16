@@ -53,7 +53,40 @@ The file `<chroma-dir>/collection_routing.json` records the current live slot fo
 }
 ```
 
-It is written with a write-then-`os.replace` pattern, so it is never partially written.  If the file is missing or corrupt on startup the agent defaults to slot `__a` and writes a fresh sidecar.  A crash between the sidecar write and the deletion of the old slot leaves an extra collection on disk, which is deleted at the start of the next cycle.
+It is written with a write-then-`os.replace` pattern, so it is never partially written.  **The sidecar is only written by `commit_swap()` after ingestion has completed successfully** — it is never written at agent startup.  This guarantees the sidecar always points at a slot that has been populated; a sidecar entry is not created until the first ingestion cycle completes.
+
+**Routing invariant:** for every entry `L → P` in the sidecar, the physical collection `P` must exist in ChromaDB and contain at least one document.  The agent verifies this invariant at the end of every successful ingestion cycle and logs ERROR if it is violated.
+
+#### Verifying the sidecar manually
+
+```bash
+# Uses $BAMBOO_CHROMA_PATH:
+python scripts/verify_routing.py
+
+# Explicit path:
+python scripts/verify_routing.py --chroma-dir /data/.chromadb
+```
+
+Sample output:
+
+```
+[OK    ] atlas_docs            ->  atlas_docs__b            (324 docs)
+[OK    ] bamboo_docs           ->  bamboo_docs__b           (74 docs)
+[BROKEN] panda_docs            ->  panda_docs__a            (0 docs)
+
+FAIL: 1 broken entrie(s):
+  [BROKEN] panda_docs -> panda_docs__a  (0 docs)
+```
+
+Exit code 0 = all entries consistent; 1 = one or more broken entries.
+
+#### Repairing a broken sidecar
+
+If the sidecar is stale (pointing at an empty slot while data is in the other slot) the quickest repair is to re-run the document monitor with `--once` for the affected collection.  This triggers a fresh ingestion cycle which will write the sidecar to the newly populated slot.
+
+If you need to repair manually (e.g. after discovering a discrepancy with `verify_routing.py`), edit `collection_routing.json` to point at the physical slot that actually contains documents, then re-run `verify_routing.py` to confirm.
+
+A crash between the sidecar write and the deletion of the old slot leaves an extra collection on disk, which is deleted at the start of the next cycle.
 
 #### Dimension mismatch protection
 

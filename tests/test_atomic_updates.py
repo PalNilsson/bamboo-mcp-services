@@ -11,8 +11,9 @@ Covers:
   ``_load``: reader thread always observes a non-zero row count during a
   concurrent refresh.
 - :class:`~bamboo_mcp_services.agents.document_monitor_agent.storage.CollectionRouter`:
-  live/idle slot resolution, first-run default, commit_swap routing update,
-  sidecar atomicity.
+  live/idle slot resolution, first-run default (no eager sidecar write),
+  commit_swap routing update, sidecar atomicity, post-swap empty-slot invariant
+  enforcement, and verify_routing_invariant diagnostics.
 """
 
 from __future__ import annotations
@@ -328,13 +329,20 @@ class TestCollectionRouter:
         router = CollectionRouter(sidecar)
         assert router.live_name("docs") == "docs__a"
 
-    def test_first_access_writes_sidecar(self, tmp_path):
+    def test_first_access_does_not_write_sidecar(self, tmp_path):
+        """live_name must NOT write the sidecar on first access.
+
+        The sidecar must only reflect slots that have been successfully populated.
+        Writing on first access would leave the sidecar pointing at an empty
+        collection if the process crashed before the first commit_swap.
+        """
         sidecar = tmp_path / "routing.json"
         router = CollectionRouter(str(sidecar))
         router.live_name("docs")
-        assert sidecar.exists()
-        data = json.loads(sidecar.read_text())
-        assert data["docs"] == "docs__a"
+        # Sidecar must not exist yet — no ingestion has occurred.
+        assert not sidecar.exists(), (
+            "live_name() must not write the sidecar before commit_swap completes"
+        )
 
     def test_idle_name_is_other_slot(self, tmp_path):
         sidecar = str(tmp_path / "routing.json")
@@ -349,6 +357,7 @@ class TestCollectionRouter:
         assert router.live_name("docs") == "docs__a"
 
         mock_chroma = MagicMock(spec=ChromaWrapper)
+        mock_chroma.collection_count.return_value = 10
         router.commit_swap("docs", mock_chroma)
 
         assert router.live_name("docs") == "docs__b"
@@ -358,9 +367,10 @@ class TestCollectionRouter:
     def test_commit_swap_deletes_old_live(self, tmp_path):
         sidecar = str(tmp_path / "routing.json")
         router = CollectionRouter(sidecar)
-        router.live_name("docs")  # initialise to __a
+        router.live_name("docs")  # initialise to __a in memory
 
         mock_chroma = MagicMock(spec=ChromaWrapper)
+        mock_chroma.collection_count.return_value = 10
         router.commit_swap("docs", mock_chroma)
 
         mock_chroma.delete_collection.assert_called_once_with("docs__a")
@@ -369,6 +379,7 @@ class TestCollectionRouter:
         sidecar = str(tmp_path / "routing.json")
         router = CollectionRouter(sidecar)
         mock_chroma = MagicMock(spec=ChromaWrapper)
+        mock_chroma.collection_count.return_value = 10
 
         expected_live = ["docs__a", "docs__b", "docs__a", "docs__b"]
         for expected in expected_live:
@@ -380,17 +391,21 @@ class TestCollectionRouter:
         sidecar = str(tmp_path / "routing.json")
         router1 = CollectionRouter(sidecar)
         mock_chroma = MagicMock(spec=ChromaWrapper)
+        mock_chroma.collection_count.return_value = 10
         router1.commit_swap("docs", mock_chroma)  # live → __b
 
         router2 = CollectionRouter(sidecar)
         assert router2.live_name("docs") == "docs__b"
 
     def test_sidecar_write_is_atomic(self, tmp_path):
-        """The sidecar is written via os.replace; the .tmp file must not linger."""
+        """The sidecar is written via os.replace on commit_swap; no .tmp must linger."""
         sidecar = tmp_path / "routing.json"
         router = CollectionRouter(str(sidecar))
-        router.live_name("docs")
+        mock_chroma = MagicMock(spec=ChromaWrapper)
+        mock_chroma.collection_count.return_value = 5  # non-empty — invariant passes
+        router.commit_swap("docs", mock_chroma)
 
+        assert sidecar.exists(), "sidecar must exist after commit_swap"
         tmp = sidecar.with_suffix(".tmp")
         assert not tmp.exists(), ".tmp file should have been replaced (not left behind)"
 
@@ -406,6 +421,7 @@ class TestCollectionRouter:
         sidecar = str(tmp_path / "routing.json")
         router = CollectionRouter(sidecar)
         mock_chroma = MagicMock(spec=ChromaWrapper)
+        mock_chroma.collection_count.return_value = 10
 
         # Swap only "alpha"; "beta" should remain at __a.
         router.live_name("alpha")
@@ -414,6 +430,157 @@ class TestCollectionRouter:
 
         assert router.live_name("alpha") == "alpha__b"
         assert router.live_name("beta") == "beta__a"
+
+    # ------------------------------------------------------------------
+    # New tests: commit_swap invariant enforcement
+    # ------------------------------------------------------------------
+
+    def test_commit_swap_raises_when_new_slot_is_empty(self, tmp_path):
+        """commit_swap must raise RuntimeError if the newly live collection is empty.
+
+        An empty slot after ingestion means no chunks were produced — RAG
+        queries would silently return nothing.  The error forces the cycle to
+        fail loudly instead of silently serving an empty corpus.
+        """
+        sidecar = str(tmp_path / "routing.json")
+        router = CollectionRouter(sidecar)
+        mock_chroma = MagicMock(spec=ChromaWrapper)
+        mock_chroma.collection_count.return_value = 0  # empty!
+
+        with pytest.raises(RuntimeError, match="invariant violated"):
+            router.commit_swap("docs", mock_chroma)
+
+    def test_commit_swap_writes_sidecar_before_invariant_check(self, tmp_path):
+        """The sidecar is written even when the invariant check fails.
+
+        The sidecar is the source of truth for readers; it must be updated
+        atomically.  The invariant error signals the operator, but the slot
+        is genuinely live and will be repopulated on the next cycle.
+        """
+        sidecar_path = tmp_path / "routing.json"
+        router = CollectionRouter(str(sidecar_path))
+        mock_chroma = MagicMock(spec=ChromaWrapper)
+        mock_chroma.collection_count.return_value = 0
+
+        with pytest.raises(RuntimeError):
+            router.commit_swap("docs", mock_chroma)
+
+        # Sidecar must have been written (swap recorded) despite the error.
+        assert sidecar_path.exists()
+        data = json.loads(sidecar_path.read_text())
+        assert data["docs"] == "docs__b"
+
+    def test_commit_swap_no_raise_when_count_positive(self, tmp_path):
+        """commit_swap must not raise when the new slot contains documents."""
+        sidecar = str(tmp_path / "routing.json")
+        router = CollectionRouter(sidecar)
+        mock_chroma = MagicMock(spec=ChromaWrapper)
+        mock_chroma.collection_count.return_value = 42
+
+        # Should not raise.
+        router.commit_swap("docs", mock_chroma)
+        assert router.live_name("docs") == "docs__b"
+
+    # ------------------------------------------------------------------
+    # New tests: verify_routing_invariant
+    # ------------------------------------------------------------------
+
+    def test_verify_routing_invariant_passes_all_ok(self, tmp_path):
+        """Returns a list of OK lines when all entries are non-empty."""
+        sidecar = str(tmp_path / "routing.json")
+        router = CollectionRouter(sidecar)
+        mock_chroma = MagicMock(spec=ChromaWrapper)
+        mock_chroma.collection_count.return_value = 10
+        router.commit_swap("docs", mock_chroma)  # sidecar now has docs -> docs__b
+
+        mock_chroma.all_collection_counts.return_value = {"docs__b": 10}
+        lines = router.verify_routing_invariant(mock_chroma)
+
+        assert len(lines) == 1
+        assert lines[0].startswith("[OK]")
+        assert "docs__b" in lines[0]
+
+    def test_verify_routing_invariant_raises_on_empty_collection(self, tmp_path):
+        """Raises RuntimeError when a routed collection is empty."""
+        sidecar_path = tmp_path / "routing.json"
+        # Manually write a sidecar that points at an empty slot.
+        sidecar_path.write_text(
+            '{"atlas_docs": "atlas_docs__a"}', encoding="utf-8"
+        )
+        router = CollectionRouter(str(sidecar_path))
+        mock_chroma = MagicMock(spec=ChromaWrapper)
+        mock_chroma.all_collection_counts.return_value = {"atlas_docs__a": 0}
+
+        with pytest.raises(RuntimeError, match="invariant violated"):
+            router.verify_routing_invariant(mock_chroma)
+
+    def test_verify_routing_invariant_raises_on_missing_collection(self, tmp_path):
+        """Raises RuntimeError when the routed physical collection does not exist."""
+        sidecar_path = tmp_path / "routing.json"
+        sidecar_path.write_text(
+            '{"atlas_docs": "atlas_docs__b"}', encoding="utf-8"
+        )
+        router = CollectionRouter(str(sidecar_path))
+        mock_chroma = MagicMock(spec=ChromaWrapper)
+        # atlas_docs__b is absent from ChromaDB.
+        mock_chroma.all_collection_counts.return_value = {}
+
+        with pytest.raises(RuntimeError, match="invariant violated"):
+            router.verify_routing_invariant(mock_chroma)
+
+    def test_verify_routing_invariant_reports_all_broken_entries(self, tmp_path):
+        """All broken entries are included in the RuntimeError message."""
+        sidecar_path = tmp_path / "routing.json"
+        sidecar_path.write_text(
+            '{"atlas_docs": "atlas_docs__a", "bamboo_docs": "bamboo_docs__b"}',
+            encoding="utf-8",
+        )
+        router = CollectionRouter(str(sidecar_path))
+        mock_chroma = MagicMock(spec=ChromaWrapper)
+        # Both collections are empty.
+        mock_chroma.all_collection_counts.return_value = {
+            "atlas_docs__a": 0,
+            "bamboo_docs__b": 0,
+        }
+
+        with pytest.raises(RuntimeError) as exc_info:
+            router.verify_routing_invariant(mock_chroma)
+
+        msg = str(exc_info.value)
+        assert "atlas_docs" in msg
+        assert "bamboo_docs" in msg
+
+    def test_verify_routing_invariant_mixed_ok_and_broken(self, tmp_path):
+        """Only the broken entries appear in the error; OK entries are not mentioned."""
+        sidecar_path = tmp_path / "routing.json"
+        sidecar_path.write_text(
+            '{"good_docs": "good_docs__a", "bad_docs": "bad_docs__b"}',
+            encoding="utf-8",
+        )
+        router = CollectionRouter(str(sidecar_path))
+        mock_chroma = MagicMock(spec=ChromaWrapper)
+        mock_chroma.all_collection_counts.return_value = {
+            "good_docs__a": 50,   # OK
+            "bad_docs__b": 0,     # BROKEN
+        }
+
+        with pytest.raises(RuntimeError) as exc_info:
+            router.verify_routing_invariant(mock_chroma)
+
+        msg = str(exc_info.value)
+        assert "bad_docs" in msg
+        # good_docs is fine — must not appear in the error
+        assert "good_docs" not in msg
+
+    def test_verify_routing_invariant_empty_sidecar_passes(self, tmp_path):
+        """An empty sidecar (no entries) passes the invariant trivially."""
+        sidecar = str(tmp_path / "routing.json")
+        router = CollectionRouter(sidecar)  # no commits yet; sidecar absent
+        mock_chroma = MagicMock(spec=ChromaWrapper)
+        mock_chroma.all_collection_counts.return_value = {}
+
+        lines = router.verify_routing_invariant(mock_chroma)
+        assert lines == []
 
 
 # ===========================================================================

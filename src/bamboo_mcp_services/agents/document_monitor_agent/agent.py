@@ -216,6 +216,56 @@ class DocumentMonitorAgent(Agent):
         self._last_error = None
         LOG.info("Processed file %s -> chunks=%d", path_str, len(chunks))
 
+    def _promote_idle_slot(
+        self,
+        idle_physical: str,
+        processed_count: int,
+        skipped_count: int,
+        candidate_count: int,
+    ) -> None:
+        """Promote or discard the idle slot based on ingestion results.
+
+        Called once per cycle after all candidates have been processed.
+
+        If *processed_count* is 0, every file failed — the idle slot is cleaned
+        up and the live slot is left untouched.  Otherwise the idle slot is
+        atomically promoted via :meth:`~storage.CollectionRouter.commit_swap`,
+        and a post-cycle routing invariant check is run.
+
+        Args:
+            idle_physical: Name of the physical idle collection built this cycle.
+            processed_count: Number of files successfully ingested this cycle.
+            skipped_count: Number of files skipped (unchanged content hash).
+            candidate_count: Total number of candidates attempted this cycle.
+        """
+        if processed_count == 0:
+            LOG.warning(
+                "Poll cycle: all %d candidate(s) failed; idle slot cleaned up, "
+                "no swap performed.", candidate_count,
+            )
+            self.chroma.delete_collection(idle_physical)
+            return
+
+        # Atomically promote the idle slot.  commit_swap raises RuntimeError
+        # if the new slot is empty.
+        self.router.commit_swap(self._logical_name, self.chroma)
+        new_live = self.router.live_name(self._logical_name)
+        self.collection = self.chroma.get_or_create_collection(new_live)
+        self.chroma.persist()
+
+        # Post-cycle invariant check: verify all routed collections are non-empty.
+        try:
+            self.router.verify_routing_invariant(self.chroma)
+        except RuntimeError as inv_exc:
+            LOG.error("Post-cycle routing invariant FAILED: %s", inv_exc)
+            self._last_error = str(inv_exc)
+
+        LOG.info(
+            "Poll cycle complete: %d file(s) ingested, %d unchanged. "
+            "Live slot: %s. Next poll in %ds.",
+            processed_count, skipped_count, new_live, self.poll_interval_sec,
+        )
+
     def _tick_impl(self) -> None:
         """Perform one polling cycle: detect new/changed files, ingest into ChromaDB.
 
@@ -299,26 +349,9 @@ class DocumentMonitorAgent(Agent):
                     LOG.exception("Error processing file %s: %s", path_str, exc)
                     self._last_error = str(exc)
 
-            if processed_count == 0:
-                # Every file failed — clean up the idle slot and leave the live
-                # slot untouched.
-                LOG.warning(
-                    "Poll cycle: all %d candidate(s) failed; idle slot cleaned up, "
-                    "no swap performed.", len(candidates),
-                )
-                self.chroma.delete_collection(idle_physical)
-            else:
-                # Atomically promote the idle slot.  Updates the routing sidecar
-                # (os.replace) and deletes the old live collection.
-                self.router.commit_swap(self._logical_name, self.chroma)
-                new_live = self.router.live_name(self._logical_name)
-                self.collection = self.chroma.get_or_create_collection(new_live)
-                self.chroma.persist()
-                LOG.info(
-                    "Poll cycle complete: %d file(s) ingested, %d unchanged. "
-                    "Live slot: %s. Next poll in %ds.",
-                    processed_count, skipped_count, new_live, self.poll_interval_sec,
-                )
+            self._promote_idle_slot(
+                idle_physical, processed_count, skipped_count, len(candidates),
+            )
 
         except Exception as exc:
             # Unexpected error outside the per-file loop — clean up and bail.
