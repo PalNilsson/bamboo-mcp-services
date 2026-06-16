@@ -70,6 +70,13 @@ class RepoConfig:
             non-GitHub hosts (GitLab, FramaGit, Bitbucket, etc.).
         clone_url: HTTPS clone URL used when ``git=True``.  Required when
             ``git=True``; ignored otherwise.
+        collection: Logical ChromaDB collection name that the normalised output
+            of this repository should be ingested into (e.g. ``"atlas_docs"``,
+            ``"bamboo_docs"``).  This field is informational for the sync agent
+            itself — it is consumed by the document-monitor CLI to route each
+            watched directory to the correct ChromaDB collection.  When
+            ``None`` the document-monitor falls back to its ``--collection``
+            default.
     """
 
     name: str
@@ -83,6 +90,7 @@ class RepoConfig:
     wiki: bool = False
     git: bool = False
     clone_url: Optional[str] = None
+    collection: Optional[str] = None
 
 
 def parse_repo(repo: str) -> Tuple[str, str]:

@@ -178,6 +178,7 @@ def _load_repo_configs(cfg: dict) -> list[RepoConfig]:
             normalize_for_rag=entry.get("normalize_for_rag", False),
             git=entry.get("git", False),
             clone_url=entry.get("clone_url"),
+            collection=entry.get("collection"),
         )
         for entry in cfg.get("repos", [])
     ]

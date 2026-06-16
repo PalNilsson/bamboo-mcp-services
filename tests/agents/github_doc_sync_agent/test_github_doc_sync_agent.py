@@ -930,3 +930,72 @@ class TestSyncGitRepo:
         # State file must be unchanged.
         saved = json.loads(state_path.read_text())
         assert saved["files_downloaded"] == 10
+
+
+# ===========================================================================
+# RepoConfig — collection field
+# ===========================================================================
+
+class TestRepoConfigCollection:
+    """Tests for the optional collection field on RepoConfig."""
+
+    def test_collection_defaults_to_none(self):
+        cfg = RepoConfig(name="owner/repo", destination="/tmp/dest")
+        assert cfg.collection is None
+
+    def test_collection_can_be_set(self):
+        cfg = RepoConfig(name="owner/repo", destination="/tmp/dest", collection="panda_docs")
+        assert cfg.collection == "panda_docs"
+
+    def test_collection_is_independent_of_other_fields(self):
+        cfg = RepoConfig(
+            name="PalNilsson/bamboo-mcp",
+            destination="/data/bamboo/tmp",
+            normalized_destination="/data/bamboo/rag/bamboo_docs",
+            collection="bamboo_docs",
+            normalize_for_rag=True,
+        )
+        assert cfg.collection == "bamboo_docs"
+        assert cfg.normalized_destination == "/data/bamboo/rag/bamboo_docs"
+
+    def test_collection_loaded_from_yaml_config(self, tmp_path):
+        """_load_repo_configs must propagate the collection field from YAML."""
+        from bamboo_mcp_services.agents.github_doc_sync_agent.cli import _load_repo_configs
+
+        cfg_dict = {
+            "repos": [
+                {
+                    "name": "PanDAWMS/panda-docs",
+                    "destination": str(tmp_path / "tmp"),
+                    "normalized_destination": str(tmp_path / "rag/panda_docs"),
+                    "collection": "panda_docs",
+                },
+                {
+                    "name": "PalNilsson/bamboo-mcp",
+                    "destination": str(tmp_path / "tmp"),
+                    "normalized_destination": str(tmp_path / "rag/bamboo_docs"),
+                    "collection": "bamboo_docs",
+                },
+            ]
+        }
+        repos = _load_repo_configs(cfg_dict)
+        assert repos[0].collection == "panda_docs"
+        assert repos[1].collection == "bamboo_docs"
+
+    def test_missing_collection_in_yaml_gives_none(self, tmp_path):
+        """Repos without a collection key in YAML get collection=None."""
+        from bamboo_mcp_services.agents.github_doc_sync_agent.cli import _load_repo_configs
+
+        cfg_dict = {
+            "repos": [
+                {"name": "owner/repo", "destination": str(tmp_path / "dest")},
+            ]
+        }
+        repos = _load_repo_configs(cfg_dict)
+        assert repos[0].collection is None
+
+    def test_multiple_repos_same_collection(self):
+        """Two repos may legitimately share the same collection name."""
+        r1 = RepoConfig(name="PanDAWMS/pilot3", destination="/tmp/a", collection="panda_docs")
+        r2 = RepoConfig(name="PanDAWMS/panda-docs", destination="/tmp/b", collection="panda_docs")
+        assert r1.collection == r2.collection == "panda_docs"

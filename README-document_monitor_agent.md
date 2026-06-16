@@ -1,6 +1,6 @@
 # document_monitor_agent
 
-A production-oriented agent that watches a directory for new or changed documents, extracts and chunks text, computes deterministic chunk IDs, embeds chunks, and stores vectors and metadata in a local ChromaDB collection.
+A production-oriented agent that watches one or more directories for new or changed documents, extracts and chunks text, computes deterministic chunk IDs, embeds chunks, and stores vectors and metadata in named ChromaDB collections.
 
 ---
 
@@ -122,90 +122,107 @@ pip install -e .
 
 ## Running the agent
 
-### One-shot (recommended for cron and pipeline use)
+### One-shot with multiple watch pairs (recommended)
 
-Process all new or changed files once and exit:
+Use `--watch DIR COLLECTION` (repeatable) to monitor several directories and
+ingest each into its own named ChromaDB collection in one invocation.  This is
+the standard deployment pattern when `bamboo-github-sync` writes to separate
+per-collection output directories:
 
 ```bash
-bamboo-document-monitor --dir ./documents --chroma-dir .chromadb --collection atlas_docs --once
+bamboo-document-monitor \
+  --watch /data/bamboo/rag/panda_docs   panda_docs \
+  --watch /data/bamboo/rag/atlas_docs   atlas_docs \
+  --watch /data/bamboo/rag/bamboo_docs  bamboo_docs \
+  --watch /data/bamboo/rag/rucio_docs   rucio_docs \
+  --watch /data/bamboo/rag/root_docs    root_docs \
+  --chroma-dir /data/bamboo/.chromadb \
+  --once
 ```
 
-This is the recommended mode when running after `bamboo-github-sync` in a
-pipeline or cron job — it processes whatever was downloaded and exits cleanly.
+Each `--watch` pair is processed sequentially.  A single embedder instance is
+shared across all pairs to avoid loading the model multiple times.
+
+Each pair gets its own checkpoint file, automatically named
+`.document_monitor/checkpoints_<dir_name>_<collection>.json`, so file state is
+tracked independently per directory.
+
+### Single directory (simple case)
+
+For a single directory, one `--watch` pair is sufficient:
+
+```bash
+bamboo-document-monitor \
+  --watch /abs/path/to/docs panda_docs \
+  --chroma-dir .chromadb \
+  --once
+```
 
 ### Long-running daemon
 
-Poll continuously, picking up new files as they arrive:
+Omit `--once` to poll continuously, picking up new files as they arrive:
 
 ```bash
-bamboo-document-monitor --dir ./documents --poll-interval 10 --chroma-dir .chromadb --collection atlas_docs
+bamboo-document-monitor \
+  --watch /data/bamboo/rag/panda_docs  panda_docs \
+  --watch /data/bamboo/rag/bamboo_docs bamboo_docs \
+  --chroma-dir .chromadb
 ```
 
-Stop with Ctrl-C or SIGTERM.
+Stop with Ctrl-C or SIGTERM.  In daemon mode, ticks are issued in round-robin
+order across all watch pairs.
 
 ### Via module
 
 ```bash
-python -m bamboo_mcp_services.agents.document_monitor_agent.cli --dir ./documents --collection atlas_docs --once
+python -m bamboo_mcp_services.agents.document_monitor_agent.cli \
+  --watch /abs/path/to/docs panda_docs --chroma-dir .chromadb --once
 ```
 
-> **First run on a new machine:** the agent loads the embedding model from local cache and avoids network calls on startup. This means the model must be downloaded at least once first. On a fresh machine, trigger the download by running with `HF_HUB_OFFLINE=0`:
+> **First run on a new machine:** the agent loads the embedding model from local
+> cache. On a fresh machine, trigger the download by running with
+> `HF_HUB_OFFLINE=0`:
 > ```bash
-> HF_HUB_OFFLINE=0 bamboo-document-monitor --dir ./documents --chroma-dir .chromadb --collection atlas_docs --once
+> HF_HUB_OFFLINE=0 bamboo-document-monitor \
+>   --watch /abs/path/to/docs panda_docs --chroma-dir .chromadb --once
 > ```
-> Subsequent runs will use the cached model automatically and do not need the flag.
 
-> **Always use absolute paths for `--dir` and `--chroma-dir`** to avoid the database being written to a different location depending on the working directory:
-> ```bash
-> bamboo-document-monitor \
->   --dir /abs/path/to/docs \
->   --chroma-dir /abs/path/to/.chromadb \
->   --collection atlas_docs \
->   --once
-> ```
+> **Always use absolute paths** for `--watch` directories and `--chroma-dir` to
+> avoid the database being written to a different location depending on the
+> working directory.
+
+### Legacy flags (deprecated)
+
+`--dir` and `--collection` still work as a backward-compatible single-pair
+shorthand and emit a `DeprecationWarning`:
+
+```bash
+# Deprecated — use --watch instead
+bamboo-document-monitor --dir ./documents --collection atlas_docs --once
+```
 
 ---
 
 ## Multiple corpora
 
-The `--collection` flag lets you ingest separate document sets into the same
-ChromaDB directory under different collection names, or into separate ChromaDB
-directories entirely.  Each corpus needs its own `--checkpoint-file` so that
-file state is tracked independently.
-
-Example — two separate corpora:
-
-```bash
-# PanDA documentation
-bamboo-document-monitor \
-  --dir /data/panda-RAG \
-  --chroma-dir /data/chromadb-panda \
-  --collection atlas_docs \
-  --checkpoint-file /data/.monitor/panda-checkpoints.json \
-  --once
-
-# CGSim documentation
-bamboo-document-monitor \
-  --dir /data/CGSim-RAG \
-  --chroma-dir /data/chromadb-cgsim \
-  --collection cgsim_docs \
-  --checkpoint-file /data/.monitor/cgsim-checkpoints.json \
-  --once
-```
+Each `--watch DIR COLLECTION` pair maps a normalised output directory to a
+logical ChromaDB collection.  Multiple repos can share the same collection
+(and therefore the same directory) — the document-monitor has no concept of
+per-repo boundaries, only per-directory ones.
 
 Verify collection names and chunk counts at any time:
 
 ```bash
 python -c "
 import chromadb
-client = chromadb.PersistentClient(path='/data/chromadb-cgsim')
+client = chromadb.PersistentClient(path='/data/bamboo/.chromadb')
 for col in client.list_collections():
     print(col.name, '  count:', col.count())
 "
 ```
 
-> **Note:** collections are now stored under slotted names (e.g. `cgsim_docs__a`
-> or `cgsim_docs__b`).  The active slot for each logical name is recorded in
+> **Note:** collections are stored under slotted names (e.g. `panda_docs__a`
+> or `panda_docs__b`).  The active slot for each logical name is recorded in
 > `<chroma-dir>/collection_routing.json`.  You will normally see exactly one
 > slotted collection per logical name; a second slot may briefly appear during
 > an active update cycle.
@@ -230,9 +247,8 @@ rm -rf .chromadb .document_monitor/checkpoints.json
 
 # 2. Re-run the agent — it will process all files from scratch into slot __a
 bamboo-document-monitor \
-  --dir /abs/path/to/docs \
+  --watch /abs/path/to/docs my_collection \
   --chroma-dir /abs/path/to/.chromadb \
-  --collection my_collection \
   --once
 ```
 

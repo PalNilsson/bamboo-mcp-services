@@ -11,6 +11,59 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+#### Multi-collection RAG ingestion — per-source ChromaDB collection routing
+
+The document-monitor-agent and github-doc-sync-agent now support routing
+documents from different source repositories into separate named ChromaDB
+collections, eliminating cross-corpus contamination in RAG search results.
+
+**Problem:** All repos previously shared a single `normalized_destination`
+directory and a single ChromaDB collection (e.g. `atlas_docs`).  BM25 and
+vector search over a mixed corpus caused Bamboo-internal documentation
+(CHANGELOGs, tool docs) to dominate results for PanDA queries.
+
+**Changes:**
+
+- `RepoConfig` (`github_markdown_sync.py`) gains an optional `collection`
+  field.  Each repo entry in `github-doc-sync-agent.yaml` can now declare
+  which logical ChromaDB collection its normalised output belongs to.
+
+- `github_doc_sync_agent/cli.py` — `_load_repo_configs()` reads and passes
+  through the new `collection` field.
+
+- `bamboo-document-monitor` CLI (`document_monitor_agent/cli.py`) replaces
+  the single `--dir`/`--collection` pair with a repeatable
+  `--watch DIR COLLECTION` argument.  Each pair runs one
+  `DocumentMonitorAgent` instance (sequentially) and receives its own
+  per-pair checkpoint file at
+  `.document_monitor/checkpoints_<dir_name>_<collection>.json`.
+  The legacy `--dir`/`--collection` flags are preserved as a deprecated
+  backward-compatible alias.
+
+- `github-doc-sync-agent.yaml` (bundled default and production config) is
+  updated with explicit `collection:` fields and per-collection
+  `normalized_destination` subdirectories:
+
+  | Collection | Repos |
+  |---|---|
+  | `panda_docs` | `PanDAWMS/pilot3`, `PanDAWMS/pilot3.wiki`, `PanDAWMS/panda-docs` |
+  | `atlas_docs` | `atlas/atlas-computing-docs` |
+  | `bamboo_docs` | `PalNilsson/bamboo-mcp`, `PalNilsson/bamboo-mcp-services` |
+  | `rucio_docs` | `rucio/documentation` |
+  | `root_docs` | `root-project/root` |
+
+- `supervisor-agent.yaml` updated: the `document-monitor` scheduled command
+  now passes five `--watch` pairs (one per collection) instead of a single
+  `--dir`.
+
+- New test class `TestRepoConfigCollection` in
+  `tests/agents/github_doc_sync_agent/test_github_doc_sync_agent.py`.
+
+- New test file
+  `tests/agents/document_monitor_agent/test_document_monitor_cli.py`
+  covering parser, `_resolve_watches`, `_checkpoint_path`, `_build_agents`,
+  and `main()` integration.
+
 #### Atomic storage updates — zero-downtime reads during every write cycle
 
 All three storage layers used by Bamboo MCP Services now guarantee that

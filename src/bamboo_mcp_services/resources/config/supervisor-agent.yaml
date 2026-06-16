@@ -87,19 +87,34 @@ agents:
       - github-doc-sync-agent.log
 
   # ── document-monitor-agent ──────────────────────────────────────────────────
-  # Monitors the normalised documentation directory for new or changed files
-  # and ingests them into ChromaDB for RAG queries.
-  # Adjust --dir to match the normalized_destination in github-doc-sync-agent.yaml.
-  # Run as a scheduled one-shot every 10 minutes so ChromaDB stays fresh after
-  # each github-sync run.
+  # Monitors per-collection normalised documentation directories for new or
+  # changed files and ingests them into the corresponding ChromaDB collections.
+  # Each --watch DIR COLLECTION pair maps one normalised output directory
+  # (written by github-sync) to the logical ChromaDB collection name.
+  # Directories must match the normalized_destination values in
+  # github-doc-sync-agent.yaml.  Run as a scheduled one-shot every 10 minutes
+  # so ChromaDB stays fresh after each github-sync run.
   - name: document-monitor
     enabled: true
     mode: scheduled
     interval_s: 600
     command:
       - bamboo-document-monitor
-      - --dir
-      - ./data/panda-docs/normalized
+      - --watch
+      - /data/bamboo/rag/panda_docs
+      - panda_docs
+      - --watch
+      - /data/bamboo/rag/atlas_docs
+      - atlas_docs
+      - --watch
+      - /data/bamboo/rag/bamboo_docs
+      - bamboo_docs
+      - --watch
+      - /data/bamboo/rag/rucio_docs
+      - rucio_docs
+      - --watch
+      - /data/bamboo/rag/root_docs
+      - root_docs
       - --chroma-dir
       - .chromadb
       - --once

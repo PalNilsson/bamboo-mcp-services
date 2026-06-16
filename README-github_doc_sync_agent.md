@@ -91,15 +91,18 @@ source links in Bamboo responses.
 
 ## Integration with `document-monitor-agent`
 
-The two agents form a pipeline:
+The two agents form a pipeline.  Each repo declares its target ChromaDB
+collection via the `collection:` key in the YAML config; the document-monitor
+is then invoked with one `--watch DIR COLLECTION` pair per collection:
 
 ```
-github-doc-sync-agent        document-monitor-agent
-─────────────────────        ──────────────────────
-polls repos                  watches ./data/*/normalized/
-downloads changed files  →   recurses into subdirectories
-writes to normalized/        chunks and embeds files  →  ChromaDB
-owner/repo/...               updates checkpoints
+github-doc-sync-agent                     document-monitor-agent
+─────────────────────                     ──────────────────────
+reads collection: panda_docs     →        --watch /rag/panda_docs  panda_docs
+writes to normalized_destination          --watch /rag/bamboo_docs bamboo_docs
+/rag/panda_docs/  (PanDA repos)           --watch /rag/rucio_docs  rucio_docs
+/rag/bamboo_docs/ (Bamboo repos)  →       chunks and embeds files
+/rag/rucio_docs/  (Rucio repo)    →       stores into named ChromaDB collections
 ```
 
 Neither agent needs to know about the other.  They can run as separate
@@ -110,7 +113,13 @@ Example cron pipeline (daily at 02:00):
 
 ```cron
 0 2 * * *  bamboo-github-sync --config /path/to/repos.yaml --once
-5 2 * * *  bamboo-document-monitor --dir /path/to/RAG --chroma-dir /path/to/.chromadb --collection atlas_docs --once
+5 2 * * *  bamboo-document-monitor \
+             --watch /data/bamboo/rag/panda_docs   panda_docs \
+             --watch /data/bamboo/rag/atlas_docs   atlas_docs \
+             --watch /data/bamboo/rag/bamboo_docs  bamboo_docs \
+             --watch /data/bamboo/rag/rucio_docs   rucio_docs \
+             --watch /data/bamboo/rag/root_docs    root_docs \
+             --chroma-dir /data/bamboo/.chromadb --once
 ```
 
 ---
@@ -270,6 +279,7 @@ repos:
 | `include_patterns` | — | Glob patterns (e.g. `*.md`, `docs/source/*.rst`). Only matching files are downloaded. If empty, all files are included. |
 | `exclude_patterns` | — | Glob patterns. Matching files are excluded even if they match an include pattern. |
 | `normalize_for_rag` | — | Prepend YAML frontmatter and convert RST to Markdown. Requires `normalized_destination` to be set. |
+| `collection` | — | Logical ChromaDB collection name that the normalised output of this repo should be ingested into (e.g. `panda_docs`, `bamboo_docs`). Consumed by `bamboo-document-monitor --watch`; not used by the sync agent itself. Omitting it means the document-monitor's default collection is used. |
 
 ---
 

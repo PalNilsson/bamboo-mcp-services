@@ -7,7 +7,9 @@ import logging
 import os
 import signal
 import sys
+import warnings
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, Optional
 
 from .agent import DocumentMonitorAgent
@@ -35,42 +37,131 @@ class _SuppressNameAtInfo(logging.Filter):
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser for the document monitor agent.
 
-    Defines all supported command-line flags with their types, defaults,
-    and help strings.
-
     Returns:
         argparse.ArgumentParser: Configured parser ready to call
             ``parse_args()`` on.
     """
     p = argparse.ArgumentParser(prog="bamboo-document-monitor")
-    p.add_argument("--dir", "-d", required=True, help="Directory to monitor (e.g. ./documents)")
+
+    # ── Multi-watch (current API) ─────────────────────────────────────────
+    p.add_argument(
+        "--watch",
+        nargs=2,
+        metavar=("DIR", "COLLECTION"),
+        action="append",
+        dest="watches",
+        default=None,
+        help=(
+            "Directory to monitor and the ChromaDB collection to ingest into. "
+            "Repeat to watch multiple directories, e.g.: "
+            "--watch ./data/panda_docs panda_docs "
+            "--watch ./data/bamboo_docs bamboo_docs"
+        ),
+    )
+
+    # ── Legacy single-dir flags (deprecated, kept for backward compat) ────
+    p.add_argument(
+        "--dir", "-d",
+        dest="legacy_dir",
+        default=None,
+        help=(
+            "DEPRECATED: use --watch DIR COLLECTION instead. "
+            "Directory to monitor (e.g. ./documents)."
+        ),
+    )
+    p.add_argument(
+        "--collection",
+        dest="legacy_collection",
+        default="atlas_docs",
+        help=(
+            "DEPRECATED: use --watch DIR COLLECTION instead. "
+            "ChromaDB collection name (default: atlas_docs)."
+        ),
+    )
+
+    # ── Shared flags ──────────────────────────────────────────────────────
     p.add_argument("--poll-interval", type=int, default=10, help="Poll interval seconds")
     p.add_argument("--chroma-dir", default=".chromadb", help="ChromaDB persist directory")
     p.add_argument(
-        "--collection",
-        default="atlas_docs",
-        help="ChromaDB collection name (default: atlas_docs).",
-    )
-    p.add_argument(
-        "--checkpoint-file",
-        default=".document_monitor/checkpoints.json",
-        help="Checkpoint file path",
+        "--checkpoint-dir",
+        default=".document_monitor",
+        help="Directory for per-watch checkpoint files (default: .document_monitor).",
     )
     p.add_argument("--chunk-size", type=int, default=3000, help="Chunk size in characters")
     p.add_argument("--chunk-overlap", type=int, default=300, help="Chunk overlap in characters")
     p.add_argument(
         "--once",
         action="store_true",
-        help="Run a single poll cycle then exit (useful for cron / one-shot invocations).",
+        help="Run a single poll cycle per watch pair then exit.",
     )
     return p
 
 
+def _resolve_watches(args: argparse.Namespace) -> list[tuple[str, str]]:
+    """Return a list of (directory, collection) pairs from parsed arguments.
+
+    Merges ``--watch`` pairs and the legacy ``--dir``/``--collection`` flags.
+    Emits a deprecation warning when the legacy flags are used.
+
+    Args:
+        args: Parsed argument namespace from :func:`build_parser`.
+
+    Returns:
+        Non-empty list of ``(dir_path, collection_name)`` tuples.
+
+    Raises:
+        SystemExit: If no watch pair can be resolved.
+    """
+    watches: list[tuple[str, str]] = []
+
+    if args.watches:
+        watches.extend((d, c) for d, c in args.watches)
+
+    if args.legacy_dir is not None:
+        warnings.warn(
+            "--dir/--collection are deprecated; use --watch DIR COLLECTION instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        watches.append((args.legacy_dir, args.legacy_collection))
+
+    if not watches:
+        logger.error(
+            "No directories to watch. "
+            "Specify at least one --watch DIR COLLECTION pair."
+        )
+        sys.exit(1)
+
+    return watches
+
+
+def _checkpoint_path(checkpoint_dir: str, directory: str, collection: str) -> str:
+    """Derive a per-watch-pair checkpoint filename.
+
+    Uses the last component of *directory* combined with *collection* to
+    produce a deterministic, human-readable filename that is unique for each
+    (directory, collection) pair even when two pairs share the same collection
+    name.
+
+    Example::
+
+        _checkpoint_path(".document_monitor", "/data/bamboo/rag/panda_docs", "panda_docs")
+        # → ".document_monitor/checkpoints_panda_docs_panda_docs.json"
+
+    Args:
+        checkpoint_dir: Root directory for checkpoint files.
+        directory: Watched filesystem path.
+        collection: Logical ChromaDB collection name.
+
+    Returns:
+        Absolute-or-relative path string for the checkpoint JSON file.
+    """
+    dir_tag = Path(directory).name.replace(" ", "_")
+    return str(Path(checkpoint_dir) / f"checkpoints_{dir_tag}_{collection}.json")
+
+
 def _build_embedder() -> LangchainHuggingFaceAdapter:
     """Instantiate the HuggingFace sentence-embedding model.
-
-    Uses the ``all-MiniLM-L6-v2`` model, a compact but accurate
-    general-purpose sentence transformer.
 
     Returns:
         LangchainHuggingFaceAdapter: Ready-to-use embedding adapter.
@@ -78,52 +169,46 @@ def _build_embedder() -> LangchainHuggingFaceAdapter:
     return LangchainHuggingFaceAdapter(model_name="all-MiniLM-L6-v2")
 
 
-def _build_agent(args: argparse.Namespace) -> DocumentMonitorAgent:
-    """Construct a :class:`DocumentMonitorAgent` from parsed CLI arguments.
+def _build_agents(args: argparse.Namespace) -> list[DocumentMonitorAgent]:
+    """Construct one :class:`DocumentMonitorAgent` per watch pair.
+
+    The embedder instance is shared across all agents to avoid loading the
+    sentence-transformer model multiple times.
 
     Args:
         args: Namespace produced by :func:`build_parser` after calling
-            ``parse_args()``.  The following attributes are consumed:
-
-            * ``dir`` – directory path to monitor.
-            * ``poll_interval`` – polling cadence in seconds.
-            * ``chunk_size`` – document chunk size in characters.
-            * ``chunk_overlap`` – overlap between consecutive chunks in
-              characters.
-            * ``checkpoint_file`` – path to the JSON checkpoint file.
-            * ``chroma_dir`` – directory used to persist ChromaDB data.
-            * ``collection`` – ChromaDB collection name.
+            ``parse_args()``.
 
     Returns:
-        DocumentMonitorAgent: Fully configured agent instance, not yet
-            started.
+        List of fully configured :class:`DocumentMonitorAgent` instances,
+        one per ``(directory, collection)`` watch pair.
     """
-    return DocumentMonitorAgent(
-        name=args.collection,
-        directory=args.dir,
-        poll_interval_sec=args.poll_interval,
-        chunk_size=args.chunk_size,
-        chunk_overlap=args.chunk_overlap,
-        checkpoint_file=args.checkpoint_file,
-        chroma_dir=args.chroma_dir,
-        embedder=_build_embedder(),
-    )
+    watches = _resolve_watches(args)
+    embedder = _build_embedder()
+    agents = []
+    for directory, collection in watches:
+        cp_file = _checkpoint_path(args.checkpoint_dir, directory, collection)
+        agent = DocumentMonitorAgent(
+            name=collection,
+            directory=directory,
+            poll_interval_sec=args.poll_interval,
+            chunk_size=args.chunk_size,
+            chunk_overlap=args.chunk_overlap,
+            checkpoint_file=cp_file,
+            chroma_dir=args.chroma_dir,
+            embedder=embedder,
+        )
+        agents.append(agent)
+    return agents
 
 
 def _make_signal_handler(
-    agent: DocumentMonitorAgent,
+    agents: list[DocumentMonitorAgent],
 ) -> Callable[[int, Any], None]:
-    """Create a POSIX signal handler that gracefully stops *agent*.
-
-    The returned callable is suitable for use with :func:`signal.signal`.
-    It attempts ``agent.request_stop()`` first, falls back to
-    ``agent.stop()``, and logs a warning if neither method exists.
-    All exceptions raised during shutdown are caught and logged so the
-    signal handler itself never raises.
+    """Create a POSIX signal handler that gracefully stops all *agents*.
 
     Args:
-        agent: The running agent instance to shut down when a signal is
-            received.
+        agents: Running agent instances to shut down when a signal is received.
 
     Returns:
         Callable[[int, Any], None]: A signal handler with the standard
@@ -132,113 +217,85 @@ def _make_signal_handler(
 
     def _handler(_signum: int, _frame: Any) -> None:
         logger.info("Signal received; attempting graceful shutdown.")
-        try:
-            if hasattr(agent, "stop"):
-                agent.stop()
-            else:
-                logger.warning("Agent has no stop method; nothing to call.")
-        except Exception:
-            logger.exception("Error while requesting agent to stop.")
+        for agent in agents:
+            try:
+                if hasattr(agent, "stop"):
+                    agent.stop()
+                else:
+                    logger.warning("Agent %s has no stop method.", agent.name)
+            except Exception:
+                logger.exception("Error while stopping agent %s.", agent.name)
 
     return _handler
 
 
 def _agent_is_running(obj: Any) -> bool:
-    """Return ``True`` if *obj* appears to be in a ``RUNNING`` state.
-
-    The check is intentionally defensive and supports several common
-    state representations used across different agent implementations:
-
-    * **Enum-like**: ``obj.state`` has a ``.name`` attribute (e.g.
-      ``AgentState.RUNNING``).  The name is compared case-insensitively
-      to ``"RUNNING"``.
-    * **Constant attribute**: ``obj`` exposes a ``RUNNING`` class
-      attribute and ``obj.state == obj.RUNNING``.
-    * **String fallback**: ``str(obj.state).upper()`` equals or ends
-      with ``"RUNNING"``.
-
-    Args:
-        obj: Any object that may expose a ``state`` attribute describing
-            its current lifecycle phase.
-
-    Returns:
-        bool: ``True`` when the agent is running, ``False`` when the
-            state is absent, unrecognised, or indicates a non-running
-            phase.
-    """
+    """Return ``True`` if *obj* appears to be in a ``RUNNING`` state."""
     state = getattr(obj, "state", None)
     if state is None:
         return False
-
-    # Case 1: state is an Enum-like with .name
     name = getattr(state, "name", None)
     if isinstance(name, str):
         return name.upper() == "RUNNING"
-
-    # Case 2: instance has a RUNNING attribute constant and state equals it
     if hasattr(obj, "RUNNING"):
         try:
             if state == getattr(obj, "RUNNING"):
                 return True
         except Exception:
             pass
-
-    # Case 3: fallback to string comparison of state
     try:
         return str(state).upper().endswith("RUNNING") or str(state).upper() == "RUNNING"
     except Exception:
         return False
 
 
-def _run_agent(agent: DocumentMonitorAgent, once: bool = False) -> None:
-    """Start *agent* and block until it stops or is interrupted.
+def _run_agents(agents: list[DocumentMonitorAgent], once: bool = False) -> None:
+    """Start all agents and run ticks sequentially until stopped.
 
-    Calls ``agent.start()``, then either runs a single tick (``once=True``)
-    or repeatedly invokes ``agent.tick()`` for as long as
-    :func:`_agent_is_running` returns ``True``.
+    In ``--once`` mode every agent executes a single tick in order, then all
+    are stopped.  In daemon mode the loop iterates over agents in round-robin
+    order for as long as every agent is running.
 
-    Shutdown is triggered by one of the following:
-
-    * ``once=True`` — a single tick is executed and the agent is stopped.
-    * The agent transitions out of the running state on its own.
-    * A ``KeyboardInterrupt`` (``SIGINT``) is received, which causes
-      ``agent.request_stop()`` to be called before the loop exits.
-    * An OS signal handled by :func:`_make_signal_handler` sets the
-      agent's internal stop flag, causing :func:`_agent_is_running` to
-      return ``False`` on the next iteration.
-
-    ``agent.stop()`` is always called in the ``finally`` block to ensure
-    resources are released regardless of how the loop exits.
+    Agents are run sequentially (not in threads) to keep the implementation
+    simple and to avoid locking complexity between agents that share the same
+    ``--chroma-dir``.
 
     Args:
-        agent: A started (or about-to-be-started) agent instance that
-            exposes ``start()``, ``tick()``, ``request_stop()``, and
-            ``stop()`` methods.
-        once: If ``True``, run a single tick then return.
+        agents: Fully configured agent instances.
+        once: If ``True``, run exactly one tick per agent then return.
     """
-    agent.start()
+    for agent in agents:
+        agent.start()
     try:
         if once:
-            logger.info("--once flag set: running a single poll cycle then exiting.")
-            agent.tick()
+            logger.info(
+                "--once flag set: running a single poll cycle per watch pair then exiting."
+            )
+            for agent in agents:
+                agent.tick()
             return
-        while _agent_is_running(agent):
-            agent.tick()
+        while all(_agent_is_running(a) for a in agents):
+            for agent in agents:
+                if _agent_is_running(agent):
+                    agent.tick()
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt received; shutting down.")
-        agent.stop()
+        for agent in agents:
+            try:
+                agent.stop()
+            except Exception:
+                pass
         return
     finally:
-        agent.stop()
+        for agent in agents:
+            try:
+                agent.stop()
+            except Exception:
+                pass
 
 
 def main(argv: Optional[list[str]] = None) -> None:
     """Run the document monitor agent from the command line.
-
-    This is the top-level entry point wired up in ``pyproject.toml``.
-    It parses arguments, configures logging, builds the agent, registers
-    a ``SIGTERM`` handler for graceful shutdown, and hands off to
-    :func:`_run_agent`.
 
     Args:
         argv: Argument list to parse.  When ``None`` (the default),
@@ -256,21 +313,17 @@ def main(argv: Optional[list[str]] = None) -> None:
         _h.addFilter(_filter)
     log_startup_banner(logger, "bamboo-document-monitor")
 
-    # Suppress verbose third-party loggers — model is loaded from local cache
     for _noisy in ("httpx", "httpcore", "huggingface_hub", "sentence_transformers"):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
 
-    # Align sentence_transformers cache with the HuggingFace hub cache so that
-    # models downloaded via HF hub are found when running in offline mode.
-    # Only set if not already overridden in the environment.
     _hf_hub_cache = os.path.expanduser("~/.cache/huggingface/hub")
     os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", _hf_hub_cache)
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
-    agent = _build_agent(args)
-    signal.signal(signal.SIGTERM, _make_signal_handler(agent))
-    _run_agent(agent, once=args.once)
+    agents = _build_agents(args)
+    signal.signal(signal.SIGTERM, _make_signal_handler(agents))
+    _run_agents(agents, once=args.once)
 
 
 if __name__ == "__main__":

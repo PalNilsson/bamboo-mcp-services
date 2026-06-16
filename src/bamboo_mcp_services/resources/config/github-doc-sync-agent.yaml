@@ -11,24 +11,129 @@ tick_interval_s: 60.0
 # List of GitHub repositories to monitor.
 # Each entry must have at minimum 'name' and 'destination'.
 #
-# 'name' is the GitHub owner/repo identifier — the part of the URL after
-# github.com/.  For example, https://github.com/PanDAWMS/panda-docs becomes
-# name: PanDAWMS/panda-docs
+# 'name' is the GitHub owner/repo identifier.
+# 'collection' declares the logical ChromaDB collection that normalized output
+# from this repo should be ingested into.  The document-monitor-agent uses
+# this field (via --watch) to route each watched directory to the right
+# collection.
 #
-# Example:
-#
-# repos:
-#   - name: PanDAWMS/panda-docs
-#     destination: ./data/panda-docs/raw
-#     normalized_destination: ./data/panda-docs/normalized
-#     within_hours: 168
-#     branch: main
-#     include_patterns:
-#       - "*.md"
-#       - "*.rst"
-#     normalize_for_rag: true
+# Collection layout:
+#   panda_docs   — PanDA/pilot3 core documentation
+#   atlas_docs   — ATLAS computing infrastructure docs
+#   bamboo_docs  — Bamboo MCP and Bamboo MCP Services internal docs
+#   rucio_docs   — Rucio data management documentation
+#   root_docs    — ROOT data analysis framework documentation
 #
 # Set GITHUB_TOKEN in the environment to access private repositories or to
 # raise the GitHub API rate limit from 60 to 5000 requests/hour.
 
 repos:
+  # ── panda_docs ────────────────────────────────────────────────────────────
+  - name: PanDAWMS/pilot3
+    collection: panda_docs
+    destination: /data/bamboo/tmp
+    normalized_destination: /data/bamboo/rag/panda_docs
+    within_hours: 10
+    branch: master
+    include_patterns:
+      - "*.md"
+      - "*.rst"
+    exclude_patterns:
+      - "doc/*"
+    normalize_for_rag: true
+
+  - name: PanDAWMS/pilot3.wiki
+    collection: panda_docs
+    wiki: true
+    destination: /data/bamboo/tmp
+    normalized_destination: /data/bamboo/rag/panda_docs
+    within_hours: 10
+    branch: master
+    include_patterns:
+      - "*.md"
+      - "*.rst"
+    exclude_patterns:
+      - "doc/*"
+    normalize_for_rag: true
+
+  - name: PanDAWMS/panda-docs
+    collection: panda_docs
+    destination: /data/bamboo/tmp
+    normalized_destination: /data/bamboo/rag/panda_docs
+    within_hours: 10
+    branch: main
+    include_patterns:
+      - "*.md"
+      - "*.rst"
+    exclude_patterns:
+      - "doc/*"
+    normalize_for_rag: true
+
+  # ── atlas_docs ────────────────────────────────────────────────────────────
+  - name: atlas/atlas-computing-docs
+    collection: atlas_docs
+    destination: /data/bamboo/tmp
+    normalized_destination: /data/bamboo/rag/atlas_docs
+    clone_url: https://gitlab.cern.ch/atlas/computing-docs/atlas-computing-docs.git
+    git: true
+    branch: master
+    include_patterns:
+      - "*.md"
+      - "*.rst"
+    normalize_for_rag: true
+    within_hours: 168
+
+  # ── bamboo_docs ───────────────────────────────────────────────────────────
+  - name: PalNilsson/bamboo-mcp
+    collection: bamboo_docs
+    destination: /data/bamboo/tmp
+    normalized_destination: /data/bamboo/rag/bamboo_docs
+    within_hours: 10
+    branch: master
+    include_patterns:
+      - "*.md"
+      - "*.rst"
+    exclude_patterns:
+      - "doc/*"
+    normalize_for_rag: true
+
+  - name: PalNilsson/bamboo-mcp-services
+    collection: bamboo_docs
+    destination: /data/bamboo/tmp
+    normalized_destination: /data/bamboo/rag/bamboo_docs
+    within_hours: 10
+    branch: master
+    include_patterns:
+      - "*.md"
+      - "*.rst"
+    exclude_patterns:
+      - "doc/*"
+    normalize_for_rag: true
+
+  # ── rucio_docs ────────────────────────────────────────────────────────────
+  - name: rucio/documentation
+    collection: rucio_docs
+    destination: /data/bamboo/tmp
+    normalized_destination: /data/bamboo/rag/rucio_docs
+    within_hours: 10
+    branch: main
+    include_patterns:
+      - "*.md"
+      - "*.rst"
+    exclude_patterns:
+      - "doc/*"
+    normalize_for_rag: true
+
+  # ── root_docs ─────────────────────────────────────────────────────────────
+  - name: root-project/root
+    collection: root_docs
+    destination: /data/bamboo/tmp
+    normalized_destination: /data/bamboo/rag/root_docs
+    clone_url: https://github.com/root-project/root.git
+    git: true
+    branch: master
+    include_patterns:
+      - "*.md"
+      - "*.rst"
+    normalize_for_rag: true
+    within_hours: 168

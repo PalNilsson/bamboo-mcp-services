@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file gives Claude (and any other AI assistant) the context needed to work
+This file gives Codex (and any other AI assistant) the context needed to work
 effectively in this repository.
 
 ---
@@ -174,7 +174,7 @@ def my_function(x: int, y: str) -> bool:
 
 ```
 bamboo-mcp-services/
-├─ CLAUDE.md
+├─ AGENTS.md
 ├─ CHANGELOG.md                        ← release notes (Keep a Changelog format)
 ├─ README.md
 ├─ README-supervisor-agent.md
