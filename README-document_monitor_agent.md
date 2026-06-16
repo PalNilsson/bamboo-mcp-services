@@ -220,6 +220,18 @@ python -m bamboo_mcp_services.agents.document_monitor_agent.cli \
 >   --watch /abs/path/to/docs panda_docs --chroma-dir .chromadb --once
 > ```
 
+> **Air-gapped machines (no outbound internet):** use `--model-path` to point
+> directly at the cached model directory.  This prevents the agent from falling
+> back to a `DummyEmbedder` that silently writes zero-vector embeddings:
+> ```bash
+> bamboo-document-monitor \
+>   --watch /abs/path/to/docs panda_docs \
+>   --model-path /data/models/sentence-transformers/all-MiniLM-L6-v2 \
+>   --chroma-dir .chromadb --once
+> ```
+> If the model cannot be loaded from the given path the agent exits immediately
+> with a clear error instead of corrupting ChromaDB.
+
 > **Always use absolute paths** for `--watch` directories and `--chroma-dir` to
 > avoid the database being written to a different location depending on the
 > working directory.
@@ -314,7 +326,19 @@ all vectors are zero.  Similarity search will return garbage results.  Any
 ChromaDB data ingested while `DummyEmbedder` was active must be deleted and
 re-ingested after fixing the embedding stack.
 
-Verify the embedding stack is working before ingesting:
+**On air-gapped machines** (no outbound internet, such as `aipanda033`): use
+`--model-path` to point at the locally cached model directory.  When
+`--model-path` is set, any load failure causes the agent to exit immediately
+with a clear error rather than falling back to `DummyEmbedder`:
+
+```bash
+bamboo-document-monitor \
+  --watch /data/bamboo/rag/panda_docs panda_docs \
+  --model-path /data/models/sentence-transformers/all-MiniLM-L6-v2 \
+  --chroma-dir .chromadb --once
+```
+
+**Verifying the embedding stack before ingesting:**
 
 ```bash
 python -c "
@@ -377,6 +401,7 @@ conda activate bamboo-mcp-services
 | `--checkpoint-file` | `.document_monitor/checkpoints.json` | JSON checkpoint path. Use a distinct path per corpus when running multiple instances. |
 | `--chunk-size` | `3000` | Characters per chunk |
 | `--chunk-overlap` | `300` | Overlap between chunks |
+| `--model-path` | *(none)* | Absolute path to a local `sentence-transformers` model directory. When set, a load failure is fatal (no `DummyEmbedder` fallback). Required on air-gapped machines. |
 | `--once` | off | Run a single poll cycle then exit |
 
 ---

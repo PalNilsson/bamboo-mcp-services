@@ -820,6 +820,7 @@ def load_config(path: Path) -> Tuple[List[RepoConfig], Dict[str, Any]]:
             wiki=entry.get("wiki", False),
             git=entry.get("git", False),
             clone_url=entry.get("clone_url"),
+            collection=entry.get("collection"),
         )
         for entry in raw.get("repos", [])
     ]

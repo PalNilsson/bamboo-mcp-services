@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .agent import DocumentMonitorAgent
-from .embedder_langchain_hf import LangchainHuggingFaceAdapter
+from .embedder_langchain_hf import DummyEmbedder, LangchainHuggingFaceAdapter
 from bamboo_mcp_services.common.cli import log_startup_banner
 
 logger = logging.getLogger(__name__)
@@ -90,6 +90,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--chunk-size", type=int, default=3000, help="Chunk size in characters")
     p.add_argument("--chunk-overlap", type=int, default=300, help="Chunk overlap in characters")
     p.add_argument(
+        "--model-path",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Absolute path to the local sentence-transformers model directory "
+            "(e.g. /data/models/all-MiniLM-L6-v2).  "
+            "When set, the embedder loads the model from this path and treats "
+            "any load failure as fatal — the agent will exit rather than "
+            "silently falling back to a DummyEmbedder.  "
+            "When omitted, the default model name ('all-MiniLM-L6-v2') is "
+            "resolved via the HuggingFace cache; if that also fails the "
+            "DummyEmbedder fallback is used (development / CI only)."
+        ),
+    )
+    p.add_argument(
         "--once",
         action="store_true",
         help="Run a single poll cycle per watch pair then exit.",
@@ -160,13 +175,38 @@ def _checkpoint_path(checkpoint_dir: str, directory: str, collection: str) -> st
     return str(Path(checkpoint_dir) / f"checkpoints_{dir_tag}_{collection}.json")
 
 
-def _build_embedder() -> LangchainHuggingFaceAdapter:
+def _build_embedder(model_path: str | None = None) -> LangchainHuggingFaceAdapter:
     """Instantiate the HuggingFace sentence-embedding model.
+
+    When *model_path* is provided the adapter is told to load from that exact
+    local directory.  Any failure is re-raised as a :class:`RuntimeError` so
+    the process exits loudly rather than silently continuing with a
+    :class:`DummyEmbedder` that writes zero-vector garbage into ChromaDB.
+
+    When *model_path* is ``None`` the adapter falls back to the default
+    model-name lookup (HuggingFace cache / network), which may degrade to
+    :class:`DummyEmbedder` in offline environments — acceptable for
+    development and CI only.
+
+    Args:
+        model_path: Absolute path to a locally cached sentence-transformers
+            model directory, or ``None`` to use the default name lookup.
 
     Returns:
         LangchainHuggingFaceAdapter: Ready-to-use embedding adapter.
+
+    Raises:
+        RuntimeError: If *model_path* is given but the model cannot be loaded.
     """
-    return LangchainHuggingFaceAdapter(model_name="all-MiniLM-L6-v2")
+    name = model_path if model_path is not None else "all-MiniLM-L6-v2"
+    adapter = LangchainHuggingFaceAdapter(model_name=name)
+    if model_path is not None and isinstance(adapter._embedder, DummyEmbedder):
+        raise RuntimeError(
+            f"--model-path '{model_path}' was specified but the model could not "
+            "be loaded — refusing to start with DummyEmbedder.  "
+            "Verify the path points to a valid sentence-transformers model directory."
+        )
+    return adapter
 
 
 def _build_agents(args: argparse.Namespace) -> list[DocumentMonitorAgent]:
@@ -182,9 +222,13 @@ def _build_agents(args: argparse.Namespace) -> list[DocumentMonitorAgent]:
     Returns:
         List of fully configured :class:`DocumentMonitorAgent` instances,
         one per ``(directory, collection)`` watch pair.
+
+    Raises:
+        RuntimeError: If ``--model-path`` is specified but the model fails to
+            load (propagated from :func:`_build_embedder`).
     """
     watches = _resolve_watches(args)
-    embedder = _build_embedder()
+    embedder = _build_embedder(model_path=getattr(args, "model_path", None))
     agents = []
     for directory, collection in watches:
         cp_file = _checkpoint_path(args.checkpoint_dir, directory, collection)

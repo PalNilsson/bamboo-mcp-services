@@ -451,6 +451,13 @@ Key modules:
 project (MIT licence).  It is included directly in the package so that
 `bamboo-mcp-services` has no dependency on an unpublished package.
 
+> **Dual-path gotcha**: `RepoConfig` is constructed in two separate places —
+> `load_config()` in `github_markdown_sync.py` and `_load_repo_configs()` in
+> `cli.py`.  Both must be kept in sync whenever a new field is added to
+> `RepoConfig`.  Adding a field to only one path silently drops it for callers
+> of the other.  After any `RepoConfig` change, grep for both function names
+> and update both.
+
 ---
 
 ## CI and testing

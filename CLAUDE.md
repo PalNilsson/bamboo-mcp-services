@@ -297,6 +297,18 @@ but never abort the remaining repos.
 
 **Force re-download**: Delete `destination/owner/repo_name/.sync_state.json`.
 
+**CLI dual-path gotcha — `load_config()` vs `_load_repo_configs()`**: There
+are two independent code paths that parse YAML into `RepoConfig` lists:
+
+- `github_markdown_sync.load_config()` — lower-level library function.
+- `github_doc_sync_agent/cli.py:_load_repo_configs()` — used by the CLI
+  entry-point.
+
+Both must be kept in sync whenever `RepoConfig` gains a new field.  A field
+present in `_load_repo_configs()` but absent from `load_config()` will be
+silently dropped for callers of the library function.  After any `RepoConfig`
+change, search for both functions and update both.
+
 ---
 
 ## document_monitor_agent — key design decisions
@@ -324,8 +336,25 @@ in cron pipelines after `bamboo-github-sync --once`.
 **Always use absolute paths** for `--chroma-dir` to avoid the database being
 written to different locations depending on the working directory.
 
-**First run on a new machine** requires `HF_HUB_OFFLINE=0` to download the
-embedding model.  Subsequent runs use the cached model automatically.
+**`--model-path PATH` — air-gapped machines**: On machines without outbound
+internet (e.g. `aipanda033`) the `all-MiniLM-L6-v2` model cannot be
+downloaded from HuggingFace Hub.  Pass `--model-path` to point at the local
+model directory.  When set, any load failure is **fatal** — the process exits
+rather than silently falling back to `DummyEmbedder` and writing zero-vector
+embeddings into ChromaDB.  Without `--model-path`, the `DummyEmbedder`
+fallback is still silent (dev/CI compat).  The `supervisor-agent.yaml`
+`document-monitor` command includes `--model-path`; update it to the correct
+local path on each host.
+
+**`DummyEmbedder` is a data corruption risk**: If the agent ever runs without a
+valid model and falls back to `DummyEmbedder`, all ChromaDB data ingested in
+that session must be deleted and re-ingested.  Zero-vector embeddings are
+indistinguishable from real ones in storage — there is no automated way to
+detect them after the fact.  Always verify with `dims: 384` before ingesting.
+
+**First run on a new machine** requires either `HF_HUB_OFFLINE=0` (to download
+the model) or `--model-path` (to load from local cache).  Subsequent runs with
+`--model-path` are self-contained.
 
 **Routing sidecar write order — critical invariant**: `CollectionRouter.live_name()`
 never writes the sidecar.  The sidecar (`collection_routing.json`) is *only*

@@ -11,6 +11,93 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Fixed
 
+#### `load_config()` missing `collection` field — github-doc-sync-agent
+
+**Root cause:** `load_config()` in `github_markdown_sync.py` and
+`_load_repo_configs()` in `cli.py` are two independent code paths that both
+construct `RepoConfig` from YAML.  `_load_repo_configs()` (used by the CLI
+entry-point) correctly read and forwarded the `collection` field, but
+`load_config()` (the lower-level library function) did not — silently dropping
+`collection` for any caller that used it directly.  This is an instance of the
+documented CLI dual-path gotcha.
+
+**Changes:**
+
+- `github_markdown_sync.py` — `load_config()`: added
+  `collection=entry.get("collection")` to the `RepoConfig` constructor call.
+  Both YAML parsing paths now produce identical `RepoConfig` values for all
+  fields.
+
+**Test changes** (`tests/agents/github_doc_sync_agent/test_github_doc_sync_agent.py`):
+
+- New test class `TestLoadConfigCollectionParity` (5 tests):
+  - `test_load_config_propagates_collection`
+  - `test_load_config_collection_none_when_absent`
+  - `test_load_config_multiple_collections`
+  - `test_load_config_and_cli_load_repo_configs_agree` — cross-checks that
+    `load_config()` and `_load_repo_configs()` produce identical `collection`
+    values for the same YAML input.
+  - `test_load_config_collection_mixed_present_and_absent`
+
+#### Silent `DummyEmbedder` fallback — document-monitor-agent
+
+**Root cause:** When the `all-MiniLM-L6-v2` sentence-transformers model is not
+in the HuggingFace cache (e.g. on a machine with no outbound internet such as
+`aipanda033`), `LangchainHuggingFaceAdapter` silently fell back to a
+`DummyEmbedder` that returns zero-vectors.  The agent continued running,
+writing zero-vector embeddings into every ChromaDB collection.  Vector
+similarity search became completely non-functional with no error logged.
+
+There was no way to supply an explicit local model path — the model name
+`"all-MiniLM-L6-v2"` was hardcoded, relying entirely on the HF cache lookup.
+
+**Changes:**
+
+- `document_monitor_agent/cli.py` — `build_parser()`: new `--model-path PATH`
+  argument.  Accepts the absolute path to a locally cached
+  `sentence-transformers` model directory.
+
+- `document_monitor_agent/cli.py` — `_build_embedder(model_path=None)`:
+  - When `model_path` is provided the adapter is constructed with that path as
+    `model_name`.
+  - After construction, if the adapter's `_embedder` is a `DummyEmbedder`
+    instance **and** `model_path` was given, a `RuntimeError` is raised
+    immediately — the process exits rather than ingesting corrupt embeddings.
+  - When `model_path=None` (default) the `DummyEmbedder` fallback is still
+    silent for backward compatibility with dev and CI environments.
+
+- `document_monitor_agent/cli.py` — `_build_agents()`: passes
+  `args.model_path` through to `_build_embedder()`.
+
+- `supervisor-agent.yaml` — `document-monitor` command: two lines added:
+  ```yaml
+  - --model-path
+  - /data/models/sentence-transformers/all-MiniLM-L6-v2
+  ```
+  Update the path to the actual location of the cached model on the host.
+  A wrong path now causes the agent to exit at startup with a clear error
+  message rather than silently degrading.
+
+**Test changes** (`tests/agents/document_monitor_agent/test_document_monitor_cli.py`):
+
+- New test class `TestModelPathFlag` (9 tests):
+  - `test_model_path_default_is_none`
+  - `test_model_path_is_accepted`
+  - `test_build_embedder_no_path_uses_default_name`
+  - `test_build_embedder_with_path_forwards_path`
+  - `test_build_embedder_raises_when_path_given_and_dummy_loaded`
+  - `test_build_embedder_does_not_raise_when_no_path_and_dummy`
+  - `test_build_embedder_does_not_raise_when_real_embedder_loaded`
+  - `test_build_agents_passes_model_path_to_embedder`
+  - `test_main_exits_when_model_path_invalid`
+
+**Operator note:** On `aipanda033`, copy or symlink the cached model to a
+stable path (e.g. `/data/models/sentence-transformers/all-MiniLM-L6-v2`),
+update `supervisor-agent.yaml` with that path, then **delete all ChromaDB
+collections and re-run the document monitor** to replace the zero-vector
+embeddings with real ones.  See README-document_monitor_agent.md for the
+re-ingestion procedure.
+
 #### `collection_routing.json` sidecar correctness — document monitor agent
 
 **Root cause:** `CollectionRouter.live_name()` called `_save()` on first

@@ -94,6 +94,11 @@ agents:
   # Directories must match the normalized_destination values in
   # github-doc-sync-agent.yaml.  Run as a scheduled one-shot every 10 minutes
   # so ChromaDB stays fresh after each github-sync run.
+  #
+  # --model-path must point to the locally cached all-MiniLM-L6-v2 model.
+  # When this flag is set, a load failure causes the agent to exit immediately
+  # rather than silently using a DummyEmbedder and corrupting ChromaDB with
+  # zero-vector embeddings.  Update the path to match your local model cache.
   - name: document-monitor
     enabled: true
     mode: scheduled
@@ -115,6 +120,8 @@ agents:
       - --watch
       - /data/bamboo/rag/root_docs
       - root_docs
+      - --model-path
+      - /data/models/sentence-transformers/all-MiniLM-L6-v2
       - --chroma-dir
       - .chromadb
       - --once

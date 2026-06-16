@@ -999,3 +999,158 @@ class TestRepoConfigCollection:
         r1 = RepoConfig(name="PanDAWMS/pilot3", destination="/tmp/a", collection="panda_docs")
         r2 = RepoConfig(name="PanDAWMS/panda-docs", destination="/tmp/b", collection="panda_docs")
         assert r1.collection == r2.collection == "panda_docs"
+
+
+# ===========================================================================
+# load_config (github_markdown_sync) — collection field parity with cli.py
+# ===========================================================================
+
+class TestLoadConfigCollectionParity:
+    """load_config() in github_markdown_sync must read the collection field.
+
+    This is the CLI dual-path gotcha: _load_repo_configs() in cli.py and
+    load_config() in github_markdown_sync.py are separate code paths that
+    both construct RepoConfig from YAML.  Both must propagate collection.
+    """
+
+    def test_load_config_propagates_collection(self, tmp_path):
+        """load_config must pass collection through to RepoConfig."""
+        import yaml
+        from bamboo_mcp_services.agents.github_doc_sync_agent.github_markdown_sync import (
+            load_config,
+        )
+
+        cfg = {
+            "repos": [
+                {
+                    "name": "PanDAWMS/pilot3",
+                    "destination": str(tmp_path / "tmp"),
+                    "normalized_destination": str(tmp_path / "rag/panda_docs"),
+                    "collection": "panda_docs",
+                },
+            ]
+        }
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump(cfg))
+        repos, _ = load_config(config_path)
+        assert repos[0].collection == "panda_docs"
+
+    def test_load_config_collection_none_when_absent(self, tmp_path):
+        """load_config must set collection=None when the key is missing."""
+        import yaml
+        from bamboo_mcp_services.agents.github_doc_sync_agent.github_markdown_sync import (
+            load_config,
+        )
+
+        cfg = {
+            "repos": [
+                {
+                    "name": "owner/repo",
+                    "destination": str(tmp_path / "dest"),
+                },
+            ]
+        }
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump(cfg))
+        repos, _ = load_config(config_path)
+        assert repos[0].collection is None
+
+    def test_load_config_multiple_collections(self, tmp_path):
+        """load_config must preserve distinct collection names across repos."""
+        import yaml
+        from bamboo_mcp_services.agents.github_doc_sync_agent.github_markdown_sync import (
+            load_config,
+        )
+
+        cfg = {
+            "repos": [
+                {
+                    "name": "PanDAWMS/pilot3",
+                    "destination": str(tmp_path / "tmp"),
+                    "collection": "panda_docs",
+                },
+                {
+                    "name": "rucio/documentation",
+                    "destination": str(tmp_path / "tmp"),
+                    "collection": "rucio_docs",
+                },
+                {
+                    "name": "PalNilsson/bamboo-mcp",
+                    "destination": str(tmp_path / "tmp"),
+                    "collection": "bamboo_docs",
+                },
+            ]
+        }
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump(cfg))
+        repos, _ = load_config(config_path)
+        assert repos[0].collection == "panda_docs"
+        assert repos[1].collection == "rucio_docs"
+        assert repos[2].collection == "bamboo_docs"
+
+    def test_load_config_and_cli_load_repo_configs_agree(self, tmp_path):
+        """Both YAML parsing paths must produce identical collection values."""
+        import yaml
+        from bamboo_mcp_services.agents.github_doc_sync_agent.cli import _load_repo_configs
+        from bamboo_mcp_services.agents.github_doc_sync_agent.github_markdown_sync import (
+            load_config,
+        )
+
+        entries = [
+            {
+                "name": "PanDAWMS/pilot3",
+                "destination": str(tmp_path / "tmp"),
+                "normalized_destination": str(tmp_path / "rag/panda_docs"),
+                "collection": "panda_docs",
+                "branch": "master",
+                "normalize_for_rag": True,
+                "include_patterns": ["*.md"],
+            },
+            {
+                "name": "rucio/documentation",
+                "destination": str(tmp_path / "tmp"),
+                "normalized_destination": str(tmp_path / "rag/rucio_docs"),
+                "collection": "rucio_docs",
+                "branch": "main",
+                "normalize_for_rag": True,
+                "include_patterns": ["*.md", "*.rst"],
+            },
+        ]
+        cfg = {"repos": entries}
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump(cfg))
+
+        via_load_config, _ = load_config(config_path)
+        via_cli = _load_repo_configs(cfg)
+
+        for lc, cc in zip(via_load_config, via_cli):
+            assert lc.collection == cc.collection, (
+                f"Mismatch for {lc.name}: "
+                f"load_config={lc.collection!r}  _load_repo_configs={cc.collection!r}"
+            )
+
+    def test_load_config_collection_mixed_present_and_absent(self, tmp_path):
+        """Some repos may have collection, others may not — both are valid."""
+        import yaml
+        from bamboo_mcp_services.agents.github_doc_sync_agent.github_markdown_sync import (
+            load_config,
+        )
+
+        cfg = {
+            "repos": [
+                {
+                    "name": "owner/with-collection",
+                    "destination": str(tmp_path / "tmp"),
+                    "collection": "atlas_docs",
+                },
+                {
+                    "name": "owner/without-collection",
+                    "destination": str(tmp_path / "tmp"),
+                },
+            ]
+        }
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(yaml.dump(cfg))
+        repos, _ = load_config(config_path)
+        assert repos[0].collection == "atlas_docs"
+        assert repos[1].collection is None
