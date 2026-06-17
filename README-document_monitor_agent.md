@@ -276,6 +276,79 @@ for col in client.list_collections():
 
 ---
 
+## Adding PDF documents
+
+Drop `.pdf` files directly into the watch directory (or any subdirectory of it).  The agent picks them up on the next poll cycle.
+
+### Text-based PDFs (the normal case)
+
+PDFs authored digitally — exported from Word, LaTeX, or a PDF printer — contain an embedded text layer.  The agent extracts this layer with `pdfminer.six`, chunks the result, and ingests it exactly as it would a `.txt` or `.md` file.
+
+### Verifying chunks after ingestion
+
+After a PDF is ingested, the agent logs a chunk-quality summary so you can confirm the extraction produced sensible text:
+
+```
+INFO chunk quality [my_paper.pdf]: 12 chunk(s), 34210 chars total — min=1823 median=3001 max=3110 — first: "Abstract — We present a new approach to distributed job scheduling…"
+```
+
+What to look for:
+
+| Signal | Likely meaning |
+|---|---|
+| `chunk(s)` count is plausible for the document length | Extraction succeeded |
+| `min` length is very small (e.g. < 50 chars) | Possible extraction artefact; review the first-chunk preview |
+| `first:` preview contains garbled characters or is empty | PDF may be partially scanned — see below |
+| Log line is absent (only `DEBUG` about "no extractable text") | PDF is fully scanned — OCR required |
+
+You can also inspect the stored chunks directly:
+
+```python
+import chromadb, json
+
+client = chromadb.PersistentClient(path="/data/bamboo/.chromadb")
+routing = json.load(open("/data/bamboo/.chromadb/collection_routing.json"))
+live_slot = routing["bamboo_docs"]          # e.g. "bamboo_docs__a"
+
+col = client.get_collection(live_slot)
+results = col.get(
+    where={"source_file": {"$eq": "/data/bamboo/rag/bamboo_docs/my_paper.pdf"}},
+    include=["documents", "metadatas"],
+)
+for i, (doc, meta) in enumerate(zip(results["documents"], results["metadatas"])):
+    print(f"--- chunk {i} (index={meta['chunk_index']}) ---")
+    print(doc[:300])
+    print()
+```
+
+### Scanned PDFs (image-only, no text layer)
+
+A scanned PDF has no embedded text; `pdfminer.six` returns an empty string.  The agent emits a `DEBUG` log line and skips the file:
+
+```
+DEBUG PDF has no extractable text layer (scanned or image-only?): /path/to/scan.pdf — skipping.
+```
+
+To ingest a scanned PDF, first add a text layer with [`ocrmypdf`](https://ocrmypdf.readthedocs.io):
+
+```bash
+# Install (once)
+pip install ocrmypdf      # or: conda install -c conda-forge ocrmypdf
+
+# Add OCR layer in-place (overwrites the file)
+ocrmypdf /data/bamboo/rag/bamboo_docs/scan.pdf \
+         /data/bamboo/rag/bamboo_docs/scan.pdf
+
+# Or write to a new file to keep the original
+ocrmypdf /path/to/scan.pdf /data/bamboo/rag/bamboo_docs/scan_ocr.pdf
+```
+
+Once the OCR'd file is in the watch directory the agent will pick it up on the next poll cycle.
+
+> **Tip:** `ocrmypdf` is idempotent — running it on a PDF that already has a text layer is safe; it will add OCR only to pages that need it.
+
+---
+
 ## Re-ingestion
 
 Re-ingestion is required when:

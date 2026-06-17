@@ -827,3 +827,136 @@ class TestChromaWrapperCreateCollection:
         # Every add_documents call must have used the same idle_col object.
         for call in mock_chroma.add_documents.call_args_list:
             assert call[0][0] is idle_col, "add_documents was not given the idle collection"
+
+
+# ===========================================================================
+# Regression: sidecar slot overwrite — stale _data clobbers a peer's swap
+# ===========================================================================
+
+
+class TestCollectionRouterSidecarSlotOverwrite:
+    """Regression tests for the bug where a late-swapping agent overwrote a
+    previously-swapped agent's sidecar entry with a stale value.
+
+    Root cause: ``_load()`` populated ``self._data`` with the **entire**
+    on-disk sidecar.  When a second agent committed its swap, ``_save()``
+    called ``merged.update(self._data)``, which overlaid stale entries for
+    *all other* collections on top of whatever was currently on disk — erasing
+    any fresh values written by agents that swapped earlier in the same cycle.
+
+    Fix: ``self._data`` is now scoped to only the entries this instance owns.
+    ``_load()`` is a no-op; ``live_name()`` does a lazy per-key disk lookup.
+    ``_save()`` does not sync ``self._data`` back from the merged result.
+    """
+
+    def test_second_swap_does_not_clobber_first_swap(self, tmp_path):
+        """If two agents swap in sequence, both sidecar entries must reflect
+        their *new* slots — the second swap must not revert the first one.
+
+        This is the exact production symptom from the 11:03 monitor run:
+        bamboo_docs swapped __b → __a (written to sidecar); a subsequent
+        agent then wrote its own swap and its stale ``bamboo_docs__b`` value
+        overwrote the freshly written ``bamboo_docs__a``.
+        """
+        sidecar = str(tmp_path / "routing.json")
+
+        # Seed: both collections are at __b (result of previous run).
+        initial = {"alpha": "alpha__b", "beta": "beta__b"}
+        (tmp_path / "routing.json").write_text(
+            json.dumps(initial, indent=2), encoding="utf-8"
+        )
+
+        mock_chroma = MagicMock(spec=ChromaWrapper)
+        mock_chroma.collection_count.return_value = 50
+
+        # Both routers load their state at (approximately) the same time,
+        # *before* either has swapped.  This is the critical window: each
+        # router's stale view of the other's collection must not be written
+        # back to disk.
+        router_alpha = CollectionRouter(sidecar)
+        router_beta = CollectionRouter(sidecar)
+        router_alpha.live_name("alpha")  # sees alpha__b
+        router_beta.live_name("beta")    # sees beta__b
+
+        # alpha swaps first: __b → __a
+        router_alpha.commit_swap("alpha", mock_chroma)
+
+        data = json.loads((tmp_path / "routing.json").read_text())
+        assert data["alpha"] == "alpha__a", "alpha should be at __a after swap"
+        assert data["beta"] == "beta__b", "beta unchanged after alpha-only swap"
+
+        # beta swaps second: __b → __a.  Must NOT revert alpha back to __b.
+        router_beta.commit_swap("beta", mock_chroma)
+
+        data = json.loads((tmp_path / "routing.json").read_text())
+        assert data["alpha"] == "alpha__a", (
+            "alpha was reverted to __b by beta's commit_swap — sidecar clobber bug"
+        )
+        assert data["beta"] == "beta__a", "beta should be at __a after its own swap"
+
+    def test_five_agents_swap_in_alternating_cycle(self, tmp_path):
+        """Full five-collection scenario matching production topology.
+
+        All five routers are created and call live_name() before any swap
+        occurs (simulating the sequential-but-overlapping startup window).
+        Then each commits its swap.  Every collection must end up at its
+        new slot regardless of swap order.
+        """
+        sidecar = str(tmp_path / "routing.json")
+        names = ["panda_docs", "atlas_docs", "bamboo_docs", "rucio_docs", "root_docs"]
+
+        # Previous cycle left everything at __b.
+        (tmp_path / "routing.json").write_text(
+            json.dumps({n: f"{n}__b" for n in names}, indent=2), encoding="utf-8"
+        )
+
+        mock_chroma = MagicMock(spec=ChromaWrapper)
+        mock_chroma.collection_count.return_value = 80
+
+        # All five routers load before any swap.
+        routers = {}
+        for name in names:
+            r = CollectionRouter(sidecar)
+            r.live_name(name)
+            routers[name] = r
+
+        # Each commits a swap sequentially.
+        for name in names:
+            routers[name].commit_swap(name, mock_chroma)
+
+        data = json.loads((tmp_path / "routing.json").read_text())
+        assert set(data.keys()) == set(names), "All five entries must be present"
+        for name in names:
+            assert data[name] == f"{name}__a", (
+                f"{name} should be at __a after swap, got {data[name]!r}. "
+                "A stale-_data clobber from a subsequent agent's commit_swap is "
+                "the likely cause."
+            )
+
+    def test_non_swapping_agents_do_not_alter_sidecar(self, tmp_path):
+        """Agents that find no new files must not write to the sidecar at all.
+
+        In a cycle where only one collection has changed files, the other four
+        collections must not alter the sidecar — not even to re-write the same
+        value.  This test ensures that simply calling live_name() (which all
+        agents do at startup) does not trigger a sidecar write.
+        """
+        sidecar_path = tmp_path / "routing.json"
+        names = ["panda_docs", "atlas_docs", "bamboo_docs", "rucio_docs", "root_docs"]
+
+        (sidecar_path).write_text(
+            json.dumps({n: f"{n}__b" for n in names}, indent=2), encoding="utf-8"
+        )
+        mtime_before = sidecar_path.stat().st_mtime
+
+        # Simulate agents that do NOT swap (no new files) — they only call live_name().
+        for name in names:
+            r = CollectionRouter(str(sidecar_path))
+            r.live_name(name)
+            # No commit_swap call.
+
+        mtime_after = sidecar_path.stat().st_mtime
+        assert mtime_before == mtime_after, (
+            "Sidecar was modified by a live_name()-only path; only commit_swap() "
+            "should write to the sidecar."
+        )

@@ -90,7 +90,14 @@ class CollectionRouter:
             Physical ChromaDB collection name.
         """
         if logical not in self._data:
-            self._data[logical] = f"{logical}__a"
+            # Lazy per-key load: read only this instance's own entry from the
+            # sidecar.  Loading the full sidecar into self._data would cause a
+            # multi-agent clobber (see _load() docstring for the full story).
+            try:
+                on_disk = json.loads(self._path.read_text(encoding="utf-8"))
+                self._data[logical] = on_disk.get(logical, f"{logical}__a")
+            except (FileNotFoundError, json.JSONDecodeError):
+                self._data[logical] = f"{logical}__a"
             # Intentionally NOT calling _save() here.  The sidecar must only
             # reflect slots that contain committed, populated data.  The first
             # write happens inside commit_swap() once ingestion has succeeded.
@@ -231,16 +238,36 @@ class CollectionRouter:
     # ------------------------------------------------------------------
 
     def _load(self) -> None:
-        """Load routing data from the sidecar file if it exists."""
-        if self._path.exists():
-            try:
-                self._data = json.loads(self._path.read_text(encoding="utf-8"))
-            except Exception:
-                LOG.warning(
-                    "CollectionRouter: failed to read sidecar '%s'; starting fresh.",
-                    self._path,
-                )
-                self._data = {}
+        """Intentional no-op — individual entries are loaded lazily in live_name().
+
+        Background: the previous implementation loaded the *entire* sidecar into
+        ``self._data`` here.  That caused a subtle multi-agent clobber bug:
+
+        * Five :class:`DocumentMonitorAgent` instances each own one logical name
+          and share one sidecar path.  Each creates its own
+          :class:`CollectionRouter`.
+        * At startup every instance called ``_load()``, which populated
+          ``self._data`` with **all five** entries from the on-disk sidecar.
+        * If agent A swapped its slot (writing ``bamboo_docs__a`` to disk) and
+          then agent B subsequently called ``commit_swap`` for *its own* name,
+          ``_save()`` would call ``merged.update(self._data)``.  Because
+          ``self._data`` still held the **pre-swap** value ``bamboo_docs__b``
+          (loaded at B's startup, before A's swap), that stale value overwrote
+          A's freshly written ``bamboo_docs__a`` in the on-disk sidecar.
+
+        The fix is to keep ``self._data`` scoped to only the entries **this
+        instance owns** (i.e. the logical names it has explicitly set via
+        :meth:`live_name` or :meth:`commit_swap`).  Foreign entries are
+        preserved through the read-modify-write in :meth:`_save` — they are
+        loaded from disk immediately before each write and the overlay
+        ``merged.update(self._data)`` only overwrites entries this instance
+        controls.
+
+        Per-key lookup from disk is done lazily inside :meth:`live_name` the
+        first time a logical name is accessed, so the correct persisted slot is
+        still recovered after a restart.
+        """
+        # Intentionally empty: self._data starts as {} and is populated lazily.
 
     def _save(self) -> None:
         """Persist routing data atomically via read-modify-write + os.replace.
@@ -256,6 +283,11 @@ class CollectionRouter:
         instance's in-memory ``_data`` is overlaid on top, so a freshly swapped
         entry always takes precedence over any stale on-disk value for the same
         logical name.
+
+        ``self._data`` is intentionally **not** updated with the merged result
+        after the write.  Keeping ``self._data`` scoped to only this instance's
+        own entries is what prevents the multi-agent clobber bug — see
+        :meth:`_load` for the full explanation.
         """
         self._path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -274,8 +306,10 @@ class CollectionRouter:
         tmp.write_text(json.dumps(merged, indent=2), encoding="utf-8")
         os.replace(tmp, self._path)
 
-        # Keep our in-memory state coherent with what we just wrote.
-        self._data = merged
+        # NOTE: self._data is NOT updated to merged here.  Doing so would
+        # re-introduce foreign entries into this instance's _data, causing
+        # a subsequent _save() to overwrite those foreign entries with
+        # whatever stale values they had when this instance loaded the sidecar.
 
 
 class ChromaWrapper:

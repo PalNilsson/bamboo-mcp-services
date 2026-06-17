@@ -19,6 +19,7 @@ from .utils import (
     chunk_text,
     content_hash,
     deterministic_chunk_id,
+    summarise_chunks,
     CheckpointStore,
 )
 from .storage import ChromaWrapper, CollectionRouter
@@ -185,6 +186,15 @@ class DocumentMonitorAgent(Agent):
             self._last_processed_file = path_str
             self._last_error = None
             return
+
+        # For PDF files, log a chunk-quality summary so operators can verify
+        # that text extraction produced sensible content.  Scanned PDFs that
+        # slipped through the empty-text guard (e.g. a PDF with a tiny stub
+        # text layer) would show very short chunk lengths here.
+        if Path(path_str).suffix.lower() == ".pdf":
+            summary = summarise_chunks(path_str, chunks)
+            if summary:
+                LOG.info("%s", summary)
 
         ids: List[str] = [deterministic_chunk_id(path_str, "", i) for i in range(len(chunks))]
         metadatas: List[Dict] = [

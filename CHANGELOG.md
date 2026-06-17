@@ -9,7 +9,71 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+#### `CollectionRouter` sidecar slot overwrite — multi-agent clobber bug
+
+**Root cause:** `CollectionRouter._load()` populated `self._data` with the
+*entire* on-disk sidecar rather than only the entry owned by this instance.
+When a second agent committed its swap, `_save()` called
+`merged.update(self._data)`, which overlaid stale entries for *all other*
+collections on top of whatever was on disk — erasing any fresh values written
+by agents that had already swapped earlier in the same cycle.
+
+**Symptom:** after a run where `bamboo_docs` swapped `__b → __a` (log line
+confirmed the swap and invariant check passed), the sidecar still contained
+`"bamboo_docs": "bamboo_docs__b"`.  Readers were directed to the empty old slot.
+
+**Fix — three changes in `storage.py`:**
+
+1. `_load()` is now a documented no-op.  `self._data` starts empty and is
+   populated lazily.
+2. `live_name()` performs a targeted per-key disk lookup the first time a
+   logical name is accessed.  Only the entry for *this* logical name is loaded
+   into `self._data`; no foreign entries are ever stored.
+3. `_save()` no longer reassigns `self._data = merged` after the write.
+   Keeping `self._data` scoped to this instance's own entries is what makes
+   the read-modify-write overlay safe — `merged.update(self._data)` can only
+   overwrite entries this instance explicitly controls.
+
+**Regression test:** `tests/test_atomic_updates.py` —
+`TestCollectionRouterSidecarSlotOverwrite` — three new tests:
+`test_second_swap_does_not_clobber_first_swap`,
+`test_five_agents_swap_in_alternating_cycle`, and
+`test_non_swapping_agents_do_not_alter_sidecar`.
+
 ### Added
+
+#### PDF chunk quality logging
+
+After a PDF is chunked, `agent._ingest_file()` emits an INFO log line with a
+quality summary: chunk count, total / min / median / max character lengths, and
+a 120-character preview of the first chunk.  Example:
+
+```
+INFO chunk quality [my_paper.pdf]: 12 chunk(s), 34210 chars total — min=1823 median=3001 max=3110 — first: "Abstract — We present a new approach…"
+```
+
+Operators can use this to verify that text extraction produced sensible content
+without querying ChromaDB directly.  Only PDF files receive this summary (other
+formats produce shorter, well-understood content).
+
+**New function:** `utils.summarise_chunks(path, chunks, *, preview_chars=120)`
+returns the summary string; returns `""` for empty chunk lists (no log noise).
+
+#### Scanned-PDF detection logging
+
+`utils._extract_pdf()` now emits a `DEBUG` log line when pdfminer returns an
+empty string, naming the offending file and suggesting the `ocrmypdf` remedy.
+Previously an empty-text PDF silently appeared as "no text extracted" with no
+indication of whether the PDF was scanned vs. genuinely empty.
+
+**Documentation:** `README-document_monitor_agent.md` — new
+[Adding PDF documents](#adding-pdf-documents) section covering text-based vs.
+scanned PDFs, the chunk quality log format and how to interpret it, manual
+chunk inspection via ChromaDB, and `ocrmypdf` pre-processing instructions.
+
+
 
 #### `--log-file` support — document-monitor-agent
 

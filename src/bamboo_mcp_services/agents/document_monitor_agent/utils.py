@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from pathlib import Path
 from typing import List, Dict
@@ -16,12 +17,20 @@ from typing import List, Dict
 from pdfminer.high_level import extract_text as pdf_extract_text
 import docx
 
+LOG = logging.getLogger(__name__)
+
 
 def extract_text_from_file(path: str) -> str:
     """Extract text content from a file.
 
     Supported extensions: .pdf, .docx, .txt, .md. For unknown extensions
     will attempt a best-effort text decode.
+
+    For `.pdf` files, extraction relies on pdfminer.six and requires the PDF
+    to have an embedded text layer.  Scanned PDFs without OCR will return an
+    empty string; a ``DEBUG`` log line is emitted so the file is skipped
+    rather than silently ingested as empty.  Run ``ocrmypdf <file> <file>``
+    to add a text layer before dropping scanned PDFs into the watch directory.
 
     Args:
         path: Path to the file.
@@ -50,17 +59,78 @@ def extract_text_from_file(path: str) -> str:
         return ""
 
 
+def summarise_chunks(
+    path: str,
+    chunks: List[str],
+    *,
+    preview_chars: int = 120,
+) -> str:
+    """Return a human-readable quality summary of the chunks produced from *path*.
+
+    Called after a PDF (or any document) is chunked so the operator can verify
+    in the log that the extraction produced sensible text rather than garbled
+    or empty content.
+
+    The summary includes:
+    - Total chunk count and total character count.
+    - Min / median / max chunk lengths.
+    - A short preview of the first chunk's leading text.
+
+    Args:
+        path: Source file path (used only for the log label).
+        chunks: List of text chunks produced by :func:`chunk_text`.
+        preview_chars: Number of characters to show from the first chunk.
+
+    Returns:
+        A single-line string suitable for ``LOG.info()``.  Returns an empty
+        string when *chunks* is empty (caller should not log it).
+    """
+    if not chunks:
+        return ""
+
+    lengths = sorted(len(c) for c in chunks)
+    n = len(lengths)
+    total_chars = sum(lengths)
+    min_len = lengths[0]
+    max_len = lengths[-1]
+    median_len = lengths[n // 2]
+
+    first_preview = chunks[0][:preview_chars].replace("\n", " ").strip()
+    if len(chunks[0]) > preview_chars:
+        first_preview += "…"
+
+    filename = Path(path).name
+    return (
+        f"chunk quality [{filename}]: "
+        f"{n} chunk(s), {total_chars} chars total — "
+        f"min={min_len} median={median_len} max={max_len} — "
+        f'first: "{first_preview}"'
+    )
+
+
 def _extract_pdf(path: str) -> str:
     """Extract text from PDF using pdfminer.six.
+
+    Returns an empty string for scanned PDFs that have no embedded text layer;
+    a ``DEBUG`` log line is emitted so the caller's skip logic produces a
+    visible trace.  Operators should pre-process scanned PDFs with
+    ``ocrmypdf <file> <file>`` before placing them in the watch directory.
 
     Args:
         path: Path to the PDF file.
 
     Returns:
-        Extracted text or empty string on error.
+        Extracted text or empty string on error or if no text layer present.
     """
     try:
-        return pdf_extract_text(path) or ""
+        text = pdf_extract_text(path) or ""
+        if not text.strip():
+            LOG.debug(
+                "PDF has no extractable text layer (scanned or image-only?): %s — "
+                "skipping. Run `ocrmypdf %s %s` to add a text layer first.",
+                path, path, path,
+            )
+        return text
     except Exception:
         return ""
 
