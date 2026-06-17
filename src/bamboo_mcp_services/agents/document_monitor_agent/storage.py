@@ -208,7 +208,19 @@ class CollectionRouter:
 
         counts = chroma.all_collection_counts()
 
-        for logical, physical in sorted(self._data.items()):
+        # Read the full sidecar from disk.  self._data is intentionally scoped
+        # to only the entries this instance owns (see _load() docstring), so
+        # iterating it would miss every other agent's entries and silently pass
+        # the invariant check for collections this instance never touched.
+        # The sidecar is the authoritative record of all live slots.
+        try:
+            on_disk: Dict[str, str] = json.loads(
+                self._path.read_text(encoding="utf-8")
+            )
+        except (FileNotFoundError, json.JSONDecodeError):
+            on_disk = {}
+
+        for logical, physical in sorted(on_disk.items()):
             count = counts.get(physical, "MISSING")
             if isinstance(count, int) and count > 0:
                 status = "OK"
