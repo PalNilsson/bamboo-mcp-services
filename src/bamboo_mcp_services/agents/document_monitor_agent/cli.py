@@ -9,6 +9,7 @@ import signal
 import sys
 import warnings
 from collections.abc import Callable
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Optional
 
@@ -109,6 +110,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run a single poll cycle per watch pair then exit.",
     )
+    p.add_argument(
+        "--log-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Append log output to PATH in addition to stderr.  "
+            "The file and any missing parent directories are created "
+            "automatically.  Uses a rotating file handler capped at "
+            "10 MB per file with up to 5 backups."
+        ),
+    )
     return p
 
 
@@ -207,6 +219,42 @@ def _build_embedder(model_path: str | None = None) -> LangchainHuggingFaceAdapte
             "Verify the path points to a valid sentence-transformers model directory."
         )
     return adapter
+
+
+def _configure_logging(log_file: str | None, suppress_filter: logging.Filter) -> None:
+    """Attach a rotating file handler to the root logger if *log_file* is set.
+
+    The handler mirrors the format used by the stream handler configured in
+    :func:`main` so that console and file output are identical.
+    :class:`_SuppressNameAtInfo` is applied to both handlers so INFO-level
+    records omit the logger hierarchy in both destinations.
+
+    The file and any missing parent directories are created automatically.
+    The handler rotates at 10 MB per file and retains up to 5 backups.
+
+    Args:
+        log_file: Filesystem path for the log file, or ``None`` to skip.
+        suppress_filter: Pre-constructed :class:`_SuppressNameAtInfo` instance
+            to attach to the new handler.
+    """
+    if log_file is None:
+        return
+
+    log_path = Path(log_file)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    handler = RotatingFileHandler(
+        log_path,
+        maxBytes=10 * 1024 * 1024,  # 10 MB
+        backupCount=5,
+        encoding="utf-8",
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s%(message)s")
+    )
+    handler.addFilter(suppress_filter)
+    logging.getLogger().addHandler(handler)
+    logger.info("Log file: %s", log_path)
 
 
 def _build_agents(args: argparse.Namespace) -> list[DocumentMonitorAgent]:
@@ -355,6 +403,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     _filter = _SuppressNameAtInfo()
     for _h in logging.root.handlers:
         _h.addFilter(_filter)
+    _configure_logging(getattr(args, "log_file", None), _filter)
     log_startup_banner(logger, "bamboo-document-monitor")
 
     for _noisy in ("httpx", "httpcore", "huggingface_hub", "sentence_transformers"):

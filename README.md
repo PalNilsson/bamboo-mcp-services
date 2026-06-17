@@ -170,6 +170,13 @@ Watches one or more directories for new or changed documents and ingests each in
 
 Updates are performed using a **blue/green slot rotation**: vectors are written into an idle ChromaDB collection while the live collection remains fully queryable, then the routing sidecar is updated atomically via `os.replace` to promote the new slot. This means there is no window where the collection is empty or partially filled, regardless of how long embedding takes. The idle slot is always deleted and recreated from scratch before each build, which also eliminates ChromaDB dimension-mismatch errors when the embedder model changes.
 
+Key features:
+- Repeatable `--watch DIR COLLECTION` for multi-corpus ingestion in one invocation
+- Blue/green slot rotation — zero reader downtime during updates
+- `--model-path` for air-gapped machines (fatal on load failure, no silent `DummyEmbedder` fallback)
+- `--log-file PATH` — rotating log file (10 MB / 5 backups) alongside stderr
+- `--once` for one-shot runs; daemon mode with Ctrl-C / SIGTERM shutdown
+
 → [Full documentation](./README-document_monitor_agent.md)
 
 ### `ingestion-agent` ✅ Ready

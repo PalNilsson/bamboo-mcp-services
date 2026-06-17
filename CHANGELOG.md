@@ -9,7 +9,86 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+#### `--log-file` support — document-monitor-agent
+
+New `--log-file PATH` flag for `bamboo-document-monitor`.  When set, log output
+is appended to `PATH` **in addition to** stderr.  The file and any missing parent
+directories are created automatically.  A `RotatingFileHandler` is used (10 MB
+per file, 5 backups, UTF-8 encoding).  The file handler uses the same format
+string and `_SuppressNameAtInfo` filter as the stream handler, so console and
+file output are identical (INFO records omit the logger hierarchy; WARNING and
+above include it for easier diagnostics).
+
+Typical daemon invocation:
+
+```bash
+bamboo-document-monitor \
+  --watch /data/bamboo/rag/panda_docs panda_docs \
+  --chroma-dir /data/bamboo/.chromadb \
+  --log-file /data/bamboo/logs/document-monitor.log
+```
+
+**Changes:**
+
+- `cli.py` — `build_parser()`: new `--log-file PATH` argument (default `None`).
+- `cli.py` — new `_configure_logging(log_file, suppress_filter)` helper; no-op
+  when `log_file` is `None`; called from `main()` after `basicConfig`.
+- `cli.py` — `from logging.handlers import RotatingFileHandler` import added.
+
+**Documentation:**
+
+- `README-document_monitor_agent.md` — `--log-file` row added to CLI reference
+  table; daemon example updated to show `--log-file` in context.
+- `README.md` — document-monitor-agent feature list updated with `--log-file`.
+
+**Test changes** (`tests/agents/document_monitor_agent/test_document_monitor_agent_cli.py`,
+new file — first dedicated CLI tests for `document_monitor_agent`):
+
+- `TestBuildParser` (6 tests) — parser defaults including `--log-file`.
+- `TestSuppressNameAtInfo` (4 tests) — INFO name suppression, WARNING preservation.
+- `TestConfigureLogging` (9 tests) — no-op on `None`; handler attachment; file
+  creation; parent directory auto-creation; format string; rotation config;
+  filter attachment; INFO name suppressed in file; WARNING name preserved.
+- `TestResolveWatches` (5 tests) — `--watch`, legacy `--dir`, no-watches exit.
+- `TestCheckpointPath` (5 tests) — filename derivation and uniqueness.
+
 ### Fixed
+
+#### `collection_routing.json` overwrite bug — document-monitor-agent
+
+**Root cause:** Each `DocumentMonitorAgent` creates its own `CollectionRouter`
+instance backed by the same sidecar path.  `CollectionRouter._save()` was a
+blind overwrite — it serialised only `self._data` (one instance's in-memory
+dict) to the file.  Because each instance tracks only its own logical name, the
+last agent to call `commit_swap()` would write a single-entry file, clobbering
+every entry produced by the agents that preceded it.  After a full five-collection
+monitor run the sidecar contained only the last collection processed.
+
+**Fix:** `_save()` is now a **read-modify-write** operation.  Immediately before
+writing, the current on-disk sidecar is re-read and parsed into a `merged` dict.
+`self._data` is then overlaid on top (so our freshly swapped entry always wins
+for our own logical name), and the merged dict is written atomically via
+`os.replace`.  The in-memory `self._data` is then updated to the merged state so
+subsequent reads stay coherent.
+
+The atomic `os.replace` rename was already correct and is preserved unchanged.
+
+**Changes:**
+
+- `storage.py` — `CollectionRouter._save()`: replaced blind overwrite with
+  read-modify-write merge using a `merged` dict; `self._data` updated to merged
+  state after write.  Doc-string expanded to explain the concurrent-instance
+  contract.
+
+**Test changes** (`tests/test_atomic_updates.py`):
+
+- `TestCollectionRouter.test_concurrent_instances_preserve_all_entries` —
+  five independent `CollectionRouter` instances sharing one sidecar; verifies
+  all five entries survive after sequential swaps.
+- `TestCollectionRouter.test_save_merges_without_clobbering_existing_entries` —
+  two instances write independent entries; verifies neither is clobbered.
 
 #### `load_config()` missing `collection` field — github-doc-sync-agent
 

@@ -199,11 +199,13 @@ Omit `--once` to poll continuously, picking up new files as they arrive:
 bamboo-document-monitor \
   --watch /data/bamboo/rag/panda_docs  panda_docs \
   --watch /data/bamboo/rag/bamboo_docs bamboo_docs \
-  --chroma-dir .chromadb
+  --chroma-dir .chromadb \
+  --log-file /data/bamboo/logs/document-monitor.log
 ```
 
 Stop with Ctrl-C or SIGTERM.  In daemon mode, ticks are issued in round-robin
-order across all watch pairs.
+order across all watch pairs.  `--log-file` appends to the given path alongside
+stderr; the file is rotated automatically at 10 MB (5 backups kept).
 
 ### Via module
 
@@ -403,6 +405,7 @@ conda activate bamboo-mcp-services
 | `--chunk-overlap` | `300` | Overlap between chunks |
 | `--model-path` | *(none)* | Absolute path to a local `sentence-transformers` model directory. When set, a load failure is fatal (no `DummyEmbedder` fallback). Required on air-gapped machines. |
 | `--once` | off | Run a single poll cycle then exit |
+| `--log-file` | *(none)* | Append log output to this file **in addition to** stderr. Parent directories are created automatically. Rotates at 10 MB with 5 backups. |
 
 ---
 

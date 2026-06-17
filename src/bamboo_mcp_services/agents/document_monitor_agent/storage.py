@@ -243,11 +243,39 @@ class CollectionRouter:
                 self._data = {}
 
     def _save(self) -> None:
-        """Persist routing data atomically via write + os.replace."""
+        """Persist routing data atomically via read-modify-write + os.replace.
+
+        Each call re-reads the on-disk sidecar immediately before writing so
+        that concurrent :class:`CollectionRouter` instances (one per
+        :class:`~bamboo_mcp_services.agents.document_monitor_agent.agent.DocumentMonitorAgent`)
+        do not clobber each other's entries.  Without this merge step the last
+        writer wins and the sidecar ends up with only a single entry — the
+        collection that most recently completed its swap.
+
+        The merge rule is: on-disk entries are loaded first, then *this*
+        instance's in-memory ``_data`` is overlaid on top, so a freshly swapped
+        entry always takes precedence over any stale on-disk value for the same
+        logical name.
+        """
         self._path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Read-modify-write: load whatever is on disk right now, then overlay
+        # our in-memory state so our latest entry wins for our own logical names
+        # while preserving every entry written by other router instances.
+        merged: Dict[str, str] = {}
+        try:
+            merged = json.loads(self._path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass  # first write, or corrupt file — start from empty
+
+        merged.update(self._data)
+
         tmp = self._path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(merged, indent=2), encoding="utf-8")
         os.replace(tmp, self._path)
+
+        # Keep our in-memory state coherent with what we just wrote.
+        self._data = merged
 
 
 class ChromaWrapper:

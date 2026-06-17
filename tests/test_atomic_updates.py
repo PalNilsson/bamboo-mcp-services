@@ -432,6 +432,83 @@ class TestCollectionRouter:
         assert router.live_name("beta") == "beta__a"
 
     # ------------------------------------------------------------------
+    # Regression: concurrent-instance sidecar overwrite bug
+    # ------------------------------------------------------------------
+
+    def test_concurrent_instances_preserve_all_entries(self, tmp_path):
+        """Five independent CollectionRouter instances sharing one sidecar must
+        each preserve the entries written by the others.
+
+        Regression test for the bug where _save() was a blind overwrite:
+        each instance would write only its own single-entry dict, so the
+        last writer always clobbered every preceding entry, leaving the
+        sidecar with only one collection after a full five-collection run.
+
+        Each instance simulates one DocumentMonitorAgent (one logical name).
+        All five share the same sidecar path, as they do in production.
+        """
+        sidecar = str(tmp_path / "collection_routing.json")
+        logical_names = [
+            "panda_docs",
+            "atlas_docs",
+            "bamboo_docs",
+            "rucio_docs",
+            "root_docs",
+        ]
+
+        mock_chroma = MagicMock(spec=ChromaWrapper)
+        mock_chroma.collection_count.return_value = 100
+
+        # Each "agent" creates its own CollectionRouter, touches its own
+        # logical name, and commits a swap — sequentially, as they run in
+        # the monitor.
+        for name in logical_names:
+            router = CollectionRouter(sidecar)
+            router.live_name(name)  # seed __a in memory
+            router.commit_swap(name, mock_chroma)  # write __b to sidecar
+
+        # The sidecar must contain all five entries, not just the last one.
+        import json as _json
+        data = _json.loads(open(sidecar).read())
+
+        assert set(data.keys()) == set(logical_names), (
+            f"Sidecar missing entries after five independent swaps.\n"
+            f"Expected: {sorted(logical_names)}\n"
+            f"Got:      {sorted(data.keys())}"
+        )
+        for name in logical_names:
+            assert data[name] == f"{name}__b", (
+                f"Wrong live slot for '{name}': expected '{name}__b', got '{data[name]}'"
+            )
+
+    def test_save_merges_without_clobbering_existing_entries(self, tmp_path):
+        """_save() must merge self._data into the on-disk state, not replace it.
+
+        Write two entries independently and verify neither is lost when the
+        second write occurs.
+        """
+        sidecar = str(tmp_path / "routing.json")
+        mock_chroma = MagicMock(spec=ChromaWrapper)
+        mock_chroma.collection_count.return_value = 10
+
+        # First instance writes "alpha".
+        r1 = CollectionRouter(sidecar)
+        r1.live_name("alpha")
+        r1.commit_swap("alpha", mock_chroma)
+
+        # Second instance writes "beta" — must not erase "alpha".
+        r2 = CollectionRouter(sidecar)
+        r2.live_name("beta")
+        r2.commit_swap("beta", mock_chroma)
+
+        import json as _json
+        data = _json.loads(open(sidecar).read())
+        assert "alpha" in data, "alpha entry was clobbered by beta's _save()"
+        assert "beta" in data, "beta entry was not written"
+        assert data["alpha"] == "alpha__b"
+        assert data["beta"] == "beta__b"
+
+    # ------------------------------------------------------------------
     # New tests: commit_swap invariant enforcement
     # ------------------------------------------------------------------
 
