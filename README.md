@@ -3,24 +3,24 @@
 **Bamboo MCP Services** is a collection of cooperative, Python-based services that feed data into the **Bamboo Toolkit**, supporting the ATLAS Experiment at CERN.
 
 > ⚠️ **Early development**
-> This repository is under active development. The `document-monitor`, `ingestion`, `cric`, `github-doc-sync`, `supervisor`, and `dashboard` services are ready for use. Other agents are planned.
+> This repository is under active development. The `document-monitor`, `ingestion`, `cric`, `github-doc-sync`, `supervisor`, and `dashboard` scripts are ready for use. Other scripts are planned.
 
 ---
 
 ## Current status
 
-| Agent | Status |
+| Script | Status |
 |---|---|
-| `document-monitor-agent` | ✅ Ready |
-| `ingestion-agent` | ✅ Ready |
-| `cric-agent` | ✅ Ready |
-| `github-doc-sync-agent` | ✅ Ready |
-| `supervisor-agent` | ✅ Ready |
-| `dashboard-agent` | ✅ Ready |
-| `dast-agent` | 📋 Planned |
-| `index-builder-agent` | 📋 Planned |
-| `feedback-agent` | 📋 Planned |
-| `metrics-agent` | 📋 Planned |
+| `document-monitor` | ✅ Ready |
+| `ingestion` | ✅ Ready |
+| `cric` | ✅ Ready |
+| `github-doc-sync` | ✅ Ready |
+| `supervisor` | ✅ Ready |
+| `dashboard` | ✅ Ready |
+| `dast` | 📋 Planned |
+| `index-builder` | 📋 Planned |
+| `feedback` | 📋 Planned |
+| `metrics` | 📋 Planned |
 
 ---
 
@@ -54,16 +54,52 @@ For development (includes pytest and flake8):
 pip install -e ".[dev]"
 ```
 
-### Run all agents with the supervisor (recommended)
+### Quick start: RAG only (`document-monitor`)
 
-The supervisor is the easiest way to run the full system.  It starts every agent,
+If you just want to test the RAG (retrieval-augmented generation) pipeline, the
+only script you need is `document-monitor`. It watches a folder of documents and
+ingests them into a ChromaDB collection you can query — everything else in this
+repo (ingestion, CRIC, GitHub sync, the dashboard, the supervisor) is optional
+and can be added later.
+
+```bash
+# Process a folder of documents once and exit:
+bamboo-document-monitor \
+  --watch /data/bamboo/rag/panda_docs panda_docs \
+  --chroma-dir /data/bamboo/.chromadb --once
+
+# Or run continuously, watching for new/changed files (polls every 10 seconds):
+bamboo-document-monitor \
+  --watch /data/bamboo/rag/panda_docs panda_docs \
+  --chroma-dir /data/bamboo/.chromadb
+```
+
+- `--watch DIR COLLECTION` is repeatable — add one pair per document source you
+  want kept in its own ChromaDB collection.
+- `DIR` is created automatically if it doesn't exist. Drop `.pdf`, `.docx`,
+  `.txt`, or `.md` files into it and they'll be chunked, embedded, and written
+  to `COLLECTION`.
+- First run on a new machine needs network access once, to download the
+  embedding model. After that it runs fully offline from the cached model.
+
+Full documentation: [README-document_monitor_agent.md](./README-document_monitor_agent.md)
+
+### Advanced: run the full system
+
+Everything below — job ingestion, CRIC queue metadata, GitHub doc sync, the
+dashboard, and the supervisor that runs them all together — is only needed
+once you're past RAG-only testing and want the full Bamboo MCP Services system.
+
+#### Run everything with the supervisor (recommended)
+
+The supervisor is the easiest way to run the full system.  It starts every script,
 monitors daemons for unexpected exits, and dispatches scheduled jobs — no manual
 juggling of individual processes needed.
 
 ```bash
 # Copy and edit the bundled config (first time only)
 cp src/bamboo_mcp_services/resources/config/supervisor-agent.yaml ./supervisor-agent.yaml
-$EDITOR supervisor-agent.yaml   # adjust paths, enable/disable agents as needed
+$EDITOR supervisor-agent.yaml   # adjust paths, enable/disable scripts as needed
 
 # Start everything
 bamboo-supervisor --config supervisor-agent.yaml
@@ -76,28 +112,7 @@ Stop with **Ctrl-C** or `kill -TERM <pid>`.
 
 Full documentation: [README-supervisor-agent.md](./README-supervisor-agent.md)
 
-### Run the document monitor agent
-
-```bash
-# Process all configured collections once and exit:
-bamboo-document-monitor \
-  --watch /data/bamboo/rag/panda_docs   panda_docs \
-  --watch /data/bamboo/rag/atlas_docs   atlas_docs \
-  --watch /data/bamboo/rag/bamboo_docs  bamboo_docs \
-  --watch /data/bamboo/rag/rucio_docs   rucio_docs \
-  --watch /data/bamboo/rag/root_docs    root_docs \
-  --chroma-dir /data/bamboo/.chromadb --once
-
-# Run as a long-lived daemon (polls every 10 seconds):
-bamboo-document-monitor \
-  --watch /data/bamboo/rag/panda_docs  panda_docs \
-  --watch /data/bamboo/rag/bamboo_docs bamboo_docs \
-  --chroma-dir /data/bamboo/.chromadb
-```
-
-Full documentation: [README-document_monitor_agent.md](./README-document_monitor_agent.md)
-
-### Run the ingestion agent
+#### Run the ingestion script
 
 ```bash
 # Download all queues once and exit:
@@ -113,7 +128,7 @@ python scripts/dump_ingestion_db.py --table jobs --queue SWT2_CPB --limit 5
 
 Full documentation: [README-ingestion_agent.md](./README-ingestion_agent.md)
 
-### Run the CRIC agent
+#### Run the CRIC script
 
 ```bash
 # Load CRIC queuedata once and exit:
@@ -129,7 +144,7 @@ duckdb cric.db "SELECT queue, status, cloud, tier FROM queuedata LIMIT 10"
 
 Full documentation: [README-cric_agent.md](./README-cric_agent.md)
 
-### Run the GitHub documentation sync agent
+#### Run the GitHub documentation sync script
 
 ```bash
 # Sync all configured repositories once and exit:
@@ -145,7 +160,7 @@ bamboo-github-sync --config repos.yaml --once
 
 Full documentation: [README-github_doc_sync_agent.md](./README-github_doc_sync_agent.md)
 
-### Run the dashboard agent
+#### Run the dashboard script
 
 ```bash
 # Serve the monitoring dashboard (reads jobs.duckdb and cric.duckdb by default):
@@ -162,9 +177,9 @@ Open `http://localhost:8080` in any browser to view live job metrics, queue stat
 
 Full documentation: [README-dashboard_agent.md](./README-dashboard_agent.md)
 
-## Agents
+## Scripts
 
-### `document-monitor-agent` ✅ Ready
+### `document-monitor` ✅ Ready
 
 Watches one or more directories for new or changed documents and ingests each into a named ChromaDB collection for use in RAG pipelines. Each `--watch DIR COLLECTION` pair (repeatable) maps a normalised output directory to a logical collection, allowing different document sources to be kept in separate collections. Extracts and chunks text from `.pdf`, `.docx`, `.txt`, and `.md` files, computes deterministic chunk IDs, and stores vectors and metadata locally.
 
@@ -179,7 +194,7 @@ Key features:
 
 → [Full documentation](./README-document_monitor_agent.md)
 
-### `ingestion-agent` ✅ Ready
+### `ingestion` ✅ Ready
 
 Periodically downloads job metadata from [BigPanda](https://bigpanda.cern.ch) for a configured list of ATLAS computing queues and persists the data in a local [DuckDB](https://duckdb.org) database for downstream use by Bamboo. Stores per-job records, facet summaries, and error frequency tables. Supports one-shot and long-running daemon modes.
 
@@ -191,14 +206,14 @@ Key features:
 
 → [Full documentation](./README-ingestion_agent.md)
 
-### `cric-agent` ✅ Ready
+### `cric` ✅ Ready
 
 Periodically reads ATLAS queue metadata from the CRIC Computing Resource
 Information Catalogue (via CVMFS) and stores the latest snapshot in a local
 [DuckDB](https://duckdb.org) database. Uses SHA-256 content hashing to skip
 database writes when the source file has not changed since the last cycle,
 and performs a full table replace on each changed load so the database stays
-small regardless of how long the agent runs.
+small regardless of how long the script runs.
 
 Table replacements use a **shadow-rename swap**: the new data is written into
 `queuedata_staging` first, then a short single-transaction `ALTER TABLE RENAME`
@@ -214,7 +229,7 @@ Key features:
 
 → [Full documentation](./README-cric_agent.md)
 
-### `github-doc-sync-agent` ✅ Ready
+### `github-doc-sync` ✅ Ready
 
 Periodically polls one or more GitHub repositories (including GitHub wikis),
 downloads changed `.md` and `.rst` documentation files, and writes normalised
@@ -223,9 +238,9 @@ commit SHA caching for regular repos, and `git clone --depth 1` for wiki repos
 (which are not accessible via the REST API).  Unchanged repositories are skipped
 with a single API call or clone.
 
-The agent is a **file writer only**.  It is designed to feed the
-`document-monitor-agent`, which handles chunking, embedding, and ChromaDB
-insertion.  The two agents are decoupled and can run independently.
+This script is a **file writer only**.  It is designed to feed
+`document-monitor`, which handles chunking, embedding, and ChromaDB
+insertion.  The two are decoupled and can run independently.
 
 Key features:
 - Multi-repository support via a YAML config file; per-repo `collection`,
@@ -239,32 +254,32 @@ Key features:
 
 → [Full documentation](./README-github_doc_sync_agent.md)
 
-### `supervisor-agent` ✅ Ready
+### `supervisor` ✅ Ready
 
 Acts as the control plane for the full Bamboo MCP Services system.  Starts all
-other agents as child subprocesses, monitors long-running (daemon) agents and
+other scripts as child subprocesses, monitors long-running (daemon) scripts and
 restarts them on failure with exponential back-off, and dispatches
-short-lived (scheduled) agents on a configurable interval.  Provides a single
+short-lived (scheduled) scripts on a configurable interval.  Provides a single
 `bamboo-supervisor` command to bring up the entire system.
 
 Key features:
-- Mixed daemon/scheduled mode: each agent independently configured as a
+- Mixed daemon/scheduled mode: each script independently configured as a
   long-running daemon or a periodic one-shot
 - Exponential back-off on rapid restarts (5 s → 300 s cap)
 - Dependency ordering via `depends_on_file` — ensures `cric.duckdb` exists
-  before the ingestion agent starts
+  before the ingestion script starts
 - `--status` flag prints a JSON config summary without starting any processes
 - Clean SIGTERM propagation and configurable `stop_timeout_s` before SIGKILL
 - Extensible health reporting (HTTP endpoint planned for remote deployments)
 
 → [Full documentation](./README-supervisor-agent.md)
 
-### `dashboard-agent` ✅ Ready
+### `dashboard` ✅ Ready
 
-Serves a live, dark-themed single-page web UI for monitoring the Bamboo MCP Services system.  Starts a [FastAPI](https://fastapi.tiangolo.com/) / [uvicorn](https://www.uvicorn.org/) HTTP server in a background daemon thread and exposes REST endpoints for job metrics, queue status, and error summaries.  The dashboard auto-refreshes on a configurable interval and queries the DuckDB databases written by the other agents — no additional processing is performed.
+Serves a live, dark-themed single-page web UI for monitoring the Bamboo MCP Services system.  Starts a [FastAPI](https://fastapi.tiangolo.com/) / [uvicorn](https://www.uvicorn.org/) HTTP server in a background daemon thread and exposes REST endpoints for job metrics, queue status, and error summaries.  The dashboard auto-refreshes on a configurable interval and queries the DuckDB databases written by the other scripts — no additional processing is performed.
 
 Key features:
-- Read-only DuckDB access — safe to run alongside writing agents (MVCC snapshot isolation)
+- Read-only DuckDB access — safe to run alongside writing scripts (MVCC snapshot isolation)
 - Dark-themed single-page dashboard with Chart.js doughnut and bar charts
 - Panels for job status breakdown, top queues by count, CRIC queue status, cloud distribution, and top 25 error codes
 - Configurable bind address, port, and auto-refresh interval
@@ -273,27 +288,29 @@ Key features:
 
 → [Full documentation](./README-dashboard_agent.md)
 
-### `dast-agent` 📋 Planned
+### `dast` 📋 Planned
 
 Will extract DAST help-list email threads (e.g. via Outlook), convert them into structured JSON, and run a daily digest pass producing cleaned Q/A pairs, thread summaries, tags, and resolution status. Output feeds RAG corpora and optional fine-tuning datasets.
 
-### `index-builder-agent` 📋 Planned
+### `index-builder` 📋 Planned
 
-Will build embedding indices for plugin corpora from sources including DAST digests, documentation, and curated knowledge. May be superseded by the `document-monitor-agent`.
+Will build embedding indices for plugin corpora from sources including DAST digests, documentation, and curated knowledge. May be superseded by `document-monitor`.
 
-### `feedback-agent` 📋 Planned
+### `feedback` 📋 Planned
 
 Will capture user feedback from Bamboo (e.g. *helpful / not helpful*) and store it in structured form for later analysis.
 
-### `metrics-agent` 📋 Planned
+### `metrics` 📋 Planned
 
-Will collect structured metrics from Bamboo and agents (latency, tool usage, failures) and export them to JSON and optionally Grafana/Prometheus-compatible backends.
+Will collect structured metrics from Bamboo and the other scripts (latency, tool usage, failures) and export them to JSON and optionally Grafana/Prometheus-compatible backends.
 
 ---
 
-## Agent lifecycle interface
+## Script lifecycle interface
 
-All agents follow a minimal, consistent lifecycle interface to simplify supervision, testing, and orchestration:
+Internally, every script above is built on top of an `Agent` base class (see
+`agents/base.py`) that follows a minimal, consistent lifecycle interface to
+simplify supervision, testing, and orchestration:
 
 ```python
 class Agent:
@@ -310,15 +327,15 @@ class Agent:
         """Gracefully release resources and shut down."""
 ```
 
-Long-running agents run a scheduler loop calling `tick()`. Batch agents may run `start() → tick() → stop()` once. The `supervisor-agent` interacts with child processes through their CLI entry points rather than this interface directly, but follows the same lifecycle itself.
+Long-running scripts run a scheduler loop calling `tick()`. Batch scripts may run `start() → tick() → stop()` once. `supervisor` interacts with child processes through their CLI entry points rather than this interface directly, but follows the same lifecycle itself.
 
-A minimal no-op `dummy-agent` is included as a template and for validating the lifecycle:
+A minimal no-op script, `dummy`, is included as a template and for validating the lifecycle:
 
 ```bash
 bamboo-dummy --tick-interval 1.0
 ```
 
-Stop with Ctrl+C or SIGTERM. When adding a new agent, register its entry point in `pyproject.toml` under `[project.scripts]`.
+Stop with Ctrl+C or SIGTERM. When adding a new script, register its entry point in `pyproject.toml` under `[project.scripts]`.
 
 ---
 
@@ -402,9 +419,9 @@ bamboo-mcp-services/
 
 ## Shared tooling
 
-Agents draw on shared components in `common/`:
+Scripts draw on shared components in `common/`:
 
-- **CLI utilities** — `common/cli.py` provides `log_startup_banner()`, called by every agent on startup to emit a consistent `prog  version=X.Y.Z  python=A.B.C` log line
+- **CLI utilities** — `common/cli.py` provides `log_startup_banner()`, called by every script on startup to emit a consistent `prog  version=X.Y.Z  python=A.B.C` log line
 - **Storage** — DuckDB store, typed schema DDL (`schema.py`), field annotations for LLM context (`schema_annotations.py`)
 - **Vector stores** — ChromaDB, embedding adapters
 - **PanDA / BigPanDA** — metadata fetching, snapshot downloads
@@ -437,7 +454,7 @@ repository root (where `pyproject.toml` lives).
 **Editable install fails** — confirm that `src/bamboo_mcp_services/` exists and
 contains an `__init__.py`.
 
-**Agent logs wrong version after `bump_version.py`** — `importlib.metadata` reads
+**Script logs wrong version after `bump_version.py`** — `importlib.metadata` reads
 the version baked in at install time. Run `pip install -e .` after every bump.
 
 **Code changes have no effect at runtime** — if `pip install .` (without `-e`) was
@@ -453,7 +470,7 @@ python -c "import bamboo_mcp_services.agents.github_doc_sync_agent.github_markdo
 ```
 The path should point into your development tree, not `site-packages`.
 
-**`document-monitor-agent` — ChromaDB collection appears empty after upgrade** — the agent now stores vectors in slotted collection names (`atlas_docs__a` / `atlas_docs__b`) rather than the bare logical name (`atlas_docs`).  If you are upgrading from an older version, the agent will not find or use any data in the old unslotted collection.  Wipe and re-ingest:
+**`document-monitor` — ChromaDB collection appears empty after upgrade** — the script now stores vectors in slotted collection names (`atlas_docs__a` / `atlas_docs__b`) rather than the bare logical name (`atlas_docs`).  If you are upgrading from an older version, the script will not find or use any data in the old unslotted collection.  Wipe and re-ingest:
 ```bash
 rm -rf .chromadb/ .document_monitor/
 bamboo-document-monitor \
@@ -462,7 +479,7 @@ bamboo-document-monitor \
   --chroma-dir /data/bamboo/.chromadb --once
 ```
 
-**`document-monitor-agent` — ChromaDB dimension mismatch error** — this used to require manually deleting the collection.  The blue/green design now handles it automatically: the idle slot is deleted and recreated from scratch before every update, so a changed embedder model can never corrupt the live collection.  If you see a dimension-mismatch error in the logs it means the current cycle failed to build into the idle slot; the live collection remains readable and the agent will retry on the next cycle.
+**`document-monitor` — ChromaDB dimension mismatch error** — this used to require manually deleting the collection.  The blue/green design now handles it automatically: the idle slot is deleted and recreated from scratch before every update, so a changed embedder model can never corrupt the live collection.  If you see a dimension-mismatch error in the logs it means the current cycle failed to build into the idle slot; the live collection remains readable and the script will retry on the next cycle.
 
  — the embedding
 stack (`torch`, `sentence-transformers`, `langchain-huggingface`) is not installed
@@ -490,7 +507,7 @@ Fix with `pip install "numpy<2"`.
 ## Continuous integration
 
 GitHub Actions runs linting (`pylint`, `flake8`) and the full unit test suite
-(`pytest`) on every push. All agents and shared tools must have corresponding
+(`pytest`) on every push. All scripts and shared tools must have corresponding
 unit tests.
 
 ---
