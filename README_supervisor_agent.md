@@ -1,9 +1,9 @@
-# Supervisor Agent
+# supervisor
 
-The `supervisor-agent` is the single entry point for running all Bamboo MCP
-Services together.  It starts every other agent as a child subprocess, monitors
+The `supervisor` is the single entry point for running all Bamboo MCP
+Services together.  It starts every other script as a child subprocess, monitors
 them, and keeps them running — so operators do not need to know about individual
-agents or their command-line flags.
+scripts or their command-line flags.
 
 ---
 
@@ -28,15 +28,15 @@ and are given 30 seconds to exit cleanly before SIGKILL is sent.
 
 ## How it works
 
-The supervisor manages each agent in one of two modes:
+The supervisor manages each script in one of two modes:
 
 ### Daemon mode
 
-The agent process runs indefinitely.  The supervisor polls it every
+The script process runs indefinitely.  The supervisor polls it every
 `health_poll_interval_s` seconds (default: 30 s).  If the process exits for any
 reason, the supervisor restarts it.
 
-Rapid restarts trigger **exponential back-off**: if an agent crashes more than
+Rapid restarts trigger **exponential back-off**: if a script crashes more than
 three times within 60 seconds, the supervisor waits progressively longer before
 the next restart attempt (5 s → 10 s → 20 s … up to 300 s).
 
@@ -49,11 +49,11 @@ then schedules the next run.  If a run exceeds `run_timeout_s` (default:
 
 ### Dependency ordering
 
-An agent can declare a file dependency with `depends_on_file`.  The supervisor
+A script can declare a file dependency with `depends_on_file`.  The supervisor
 waits up to `depends_timeout_s` seconds (default: 120 s) for that file to
-exist before starting the agent.  This is used to ensure `cric.duckdb` is
-written by the CRIC agent before the ingestion agent tries to read it.  If the
-file does not appear in time, the agent starts anyway with a warning — it falls
+exist before starting the script.  This is used to ensure `cric.duckdb` is
+written by the CRIC script before the ingestion script tries to read it.  If the
+file does not appear in time, the script starts anyway with a warning — it falls
 back to its own defaults.
 
 ### Startup sequence (default config)
@@ -88,7 +88,7 @@ is launched.
 | `log_file` | `supervisor-agent.log` | Rotating log file (override with `--log-file`). |
 | `log_level` | `INFO` | Log verbosity (override with `--log-level`). |
 
-### Per-agent keys
+### Per-script keys
 
 | Key | Required | Description |
 |---|---|---|
@@ -97,11 +97,11 @@ is launched.
 | `command` | ✅ | Argument list passed verbatim to the OS (YAML list). |
 | `enabled` | — | `true` (default) or `false` to skip without removing the entry. |
 | `interval_s` | ✅ (scheduled) | Seconds between one-shot runs. |
-| `depends_on_file` | — | Path that must exist before this agent is started. |
+| `depends_on_file` | — | Path that must exist before this script is started. |
 | `depends_timeout_s` | — | Seconds to wait for `depends_on_file` (default: 120). |
 | `run_timeout_s` | — | Kill scheduled one-shots that run longer than this (default: `interval_s × 2`). |
 
-### Example: adding a new agent
+### Example: adding a new script
 
 ```yaml
 agents:
@@ -120,7 +120,7 @@ agents:
       - my-new-agent.log
 ```
 
-### Disabling an agent temporarily
+### Disabling a script temporarily
 
 Set `enabled: false`:
 
@@ -174,8 +174,8 @@ bamboo-supervisor --config supervisor-agent.yaml --status
 
 ### `--once`
 
-Starts all daemon agents, runs one health-poll tick (dispatching any scheduled
-agents that are due), logs the health report as JSON, then stops cleanly.
+Starts all daemon scripts, runs one health-poll tick (dispatching any scheduled
+scripts that are due), logs the health report as JSON, then stops cleanly.
 Useful for verifying the configuration end-to-end without leaving background
 processes running:
 
@@ -188,12 +188,12 @@ bamboo-supervisor --config supervisor-agent.yaml --once
 ## Log files
 
 The supervisor writes to `supervisor-agent.log` (rotating, 10 MB × 5 backups).
-Each managed agent continues writing to its own log file as specified in its
-`command` list.  Logs stay separate per agent.
+Each managed script continues writing to its own log file as specified in its
+`command` list.  Logs stay separate per script.
 
 Key events logged by the supervisor:
 
-- Start and stop of each agent subprocess (with PID).
+- Start and stop of each script subprocess (with PID).
 - Unexpected exits and restarts, including back-off delays.
 - Scheduled one-shot dispatches and their exit codes.
 - Dependency file waits.
@@ -282,7 +282,7 @@ scheduled dispatch outcomes in real time.
 ### Future: HTTP health endpoint
 
 A lightweight HTTP endpoint (`GET /health → JSON`) is planned for remote
-deployments where operators need to query agent status without SSH access.
+deployments where operators need to query script status without SSH access.
 The data structure is already defined — `bamboo-supervisor --once` logs
 exactly what the endpoint would return.  The implementation will be a thin
 wrapper around the existing `SupervisorAgent.health()` call and will be
@@ -296,18 +296,18 @@ added in a future release.
 
 Run `pip install -e .` from the repository root to install the entry point.
 
-**An agent keeps restarting**
+**A script keeps restarting**
 
-Check the agent's own log file (e.g. `cric-agent.log`).  Back-off delays are
+Check the script's own log file (e.g. `cric-agent.log`).  Back-off delays are
 visible in `supervisor-agent.log` as `WARNING: Rapid-restart back-off for ...`.
 
 **`cric.duckdb` not found at startup**
 
 Ensure `bamboo-cric` can reach the CVMFS path configured in `cric-agent.yaml`
-(`cric_path`).  The ingestion agent will start after `depends_timeout_s` seconds
+(`cric_path`).  The ingestion script will start after `depends_timeout_s` seconds
 even if the file is missing; it will fall back to its built-in queue list.
 
-**Scheduled agent never runs**
+**Scheduled script never runs**
 
 Verify that the `command` list includes `--once`.  Without it the scheduled
 process will run indefinitely and the supervisor will wait for it to finish

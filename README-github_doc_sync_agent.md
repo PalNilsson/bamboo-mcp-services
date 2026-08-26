@@ -1,6 +1,6 @@
-# github-doc-sync-agent
+# github-doc-sync
 
-A periodic documentation sync agent that downloads changed `.md` and `.rst`
+A periodic documentation sync script that downloads changed `.md` and `.rst`
 files from one or more repositories, normalises them for RAG ingestion, and
 writes the results to a local directory.  Supported sources:
 
@@ -9,9 +9,9 @@ writes the results to a local directory.  Supported sources:
 - **Any public git repository** — GitLab, FramaGit, Bitbucket, Gitea, etc. —
   via `git clone --depth 1` with an explicit `clone_url`
 
-The agent is a **file writer only** — it does not interact with DuckDB or
+The script is a **file writer only** — it does not interact with DuckDB or
 ChromaDB directly.  Its output directory is intended to be watched by the
-[`document-monitor-agent`](./README-document_monitor_agent.md), which handles
+[`document-monitor`](./README-document_monitor_agent.md), which handles
 chunking, embedding, and ChromaDB insertion.
 
 ---
@@ -49,7 +49,7 @@ chunking, embedding, and ChromaDB insertion.
 
 ## Output structure
 
-For each configured repository the agent creates two directories under the
+For each configured repository the script creates two directories under the
 configured `destination`:
 
 ```
@@ -66,7 +66,7 @@ data/
     .sync_state.json         ← cached commit SHA, last sync time, file count
 ```
 
-The `normalized/` directory is what the `document-monitor-agent` should be
+The `normalized/` directory is what the `document-monitor` should be
 pointed at.
 
 ### Normalised file format
@@ -89,14 +89,14 @@ source links in Bamboo responses.
 
 ---
 
-## Integration with `document-monitor-agent`
+## Integration with `document-monitor`
 
-The two agents form a pipeline.  Each repo declares its target ChromaDB
+The two scripts form a pipeline.  Each repo declares its target ChromaDB
 collection via the `collection:` key in the YAML config; the document-monitor
 is then invoked with one `--watch DIR COLLECTION` pair per collection:
 
 ```
-github-doc-sync-agent                     document-monitor-agent
+github-doc-sync                           document-monitor
 ─────────────────────                     ──────────────────────
 reads collection: panda_docs     →        --watch /rag/panda_docs  panda_docs
 writes to normalized_destination          --watch /rag/bamboo_docs bamboo_docs
@@ -105,7 +105,7 @@ writes to normalized_destination          --watch /rag/bamboo_docs bamboo_docs
 /rag/rucio_docs/  (Rucio repo)    →       stores into named ChromaDB collections
 ```
 
-Neither agent needs to know about the other.  They can run as separate
+Neither script needs to know about the other.  They can run as separate
 long-lived daemons on independent tick intervals, or both be invoked with
 `--once` in a cron pipeline.
 
@@ -191,7 +191,7 @@ bamboo-github-sync --config repos.yaml --once
 With a token the limit rises to **5,000 requests per hour**.  Private
 repositories also require a token.
 
-The agent logs a confirmation at startup when `GITHUB_TOKEN` is detected.
+The script logs a confirmation at startup when `GITHUB_TOKEN` is detected.
 
 > **Note:** `GITHUB_TOKEN` is used for REST API requests only.  Git clones
 > (wikis and generic git repos) use the public HTTPS URL and do not currently
@@ -202,7 +202,7 @@ The agent logs a confirmation at startup when `GITHUB_TOKEN` is detected.
 
 ## Configuration
 
-The agent is configured via a YAML file.  The default path is:
+The script is configured via a YAML file.  The default path is:
 
 ```
 src/bamboo_mcp_services/resources/config/github-doc-sync-agent.yaml
@@ -279,11 +279,11 @@ repos:
 | `include_patterns` | — | Glob patterns (e.g. `*.md`, `docs/source/*.rst`). Only matching files are downloaded. If empty, all files are included. |
 | `exclude_patterns` | — | Glob patterns. Matching files are excluded even if they match an include pattern. |
 | `normalize_for_rag` | — | Prepend YAML frontmatter and convert RST to Markdown. Requires `normalized_destination` to be set. |
-| `collection` | — | Logical ChromaDB collection name that the normalised output of this repo should be ingested into (e.g. `panda_docs`, `bamboo_docs`). Consumed by `bamboo-document-monitor --watch`; not used by the sync agent itself. Omitting it means the document-monitor's default collection is used. |
+| `collection` | — | Logical ChromaDB collection name that the normalised output of this repo should be ingested into (e.g. `panda_docs`, `bamboo_docs`). Consumed by `bamboo-document-monitor --watch`; not used by the sync script itself. Omitting it means the document-monitor's default collection is used. |
 
 ---
 
-## Running the agent
+## Running the script
 
 ### One-shot (recommended for first use and cron)
 
@@ -380,7 +380,7 @@ Each repository stores its state in `{destination}/{owner}/{repo}/.sync_state.js
 }
 ```
 
-On each cycle the agent checks whether the HEAD SHA has changed (one API call
+On each cycle the script checks whether the HEAD SHA has changed (one API call
 for regular repos, one `git clone` for wikis and generic git repos).  If the
 SHA matches the cached value the repository is skipped entirely.  This makes
 repeated runs cheap for repositories that change infrequently.

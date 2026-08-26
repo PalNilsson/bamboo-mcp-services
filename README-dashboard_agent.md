@@ -1,8 +1,8 @@
-# Dashboard Agent
+# dashboard
 
-The `dashboard-agent` serves a live, dark-themed web UI for monitoring Bamboo MCP Services.  It starts a lightweight [FastAPI](https://fastapi.tiangolo.com/) / [uvicorn](https://www.uvicorn.org/) HTTP server in a background daemon thread and exposes REST endpoints that the single-page dashboard polls on a configurable auto-refresh interval.
+The `dashboard` serves a live, dark-themed web UI for monitoring Bamboo MCP Services.  It starts a lightweight [FastAPI](https://fastapi.tiangolo.com/) / [uvicorn](https://www.uvicorn.org/) HTTP server in a background daemon thread and exposes REST endpoints that the single-page dashboard polls on a configurable auto-refresh interval.
 
-No additional ingestion or processing is performed — the dashboard is **read-only** and queries the DuckDB databases written by the other agents (`jobs.duckdb` from the ingestion agent, `cric.duckdb` from the CRIC agent).
+No additional ingestion or processing is performed — the dashboard is **read-only** and queries the DuckDB databases written by the other scripts (`jobs.duckdb` from the ingestion script, `cric.duckdb` from the CRIC script).
 
 ---
 
@@ -72,12 +72,12 @@ bamboo-dashboard [OPTIONS]
 
 | Flag | Default | Description |
 |---|---|---|
-| `--jobs-db PATH` | `jobs.duckdb` | Path to the ingestion agent's DuckDB file |
-| `--cric-db PATH` | `cric.duckdb` | Path to the CRIC agent's DuckDB file |
+| `--jobs-db PATH` | `jobs.duckdb` | Path to the ingestion script's DuckDB file |
+| `--cric-db PATH` | `cric.duckdb` | Path to the CRIC script's DuckDB file |
 | `--host ADDR` | `0.0.0.0` | HTTP server bind address |
 | `--port PORT` | `8080` | HTTP server port |
 | `--refresh SECONDS` | `30` | Dashboard client auto-refresh interval |
-| `--tick-interval SECONDS` | `15.0` | Agent health-check interval (server thread liveness) |
+| `--tick-interval SECONDS` | `15.0` | Health-check interval (server thread liveness) |
 | `--log-file PATH` | `dashboard-agent.log` | Rotating log file; pass `''` to disable |
 | `--log-level LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR` |
 | `--once` | — | Start, verify server is up, print URL, then exit |
@@ -86,7 +86,7 @@ bamboo-dashboard [OPTIONS]
 
 ## Running under the supervisor
 
-Add the following block to your `supervisor-agent.yaml` to have the supervisor manage the dashboard alongside the other agents:
+Add the following block to your `supervisor-agent.yaml` to have the supervisor manage the dashboard alongside the other scripts:
 
 ```yaml
 - name: dashboard
@@ -109,12 +109,12 @@ The supervisor will restart the dashboard automatically if it exits unexpectedly
 
 ## Design notes
 
-**Read-only DuckDB connections** — every query opens a `read_only=True` connection, executes the query, and closes immediately.  This is safe to run alongside a writing agent because DuckDB's MVCC ensures consistent committed snapshots for read-only connections.
+**Read-only DuckDB connections** — every query opens a `read_only=True` connection, executes the query, and closes immediately.  This is safe to run alongside a writing script because DuckDB's MVCC ensures consistent committed snapshots for read-only connections.
 
-**Background thread model** — uvicorn runs in a daemon thread started by `_start_impl`.  The agent's `_tick_impl` simply verifies the thread is still alive; if it has died, a `RuntimeError` is raised so the supervisor can restart the process.
+**Background thread model** — uvicorn runs in a daemon thread started by `_start_impl`.  The script's `_tick_impl` simply verifies the thread is still alive; if it has died, a `RuntimeError` is raised so the supervisor can restart the process.
 
 **Static HTML, no build step** — the dashboard UI is a self-contained `static/index.html` file served directly by FastAPI.  It imports Tailwind CSS and Chart.js from CDNs.  No Node.js, bundler, or build pipeline is required.
 
 **`__REFRESH_INTERVAL__` substitution** — the HTML template contains the literal string `__REFRESH_INTERVAL__` which is replaced at serve time with the configured `--refresh` value before sending the response.  This keeps the refresh interval as a single source of truth in the Python config.
 
-**Graceful shutdown** — `_stop_impl` sets `uvicorn.Server.should_exit = True` and joins the thread with a 5-second timeout before returning.  SIGTERM is forwarded to `agent.stop()` by the CLI signal handler.
+**Graceful shutdown** — `_stop_impl` sets `uvicorn.Server.should_exit = True` and joins the thread with a 5-second timeout before returning.  SIGTERM is forwarded to `script.stop()` by the CLI signal handler.

@@ -17,6 +17,7 @@
 | `github-doc-sync` | ✅ Ready |
 | `supervisor` | ✅ Ready |
 | `dashboard` | ✅ Ready |
+| `core-reaper` | ✅ Ready (report-only) |
 | `dast` | 📋 Planned |
 | `index-builder` | 📋 Planned |
 | `feedback` | 📋 Planned |
@@ -177,6 +178,22 @@ Open `http://localhost:8080` in any browser to view live job metrics, queue stat
 
 Full documentation: [README-dashboard_agent.md](./README-dashboard_agent.md)
 
+#### Report reclaimable core-dump workspaces (`core-reaper`)
+
+```bash
+# One sweep of $BAMBOO_CORE_ANALYSIS_ROOT (default /tmp/bamboo/core-analysis):
+bamboo-core-reaper --once
+
+# Machine-readable, for monitoring:
+bamboo-core-reaper --once --format json
+```
+
+This script **removes nothing** — it logs `I could have removed: <path>` for
+every workspace that passes its safety rules and path guard.  Exit code 3 means
+usage is above the pressure threshold and someone needs to free space by hand.
+
+Full documentation: [README-core_reaper.md](./README-core_reaper.md)
+
 ## Scripts
 
 ### `document-monitor` ✅ Ready
@@ -288,6 +305,28 @@ Key features:
 
 → [Full documentation](./README-dashboard_agent.md)
 
+### `core-reaper` ✅ Ready (report-only)
+
+Reports which PanDA core-dump analysis workspaces could be reclaimed under
+`$BAMBOO_CORE_ANALYSIS_ROOT`.  Core dumps are routinely 1 GB each and Bamboo
+MCP deliberately never deletes them, so an unattended node fills up until its
+byte quota starts refusing new analyses.  This script makes that visible before
+it happens.
+
+**It removes nothing.**  There is no `--apply` flag and no deletion code in the
+module — a unit test parses the module's own AST to enforce that.  Deletion
+will only be enabled once these reports have been reviewed against real
+production data.
+
+Key features:
+- Four independent safety rules: terminal state, retention age, slot ownership, and worker liveness (checked via `/proc`, never by signalling)
+- A path guard with a hardcoded `/tmp/bamboo` allowlist, symlink rejection, shape and filesystem checks — exercised on every candidate so it is proven before it ever gates a deletion
+- Prune (report `job/` only, preserving the manifest and the small diagnostic files) or purge (whole workspace)
+- Quota-pressure pass that relaxes the retention age — and only the retention age — when usage approaches the ceiling
+- `--format json` and a distinct exit code for "still over the threshold"
+
+→ [Full documentation](./README-core_reaper.md)
+
 ### `dast` 📋 Planned
 
 Will extract DAST help-list email threads (e.g. via Outlook), convert them into structured JSON, and run a daily digest pass producing cleaned Q/A pairs, thread summaries, tags, and resolution status. Output feeds RAG corpora and optional fine-tuning datasets.
@@ -350,6 +389,7 @@ bamboo-mcp-services/
 ├─ README-cric_agent.md
 ├─ README-github_doc_sync_agent.md
 ├─ README-dashboard_agent.md
+├─ README-core_reaper.md
 ├─ CHANGELOG.md
 ├─ pyproject.toml
 ├─ requirements.txt
@@ -389,6 +429,9 @@ bamboo-mcp-services/
 │     │  │  ├─ agent.py               # DashboardAgent, DashboardConfig, FastAPI app
 │     │  │  ├─ cli.py                 # bamboo-dashboard entry point
 │     │  │  └─ static/index.html      # single-page monitoring dashboard
+│     │  ├─ core_reaper_agent/
+│     │  │  ├─ agent.py               # CoreReaperAgent, path guard, classification
+│     │  │  └─ cli.py                 # bamboo-core-reaper (report-only)
 │     │  ├─ dummy_agent/
 │     │  ├─ dast_agent/              # planned
 │     │  ├─ index_builder_agent/     # planned
@@ -397,6 +440,7 @@ bamboo-mcp-services/
 │     ├─ plugin/                     # Bamboo MCP plugin adapter
 │     └─ resources/
 │        └─ config/
+│           ├─ core-reaper-agent.yaml
 │           ├─ ingestion-agent.yaml
 │           ├─ cric-agent.yaml
 │           ├─ github-doc-sync-agent.yaml
@@ -408,6 +452,7 @@ bamboo-mcp-services/
 │     ├─ github_doc_sync_agent/
 │     ├─ supervisor_agent/
 │     │  └─ test_supervisor_agent.py
+│     ├─ core_reaper_agent/
 │     ├─ dummy_agent/
 │     └─ test_base_agent.py
 └─ .github/

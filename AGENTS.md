@@ -18,6 +18,7 @@ the Bamboo Toolkit, supporting ATLAS Experiment computing operations at CERN.
 | `github-doc-sync-agent` | ✅ Ready | `bamboo-github-sync` |
 | `supervisor-agent` | ✅ Ready | `bamboo-supervisor` |
 | `dashboard-agent` | ✅ Ready | `bamboo-dashboard` |
+| `core-reaper-agent` | ✅ Ready (report-only) | `bamboo-core-reaper` |
 | `dast-agent` | 📋 Planned | — |
 
 ---
@@ -558,3 +559,94 @@ contains `.md`/`.rst` files written by `bamboo-github-sync`.
 **supervisor agent not restarting a crashed daemon** — check
 `supervisor-agent.log` for `Rapid-restart back-off` warnings.  The back-off
 resets when the supervisor itself is restarted.
+
+---
+
+## core_reaper_agent — key design decisions
+
+**Terminology**: internally this is an ordinary `Agent` subclass and lives in
+`agents/core_reaper_agent/`.  In user-facing documentation it is a *script*
+called `core-reaper`; never call it an agent there.  The same split applies to
+every other script in this repository — see "Terminology" below.
+
+**It removes nothing, and cannot.**  The module contains no `shutil.rmtree`,
+no `os.remove`/`unlink`/`rmdir`, no `subprocess`, no writable `open()`, and
+`os.open` only with `O_RDONLY`.  There is no `--apply` flag.  Every candidate
+produces a log line beginning `I could have removed:` instead.
+`TestNoDeletionInvariant` in `tests/agents/core_reaper_agent/` parses the
+module's AST and fails if any of that changes; it also asserts that a full
+sweep leaves the tree byte-for-byte identical.  Those tests are the deliberate
+gate for the day deletion is enabled — do not weaken them incidentally.
+
+**The path guard is built now and gates reporting.**
+`assert_reclaimable_path()` is the single choke point: hardcoded `/tmp/bamboo`
+allowlist, strict containment under the configured root, no symlink in any
+component below the root, forbidden/too-shallow paths, name shape
+(`job-<digits>` or `<job-N>/job`), same filesystem, and reserved names.  Every
+reported candidate passes through it, so the guard is exercised against real
+production layouts long before it ever gates an unlink.  A future `--apply`
+calls it immediately before each deletion and nowhere else.
+
+**The allowlist is hardcoded on purpose** — no flag, no environment variable.
+A root outside it (e.g. `/data/bamboo/tmp`) still gets a usage report, but
+every candidate is refused and logged.  Widening it is a code change with a
+review.  `assert_reclaimable_path()` takes `allowed_prefixes` as a defaulted
+parameter resolved *at call time* purely so unit tests can drive it against
+`tmp_path`; nothing at runtime passes that argument.
+
+**Four safety rules, checked independently**: terminal `state`, retention age,
+not the `.busy.lock` holder, and no live `worker_pid`.  Rules 1 and 4 are not
+interchangeable — a stale manifest can show a non-terminal state with a dead
+PID, and Bamboo MCP's own `reconcile_state` owns that case.
+
+**Workers are never signalled.**  Liveness is `/proc/<pid>` existence, falling
+back to `os.kill(pid, 0)` only off Linux.  PID reuse can only make the check
+over-report liveness, which is the safe direction.
+
+**`.busy.lock` — flock vs. content**: the `fcntl.flock` guards only the
+read-modify-write and is held for microseconds; the file's *content* is the
+ownership record and outlives both the flock and the writing process.  Holding
+the flock is not holding the slot.  The reaper takes the flock only for the
+duration of the read, opens the file read-only, and never creates, rewrites or
+removes it.  Stale-slot clearing is deliberately not implemented — it would be
+a write.
+
+**Retention defaults are deliberately short** (1 h normal, 24 h for
+manifest-less workspaces).  Several people analysing 1 GB core dumps on a
+shared node fill a disk fast, and since nothing is deleted the setting only
+controls visibility.
+
+**Pressure relaxes the age rule and nothing else.**  When usage reaches
+`pressure_pct` of `BAMBOO_CORE_ANALYSIS_QUOTA_BYTES`, a second pass walks
+age-blocked workspaces oldest-first until projected usage falls below
+`target_pct`.  State, slot ownership and liveness are re-checked identically,
+and `min_age_floor_hours` stops pressure reaching a run that just finished.
+
+**Sizing mirrors Bamboo MCP**: `rglob("*")`, symlinks skipped, unreadable
+entries ignored, `st_size` summed.  `st_size` rather than `st_blocks` keeps the
+arithmetic identical to `check_quota()`, at the cost of overstating sparse
+cores.
+
+**Constants are duplicated, not imported.**  `bamboo-mcp` and
+`bamboo-mcp-services` stay fully independent — no cross-package imports in
+either direction — so `MANIFEST_NAME`, `LOCK_NAME`, states and the quota
+variable are mirrored here.  An unknown `manifest_version` is refused rather
+than guessed at, which is what makes that duplication safe if the two drift.
+
+**Exit code 3** means usage is above the pressure threshold *and* reclaimable
+space was found.  While the script is report-only that is the actionable
+signal; wire it to an alert.
+
+---
+
+## Terminology
+
+Internally — package names, class names, `agents/base.py`, this file,
+`AGENTS.md`, `CONTRIBUTING.md` — everything is still an **agent**.  The
+`Agent` ABC is unchanged and new work subclasses it as before.
+
+In user-facing documentation (`README*.md`) they are **scripts**, and the
+collection is **services**.  Identifiers keep their names regardless of which
+document they appear in: `supervisor-agent.yaml`, its `agents:` key,
+`cric-agent.log`, `core-reaper-agent.yaml`, config filenames and CLI flags are
+never rewritten in prose.

@@ -127,3 +127,27 @@ agents:
       - --once
       - --log-file
       - document-monitor-agent.log
+
+  # ── core-reaper ─────────────────────────────────────────────────────────────
+  # Reports reclaimable PanDA core-dump analysis workspaces under
+  # $BAMBOO_CORE_ANALYSIS_ROOT (default /tmp/bamboo/core-analysis).  Core dumps
+  # are routinely 1 GB each and Bamboo MCP never deletes them, so an unattended
+  # node fills up until someone clears the directory by hand.
+  #
+  # This build REMOVES NOTHING.  It logs "I could have removed: <path>" for
+  # every workspace that passes the safety rules and the path guard, so the
+  # decisions can be reviewed against real production data before any deletion
+  # code is written.  There is no --apply flag to enable.
+  #
+  # Runs as a scheduled one-shot every hour; a sweep is read-only and cheap.
+  - name: core-reaper
+    enabled: true
+    mode: scheduled
+    interval_s: 3600
+    command:
+      - bamboo-core-reaper
+      - --config
+      - src/bamboo_mcp_services/resources/config/core-reaper-agent.yaml
+      - --once
+      - --log-file
+      - core-reaper-agent.log

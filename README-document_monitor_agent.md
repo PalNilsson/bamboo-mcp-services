@@ -1,6 +1,6 @@
-# document_monitor_agent
+# document-monitor
 
-A production-oriented agent that watches one or more directories for new or changed documents, extracts and chunks text, computes deterministic chunk IDs, embeds chunks, and stores vectors and metadata in named ChromaDB collections.
+A production-oriented script that watches one or more directories for new or changed documents, extracts and chunks text, computes deterministic chunk IDs, embeds chunks, and stores vectors and metadata in named ChromaDB collections.
 
 ---
 
@@ -53,9 +53,9 @@ The file `<chroma-dir>/collection_routing.json` records the current live slot fo
 }
 ```
 
-It is written with a write-then-`os.replace` pattern, so it is never partially written.  **The sidecar is only written by `commit_swap()` after ingestion has completed successfully** — it is never written at agent startup.  This guarantees the sidecar always points at a slot that has been populated; a sidecar entry is not created until the first ingestion cycle completes.
+It is written with a write-then-`os.replace` pattern, so it is never partially written.  **The sidecar is only written by `commit_swap()` after ingestion has completed successfully** — it is never written at script startup.  This guarantees the sidecar always points at a slot that has been populated; a sidecar entry is not created until the first ingestion cycle completes.
 
-**Routing invariant:** for every entry `L → P` in the sidecar, the physical collection `P` must exist in ChromaDB and contain at least one document.  The agent verifies this invariant at the end of every successful ingestion cycle and logs ERROR if it is violated.
+**Routing invariant:** for every entry `L → P` in the sidecar, the physical collection `P` must exist in ChromaDB and contain at least one document.  The script verifies this invariant at the end of every successful ingestion cycle and logs ERROR if it is violated.
 
 #### Verifying the sidecar manually
 
@@ -96,7 +96,7 @@ With the blue/green design this can never corrupt live data:
 
 - The idle slot is **always deleted and recreated** (`delete_collection` + `create_collection`) before any new vectors are written into it.  No dimension is inherited.
 - If the write into the idle slot fails for any reason — including a dimension mismatch — the idle slot is cleaned up and the **live slot remains untouched and queryable**.
-- The agent logs the error and retries on the next poll cycle.
+- The script logs the error and retries on the next poll cycle.
 
 ### Replace-on-change strategy
 
@@ -153,7 +153,7 @@ pip install -e .
 
 ---
 
-## Running the agent
+## Running the script
 
 ### One-shot with multiple watch pairs (recommended)
 
@@ -214,7 +214,7 @@ python -m bamboo_mcp_services.agents.document_monitor_agent.cli \
   --watch /abs/path/to/docs panda_docs --chroma-dir .chromadb --once
 ```
 
-> **First run on a new machine:** the agent loads the embedding model from local
+> **First run on a new machine:** the script loads the embedding model from local
 > cache. On a fresh machine, trigger the download by running with
 > `HF_HUB_OFFLINE=0`:
 > ```bash
@@ -223,7 +223,7 @@ python -m bamboo_mcp_services.agents.document_monitor_agent.cli \
 > ```
 
 > **Air-gapped machines (no outbound internet):** use `--model-path` to point
-> directly at the cached model directory.  This prevents the agent from falling
+> directly at the cached model directory.  This prevents the script from falling
 > back to a `DummyEmbedder` that silently writes zero-vector embeddings:
 > ```bash
 > bamboo-document-monitor \
@@ -231,7 +231,7 @@ python -m bamboo_mcp_services.agents.document_monitor_agent.cli \
 >   --model-path /data/models/sentence-transformers/all-MiniLM-L6-v2 \
 >   --chroma-dir .chromadb --once
 > ```
-> If the model cannot be loaded from the given path the agent exits immediately
+> If the model cannot be loaded from the given path the script exits immediately
 > with a clear error instead of corrupting ChromaDB.
 
 > **Always use absolute paths** for `--watch` directories and `--chroma-dir` to
@@ -278,15 +278,15 @@ for col in client.list_collections():
 
 ## Adding PDF documents
 
-Drop `.pdf` files directly into the watch directory (or any subdirectory of it).  The agent picks them up on the next poll cycle.
+Drop `.pdf` files directly into the watch directory (or any subdirectory of it).  The script picks them up on the next poll cycle.
 
 ### Text-based PDFs (the normal case)
 
-PDFs authored digitally — exported from Word, LaTeX, or a PDF printer — contain an embedded text layer.  The agent extracts this layer with `pdfminer.six`, chunks the result, and ingests it exactly as it would a `.txt` or `.md` file.
+PDFs authored digitally — exported from Word, LaTeX, or a PDF printer — contain an embedded text layer.  The script extracts this layer with `pdfminer.six`, chunks the result, and ingests it exactly as it would a `.txt` or `.md` file.
 
 ### Verifying chunks after ingestion
 
-After a PDF is ingested, the agent logs a chunk-quality summary so you can confirm the extraction produced sensible text:
+After a PDF is ingested, the script logs a chunk-quality summary so you can confirm the extraction produced sensible text:
 
 ```
 INFO chunk quality [my_paper.pdf]: 12 chunk(s), 34210 chars total — min=1823 median=3001 max=3110 — first: "Abstract — We present a new approach to distributed job scheduling…"
@@ -323,7 +323,7 @@ for i, (doc, meta) in enumerate(zip(results["documents"], results["metadatas"]))
 
 ### Scanned PDFs (image-only, no text layer)
 
-A scanned PDF has no embedded text; `pdfminer.six` returns an empty string.  The agent emits a `DEBUG` log line and skips the file:
+A scanned PDF has no embedded text; `pdfminer.six` returns an empty string.  The script emits a `DEBUG` log line and skips the file:
 
 ```
 DEBUG PDF has no extractable text layer (scanned or image-only?): /path/to/scan.pdf — skipping.
@@ -343,7 +343,7 @@ ocrmypdf /data/bamboo/rag/bamboo_docs/scan.pdf \
 ocrmypdf /path/to/scan.pdf /data/bamboo/rag/bamboo_docs/scan_ocr.pdf
 ```
 
-Once the OCR'd file is in the watch directory the agent will pick it up on the next poll cycle.
+Once the OCR'd file is in the watch directory the script will pick it up on the next poll cycle.
 
 > **Tip:** `ocrmypdf` is idempotent — running it on a PDF that already has a text layer is safe; it will add OCR only to pages that need it.
 
@@ -356,8 +356,8 @@ Re-ingestion is required when:
 - You change `--chunk-size` or `--chunk-overlap` (existing chunks remain at the old size until wiped).
 - The ChromaDB index becomes corrupted or out of sync with the SQLite metadata.
 - You want to start fresh after adding or removing documents.
-- The agent previously ran with `DummyEmbedder` (zero vectors) — see [Embedding troubleshooting](#embedding-troubleshooting).
-- You are upgrading from a version of the agent that predates the blue/green routing (collections named `atlas_docs` rather than `atlas_docs__a` / `atlas_docs__b`) — see note below.
+- The script previously ran with `DummyEmbedder` (zero vectors) — see [Embedding troubleshooting](#embedding-troubleshooting).
+- You are upgrading from a version of the script that predates the blue/green routing (collections named `atlas_docs` rather than `atlas_docs__a` / `atlas_docs__b`) — see note below.
 
 To re-ingest cleanly:
 
@@ -365,15 +365,15 @@ To re-ingest cleanly:
 # 1. Wipe the vector store, routing sidecar, and checkpoint
 rm -rf .chromadb .document_monitor/checkpoints.json
 
-# 2. Re-run the agent — it will process all files from scratch into slot __a
+# 2. Re-run the script — it will process all files from scratch into slot __a
 bamboo-document-monitor \
   --watch /abs/path/to/docs my_collection \
   --chroma-dir /abs/path/to/.chromadb \
   --once
 ```
 
-> **Upgrading from a pre-blue/green version:** the old agent wrote vectors into
-> a collection named exactly `<collection>` (e.g. `atlas_docs`).  The new agent
+> **Upgrading from a pre-blue/green version:** the old script wrote vectors into
+> a collection named exactly `<collection>` (e.g. `atlas_docs`).  The new script
 > uses `atlas_docs__a` / `atlas_docs__b` and will not find or use the old
 > collection.  After wiping and re-ingesting, the old `atlas_docs` collection
 > can be deleted manually:
@@ -387,7 +387,7 @@ bamboo-document-monitor \
 
 ## Embedding troubleshooting
 
-The agent logs a warning and falls back to `DummyEmbedder` (zero vectors) if
+The script logs a warning and falls back to `DummyEmbedder` (zero vectors) if
 the embedding stack is not correctly installed:
 
 ```
@@ -395,7 +395,7 @@ WARNING ... Local HF instantiation failed (will try hub or dummy): ...
 WARNING ... Falling back to DummyEmbedder for embeddings (no HF available).
 ```
 
-**This is a silent data corruption issue** — the agent completes successfully,
+**This is a silent data corruption issue** — the script completes successfully,
 files are marked as ingested in the checkpoint, and ChromaDB is populated, but
 all vectors are zero.  Similarity search will return garbage results.  Any
 ChromaDB data ingested while `DummyEmbedder` was active must be deleted and
@@ -403,7 +403,7 @@ re-ingested after fixing the embedding stack.
 
 **On air-gapped machines** (no outbound internet, such as `aipanda033`): use
 `--model-path` to point at the locally cached model directory.  When
-`--model-path` is set, any load failure causes the agent to exit immediately
+`--model-path` is set, any load failure causes the script to exit immediately
 with a clear error rather than falling back to `DummyEmbedder`:
 
 ```bash

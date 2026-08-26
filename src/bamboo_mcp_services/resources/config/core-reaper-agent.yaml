@@ -1,0 +1,61 @@
+# Core-dump workspace reaper configuration
+#
+# Reports reclaimable PanDA core-dump analysis workspaces under the analysis
+# root.  This version REMOVES NOTHING — it logs "I could have removed: ..."
+# for every candidate and exits.  There is no --apply flag.
+#
+# Minimal one-shot run:
+#   bamboo-core-reaper --once
+#
+# Every key below can also be given on the command line, which wins over this
+# file.  A missing config file is not an error.
+
+# Analysis root to sweep.  When unset, $BAMBOO_CORE_ANALYSIS_ROOT is used,
+# falling back to /tmp/bamboo/core-analysis.
+#
+# The reaper refuses to report candidates outside the hardcoded allowlist in
+# agent.py (currently /tmp/bamboo only).  A deployment that moves the root
+# elsewhere needs a reviewed code change, not a config change.
+# root: /tmp/bamboo/core-analysis
+
+# Minimum age, in hours, before a completed or failed workspace is reported.
+# Deliberately aggressive: a 1 GB core dump per analysis fills a shared node
+# quickly, and nothing is deleted anyway — this only controls visibility.
+min_age_hours: 1.0
+
+# Workspaces with no manifest at all are ambiguous (possibly a run that
+# crashed between mkdir and the first manifest write), so they need a much
+# longer idle period before being reported, and are logged with the distinct
+# reason code "orphan-no-manifest".
+orphan_age_hours: 24.0
+
+# prune: report <workspace>/job only, preserving the manifest, evidence.json,
+#        gdb_raw.txt and worker.log — kilobytes that are the entire diagnostic
+#        record of the run, while job/ holds essentially all of the bytes.
+# purge: report the whole workspace.
+mode: prune
+
+# In prune mode, escalate to whole-workspace removal for failed runs older
+# than this many hours.  Leave unset to disable the escalation.
+# purge_failed_after_hours: 168.0
+
+# Quota ceiling used for pressure calculations.  When unset,
+# $BAMBOO_CORE_ANALYSIS_QUOTA_BYTES is used, falling back to 50 GiB — the same
+# figure Bamboo MCP's check_quota() refuses new analyses at.
+# quota_bytes: 53687091200
+
+# When usage reaches pressure_pct of the quota, a second pass reports older
+# workspaces that the retention age would otherwise have spared, until the
+# projected usage falls below target_pct.  Pressure relaxes the age rule and
+# nothing else: terminal state, slot ownership and worker liveness are always
+# enforced.
+pressure_pct: 80.0
+target_pct: 60.0
+
+# Hard floor the pressure pass may never go below, so an analysis that
+# finished moments ago is never reported.
+min_age_floor_hours: 0.5
+
+# Seconds between sweeps in daemon mode.  Under the supervisor the reaper runs
+# in scheduled mode with --once instead, and this value is unused.
+tick_interval_s: 3600.0

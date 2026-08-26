@@ -1,6 +1,6 @@
-# ingestion-agent
+# ingestion
 
-A periodic data ingestion agent that downloads job metadata from the [BigPanda](https://bigpanda.cern.ch) monitoring service for a configured list of ATLAS computing queues and persists the data in a local [DuckDB](https://duckdb.org) database for downstream use by Bamboo / AskPanDA.
+A periodic data ingestion script that downloads job metadata from the [BigPanda](https://bigpanda.cern.ch) monitoring service for a configured list of ATLAS computing queues and persists the data in a local [DuckDB](https://duckdb.org) database for downstream use by Bamboo / AskPanDA.
 
 ---
 
@@ -42,7 +42,7 @@ print(table_names())        # ['jobs', 'selectionsummary', 'errors_by_count']
 
 One row per PanDA job. Primary key: `pandaid`.
 
-All columns from the BigPanda `jobs1h` API response are represented. Columns that are always `null` in the current API sample are stored as `VARCHAR` to accommodate future data. Two bookkeeping columns are added by the agent:
+All columns from the BigPanda `jobs1h` API response are represented. Columns that are always `null` in the current API sample are stored as `VARCHAR` to accommodate future data. Two bookkeeping columns are added by the script:
 
 | Column | Type | Description |
 |---|---|---|
@@ -58,8 +58,8 @@ All columns from the BigPanda `jobs1h` API response are represented. Columns tha
 | `piloterrorcode` | `INTEGER` | Pilot error code (0 = no error) |
 | `piloterrordiag` | `VARCHAR` | Pilot error diagnostic string |
 | *(~100 further columns)* | | See `schema.py` for the full list |
-| `_queue` | `VARCHAR` | Ingestion agent bookkeeping: source queue name |
-| `_fetched_utc` | `TIMESTAMP` | Ingestion agent bookkeeping: fetch timestamp |
+| `_queue` | `VARCHAR` | Ingestion script bookkeeping: source queue name |
+| `_fetched_utc` | `TIMESTAMP` | Ingestion script bookkeeping: fetch timestamp |
 
 ### `selectionsummary` table
 
@@ -123,7 +123,7 @@ python -c "from bamboo_mcp_services.agents.ingestion_agent.agent import Ingestio
 
 ## Configuration
 
-The agent is configured via a YAML file. The default path is:
+The script is configured via a YAML file. The default path is:
 
 ```
 src/bamboo_mcp_services/resources/config/ingestion-agent.yaml
@@ -158,7 +158,7 @@ tick_interval_s: 1.0
 
 In production, ATLAS has hundreds of computing queues. Listing them all manually
 in the YAML is impractical. The recommended approach is to point `cric_path` at
-the `cric_pandaqueues.json` file maintained by the CRIC agent on CVMFS:
+the `cric_pandaqueues.json` file maintained by the CRIC script on CVMFS:
 
 ```
 /cvmfs/atlas.cern.ch/repo/sw/local/etc/cric_pandaqueues.json
@@ -166,7 +166,7 @@ the `cric_pandaqueues.json` file maintained by the CRIC agent on CVMFS:
 
 The top-level keys of that JSON object are the PanDA queue names. When the file
 exists the `queues` list is silently ignored. If the file cannot be read (missing
-CVMFS mount, I/O error, malformed JSON), a warning is logged and the agent falls
+CVMFS mount, I/O error, malformed JSON), a warning is logged and the script falls
 back to the `queues` list — no crash.
 
 Because the full CRIC file contains ~700 queues, downloading all of them in one
@@ -208,7 +208,7 @@ Each entry under `sources` supports:
 
 ---
 
-## Running the agent
+## Running the script
 
 ### One-shot (single tick)
 
@@ -260,7 +260,7 @@ The `scripts/` directory contains standalone utility scripts that can be run dir
 
 ### `dump_ingestion_db.py` — inspect the database from the command line
 
-Dumps the contents of a `jobs.duckdb` file to stdout. Useful for quickly checking what the agent has collected without opening a DuckDB shell.
+Dumps the contents of a `jobs.duckdb` file to stdout. Useful for quickly checking what the script has collected without opening a DuckDB shell.
 
 ```bash
 # Show the first 10 rows of every table (default):
@@ -298,7 +298,7 @@ python scripts/dump_ingestion_db.py --schema-only
 
 ## Querying the database
 
-The DuckDB file can be opened directly by AskPanDA, a Jupyter notebook, or the `duckdb` CLI. The schema is guaranteed by `apply_schema()`, which is called automatically at agent startup.
+The DuckDB file can be opened directly by AskPanDA, a Jupyter notebook, or the `duckdb` CLI. The schema is guaranteed by `apply_schema()`, which is called automatically at script startup.
 
 ### DuckDB CLI
 
@@ -422,4 +422,4 @@ HTTP calls are mocked with `unittest.mock.patch` so no network access is require
 
 ## Relationship to AskPanDA / Bamboo
 
-The `jobs.duckdb` file is the handoff point between the ingestion agent and the Bamboo / AskPanDA plugin. The plugin opens the file in **read-only** mode and queries the typed tables directly. The schema module (`schema.py`) can be copied into or imported by the plugin to guarantee the expected columns are present before issuing queries.
+The `jobs.duckdb` file is the handoff point between the ingestion script and the Bamboo / AskPanDA plugin. The plugin opens the file in **read-only** mode and queries the typed tables directly. The schema module (`schema.py`) can be copied into or imported by the plugin to guarantee the expected columns are present before issuing queries.

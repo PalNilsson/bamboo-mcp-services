@@ -9,6 +9,105 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+#### `core-reaper` — report-only core-dump workspace reaper
+
+**Problem:** `atlas.core_dump_analysis` in Bamboo MCP downloads PanDA job core
+dumps — routinely 1 GB each — and never deletes anything.  That no-delete rule
+is deliberate in that codebase, so the only thing between an unattended
+deployment and a full `/tmp` is `check_quota()`, which *refuses new work*
+rather than freeing space.  When it trips, core-dump analysis stops working
+until someone clears the directory by hand.  Reaping is a separate concern and
+belongs here.
+
+**This first version removes nothing.**  It reports what it *could* have
+removed and exits.  The reasoning: the first release runs against a production
+directory holding gigabytes of someone's investigation, and a wrong path in a
+deletion loop there is unrecoverable.  So rather than a `--dry-run` default,
+the module contains no deletion code at all — no `shutil.rmtree`, no
+`os.remove`/`unlink`/`rmdir`, no `subprocess`, no writable `open()`, and
+`os.open` only with `O_RDONLY`.  There is no `--apply` flag to fumble.
+
+**New files:**
+
+- `src/bamboo_mcp_services/agents/core_reaper_agent/agent.py` — `CoreReaperAgent`
+  (an ordinary `Agent` subclass), `CoreReaperConfig`, manifest parsing, slot
+  reading, classification, and the path guard.
+- `src/bamboo_mcp_services/agents/core_reaper_agent/cli.py` — `bamboo-core-reaper`.
+- `src/bamboo_mcp_services/resources/config/core-reaper-agent.yaml` — defaults.
+- `tests/agents/core_reaper_agent/test_core_reaper_agent.py` — 116 tests.
+- `README-core_reaper.md` — full documentation.
+
+**Safety model — four rules, checked independently:** terminal `state`
+(`complete`/`failed`), age past the retention threshold, not the current
+`.busy.lock` holder, and `worker_pid` null or not alive.  Rules 1 and 4 are not
+interchangeable: a stale manifest can show a non-terminal state with a dead
+PID, and Bamboo MCP's own `reconcile_state` owns that case.  Worker liveness is
+`/proc/<pid>` existence — no signal is ever sent, matching Bamboo MCP's rule
+for the same directory.
+
+**Path guard:** `assert_reclaimable_path()` is the single choke point, and
+every *reported* candidate already passes through it, so it is exercised
+against real production layouts before it ever gates a deletion.  Checks: a
+hardcoded `/tmp/bamboo` allowlist (no flag or environment variable widens it),
+strict containment under the configured root, no symlink in any component below
+the root, forbidden and implausibly shallow targets, name shape (`job-<digits>`
+or `<job-N>/job`), same filesystem as the root, and reserved filenames.  A root
+outside the allowlist still produces a usage report but refuses every
+candidate, with an explicit ERROR naming the allowlist.
+
+**No-deletion invariant is enforced by tests, not convention:**
+`TestNoDeletionInvariant` parses the module's own AST and fails on any
+destructive call, `shutil`/`subprocess` import, writable `open()`, or non-
+`O_RDONLY` `os.open`; a companion test asserts that a full sweep leaves the
+tree byte-for-byte identical.
+
+**Reclaim modes:** prune (report `<workspace>/job` only — it holds essentially
+all the bytes, while the manifest, `evidence.json`, `gdb_raw.txt` and
+`worker.log` are kilobytes and the entire diagnostic record) is the default;
+purge (whole workspace) is opt-in, with an optional escalation for old `failed`
+runs.  Workspaces with no manifest are ambiguous and get a longer threshold and
+their own `orphan-no-manifest` reason code.
+
+**Quota pressure:** above `pressure_pct` of `BAMBOO_CORE_ANALYSIS_QUOTA_BYTES`,
+a second pass reports age-blocked workspaces oldest-first until projected usage
+falls below `target_pct`.  Pressure relaxes the age rule and nothing else, and
+`min_age_floor_hours` keeps it away from a run that just finished.
+
+**Defaults are deliberately aggressive** — 1 h retention, 24 h for
+manifest-less workspaces — because several people analysing 1 GB core dumps on
+a shared node fill a disk quickly.  Since nothing is deleted, the setting only
+controls visibility.
+
+**Supervisor:** registered in `supervisor-agent.yaml` as a `scheduled` one-shot
+every hour, and in `pyproject.toml` as `bamboo-core-reaper`.
+
+**Exit codes:** 0 clean, 1 sweep errors, 2 usage error, 3 usage above the
+pressure threshold with reclaimable space found — the actionable signal while
+the script is report-only.
+
+### Changed
+
+#### User-facing documentation no longer calls scripts "agents"
+
+**Rationale:** "agent" carries an unhelpful connotation for readers of the
+public documentation, where these are simply scripts that run on a schedule.
+The internal vocabulary is unchanged: the `Agent` ABC, the `agents/` package,
+class names, `CLAUDE.md`, `AGENTS.md` and `CONTRIBUTING.md` all keep the term.
+
+All prose in `README*.md` now says **script** (or **services** for the
+collection).  Identifiers are untouched wherever they appear —
+`supervisor-agent.yaml`, its `agents:` key, `cric-agent.log`, config filenames,
+package paths, CLI entry points and class names all keep their names, including
+inside README prose.  Per-file README *filenames* are unchanged in this
+changeset and remain to be renamed separately.
+
+**Known pre-existing issue, not fixed here:** `README.md` links to
+`README-supervisor-agent.md`, but the file on disk is `README_supervisor_agent.md`
+(underscore).  Worth correcting as part of the rename.
+
+
 ### Fixed
 
 #### `CollectionRouter` sidecar slot overwrite — multi-agent clobber bug

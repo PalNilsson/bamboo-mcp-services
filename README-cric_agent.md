@@ -1,6 +1,6 @@
-# cric-agent
+# cric
 
-A periodic ingestion agent that reads ATLAS queue metadata from the CRIC
+A periodic ingestion script that reads ATLAS queue metadata from the CRIC
 (Computing Resource Information Catalogue) and stores the latest snapshot in a
 local [DuckDB](https://duckdb.org) database for downstream use by Bamboo /
 AskPanDA.
@@ -119,7 +119,7 @@ a local copy of the JSON.
 
 ## Configuration
 
-The agent is configured via a YAML file. The default path is:
+The script is configured via a YAML file. The default path is:
 
 ```
 src/bamboo_mcp_services/resources/config/cric-agent.yaml
@@ -152,7 +152,7 @@ tick_interval_s: 60.0
 
 ---
 
-## Running the agent
+## Running the script
 
 ### One-shot (recommended for first use and testing)
 
@@ -209,7 +209,7 @@ bamboo-cric --data /data/cric.db --log-file /var/log/cric-agent.log
 ## Querying the database
 
 The DuckDB file can be opened directly by AskPanDA, a Jupyter notebook, or the
-`duckdb` CLI. The agent holds the file open in read-write mode while running;
+`duckdb` CLI. The script holds the file open in read-write mode while running;
 open it read-only from other processes to avoid conflicts.
 
 ### Installing the DuckDB CLI
@@ -316,7 +316,7 @@ from bamboo_mcp_services.common.storage.schema_annotations import (
     get_queuedata_schema_context,
 )
 
-# Open read-only while the agent may be running
+# Open read-only while the script may be running
 conn = duckdb.connect("/path/to/cric.db", read_only=True)
 
 # Fetch all online queues as a DataFrame
@@ -334,7 +334,7 @@ system_prompt = f"You have access to a CRIC queuedata database.\n{schema_context
 ## Refresh behaviour
 
 CVMFS propagates updates from the CERN stratum-0 roughly every 30 minutes,
-but the exact timing is not predictable. The agent polls every 10 minutes by
+but the exact timing is not predictable. The script polls every 10 minutes by
 default to keep the local database reasonably fresh without excessive I/O.
 
 On each poll cycle:
@@ -422,7 +422,7 @@ is required during tests.
 
 ## Relationship to AskPanDA / Bamboo
 
-The `cric.db` file is the handoff point between the agent and the Bamboo /
+The `cric.db` file is the handoff point between the script and the Bamboo /
 AskPanDA plugin. The plugin opens the file in **read-only** mode and queries
 the `queuedata` table directly. The field descriptions in
 `schema_annotations.py` are designed to be injected into LLM system prompts
