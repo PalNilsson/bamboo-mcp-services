@@ -38,6 +38,32 @@ direct output to different locations without editing the config file.
 bamboo-cric --data /path/to/cric.db
 ```
 
+### Sharing the file with readers
+
+DuckDB lets **either** one process read and write a file **or** any number of
+processes read it — never both at once.  The agent therefore opens `cric.db`
+only for the SQL part of a load: reading CVMFS, hashing and building rows all
+happen with the file closed.  It then runs `CHECKPOINT` and closes the file
+again, so the new snapshot is in `cric.db` itself rather than waiting in
+`cric.db.wal`, and other processes can open the file between loads.
+
+Earlier versions held the file open for the agent's whole lifetime, which made
+`cric.db` unreadable by any other process while `bamboo-cric` ran.
+
+If a reader holds the file when a load starts, the agent retries for about
+5 seconds (10 attempts, 0.5 s apart) and otherwise logs
+
+```
+cric_fetcher: /data/bamboo/db/cric.db is locked by another process — load deferred to the next tick (...)
+```
+
+and tries again at the next tick (60 s by default).  The same rule binds
+readers: a process that keeps a read-only connection open blocks every load.
+Open, query and close.
+
+At startup the agent opens and closes the file once, so an unwritable path or
+a lock held by another process fails `bamboo-cric` immediately.
+
 ### Table: `queuedata`
 
 One row per ATLAS computing queue. The top-level key from
@@ -316,13 +342,13 @@ from bamboo_mcp_services.common.storage.schema_annotations import (
     get_queuedata_schema_context,
 )
 
-# Open read-only while the script may be running
-conn = duckdb.connect("/path/to/cric.db", read_only=True)
-
-# Fetch all online queues as a DataFrame
-df = conn.execute(
-    "SELECT * FROM queuedata WHERE status = 'online'"
-).df()
+# Open read-only, query, close.  A connection kept open blocks the agent's
+# next load (see "Sharing the file with readers").
+with duckdb.connect("/path/to/cric.db", read_only=True) as conn:
+    # Fetch all online queues as a DataFrame
+    df = conn.execute(
+        "SELECT * FROM queuedata WHERE status = 'online'"
+    ).df()
 
 # Inject the schema summary into an LLM system prompt
 schema_context = get_queuedata_schema_context()
@@ -361,7 +387,7 @@ SELECT * FROM snapshots ORDER BY fetched_utc DESC LIMIT 10;
 
 ```
 CricAgent
-├── _start_impl()         — opens DuckDBStore, initialises CricQueuedataFetcher
+├── _start_impl()         — opens and closes the DB once (fail fast), initialises CricQueuedataFetcher
 ├── _tick_impl()
 │   └── CricQueuedataFetcher.run_cycle()
 │       ├── interval check (skip if < refresh_interval_s since last attempt)
@@ -370,11 +396,11 @@ CricAgent
 │       └── hash changed?
 │           ├── _build_rows()     — flatten JSON dict, drop _data fields
 │           ├── _infer_schema()   — dynamic type inference across all rows
-│           ├── DROP TABLE IF EXISTS queuedata
-│           ├── CREATE TABLE queuedata (...)
-│           ├── executemany INSERT
-│           └── conn.commit()
-└── _stop_impl()          — releases fetcher and DuckDB connection
+│           └── short_lived_connection(duckdb_path)   — file held only from here …
+│               ├── CREATE TABLE queuedata_staging (...) + executemany INSERT
+│               ├── atomic_swap_table(staging → queuedata)
+│               └── CHECKPOINT, close              — … to here
+└── _stop_impl()          — releases the fetcher (and the in-memory store, if any)
 ```
 
 Key modules:
@@ -384,7 +410,7 @@ Key modules:
 | `agents/cric_agent/agent.py` | Agent lifecycle, `CricAgentConfig` dataclass |
 | `agents/cric_agent/cric_fetcher.py` | File reading, hash check, DROP/CREATE/INSERT |
 | `agents/cric_agent/cli.py` | CLI entry point (`bamboo-cric`) |
-| `common/storage/duckdb_store.py` | Low-level DuckDB helpers (snapshots table) |
+| `common/storage/duckdb_store.py` | Low-level DuckDB helpers: short-lived, lock-aware connections; snapshots table |
 | `common/panda/source.py` | File fetching with SHA-256 content hashing |
 | `common/storage/schema_annotations.py` | `QUEUEDATA_FIELD_DESCRIPTIONS`, `get_queuedata_schema_context()` |
 

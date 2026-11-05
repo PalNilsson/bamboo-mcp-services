@@ -150,6 +150,9 @@ bigpanda_jobs:
   cycle_interval_s: 1800      # 30 minutes
   inter_queue_delay_s: 60     # 1 minute between queues
 
+  # Purge jobs BigPanda has not reported for this many days.  0 = keep all.
+  retention_days: 7
+
 duckdb_path: "jobs.duckdb"
 tick_interval_s: 1.0
 ```
@@ -184,12 +187,13 @@ processed per cycle.
 | `max_queues` | `0` | Maximum queues to process per cycle. `0` means no limit — all discovered queues are polled |
 | `cycle_interval_s` | `1800` | Minimum seconds between full polling cycles |
 | `inter_queue_delay_s` | `60` | Seconds to sleep between consecutive queue downloads |
+| `retention_days` | `0` (bundled YAML: `7`) | At the start of every cycle, delete rows whose `_fetched_utc` is older than this many days from `jobs`, `selectionsummary` and `errors_by_count`. `0` disables the purge. See [Retention](#retention) |
 
 ### Top-level options
 
 | Key | Default | Description |
 |---|---|---|
-| `duckdb_path` | `":memory:"` | DuckDB file path, or `":memory:"` for an ephemeral in-memory database |
+| `duckdb_path` | `":memory:"` | DuckDB file path, or `":memory:"` for an ephemeral in-memory database. See [Sharing the file with readers](#sharing-the-file-with-readers) |
 | `tick_interval_s` | `1.0` | Seconds between `tick()` calls in the run loop |
 | `sources` | `[]` | List of generic file/URL sources (see below) |
 
@@ -333,16 +337,71 @@ DESCRIBE jobs;
 
 ```python
 import duckdb
-from bamboo_mcp_services.common.storage.schema import apply_schema
 
-conn = duckdb.connect("jobs.duckdb", read_only=True)
-apply_schema(conn)  # no-op if tables already exist; ensures schema is present
-
-df = conn.execute(
-    "SELECT * FROM jobs WHERE _queue = ? ORDER BY _fetched_utc DESC",
-    ["SWT2_CPB"],
-).df()
+# Open read-only, query, close.  Do not call apply_schema() here: it issues
+# CREATE statements, which a read-only connection rejects, and the agent has
+# already created the tables.  A connection kept open blocks the agent's next
+# write (see "Sharing the file with readers").
+with duckdb.connect("jobs.duckdb", read_only=True) as conn:
+    df = conn.execute(
+        "SELECT * FROM jobs WHERE _queue = ? ORDER BY _fetched_utc DESC",
+        ["SWT2_CPB"],
+    ).df()
 ```
+
+---
+
+## Sharing the file with readers
+
+DuckDB lets **either** one process read and write a file **or** any number of
+processes read it — never both at once.  The agent therefore opens
+`jobs.duckdb` only for each queue's write transaction, then runs `CHECKPOINT`
+and closes it.  The HTTP download and the inter-queue sleep happen with the
+file closed, so other processes can read it for nearly all of a cycle, which
+takes hours across the full ATLAS queue list.
+
+Earlier versions held the file open for the agent's whole lifetime, which made
+`jobs.duckdb` unreadable by any other process while `bamboo-ingestion` ran.
+
+If a reader holds the file when a write starts, the agent retries for about
+5 seconds (10 attempts, 0.5 s apart).  After that the queue's write fails, is
+logged, and that queue is fetched again in the next cycle.  The same rule
+binds readers: open, query, close.
+
+At startup the agent opens and closes the file once, so an unwritable path or
+a lock held by another process fails `bamboo-ingestion` immediately.
+
+---
+
+## Retention
+
+`jobs` is upserted by `pandaid`, so it grows by every new job BigPanda reports
+and never shrinks by itself.  With `retention_days` set (the bundled config
+uses 7), each cycle begins by deleting, in one transaction, every row older
+than that from `jobs`, `selectionsummary` and `errors_by_count`:
+
+```
+BigPandaJobsFetcher: retention purge (older than 2026-10-28 12:00:00 UTC, 7 days): jobs=51234, selectionsummary=0, errors_by_count=0
+```
+
+The age is taken from `_fetched_utc`, which is refreshed each time BigPanda
+reports a job, so the purge removes jobs **not seen** for `retention_days`,
+not jobs created that long ago.  A row exactly `retention_days` old is kept.
+A failed purge is logged and retried at the start of the next cycle; it does
+not stop the cycle.
+
+DuckDB reuses the space a purge frees but does **not** shrink the file.  To
+reclaim space already used, stop the agent (and every reader) and copy the
+database into a new file:
+
+```bash
+python scripts/compact_duckdb.py /data/bamboo/db/jobs.duckdb /data/bamboo/db/jobs.compact.duckdb
+```
+
+The script never touches the source.  It verifies that every table has the
+same row count in the copy and prints the two `mv` commands that swap the
+files.  It refuses to overwrite an existing destination, and fails if a
+writer still holds the source.
 
 ---
 

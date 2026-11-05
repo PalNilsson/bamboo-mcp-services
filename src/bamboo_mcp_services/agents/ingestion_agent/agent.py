@@ -4,10 +4,11 @@ import json
 import uuid
 import time
 import logging
-from typing import Any, Dict, List, Optional
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional
 from dataclasses import dataclass, field
 from bamboo_mcp_services.agents.base import Agent
-from bamboo_mcp_services.common.storage.duckdb_store import DuckDBStore
+from bamboo_mcp_services.common.storage.duckdb_store import MEMORY_PATH, DuckDBStore
 from bamboo_mcp_services.common.panda.source import BaseSource, RawSnapshot
 from bamboo_mcp_services.agents.ingestion_agent.bigpanda_jobs_fetcher import (
     BigPandaJobsFetcher,
@@ -56,6 +57,9 @@ class BigPandaJobsConfig:
         cycle_interval_s: Seconds between full polling cycles (default: 30 min).
         inter_queue_delay_s: Seconds to wait between consecutive queue fetches
             within a single cycle (default: 60 s).
+        retention_days: Purge job rows not seen by BigPanda for this many days
+            at the start of every cycle.  ``0`` (the default) keeps everything;
+            the bundled YAML sets 7.
     """
     enabled: bool = True
     queues: List[str] = field(default_factory=lambda: list(DEFAULT_QUEUES))
@@ -63,6 +67,7 @@ class BigPandaJobsConfig:
     max_queues: int = 0
     cycle_interval_s: int = DEFAULT_CYCLE_INTERVAL_S
     inter_queue_delay_s: int = DEFAULT_INTER_QUEUE_DELAY_S
+    retention_days: int = 0
 
 
 @dataclass
@@ -93,6 +98,13 @@ class IngestionAgent(Agent):
     that periodically downloads per-queue job data from BigPanda and persists it
     in typed tables (``jobs``, ``selectionsummary``, ``errors_by_count``) using
     the schema from :mod:`bamboo_mcp_services.common.storage.schema`.
+
+    For a database file the agent holds no connection between writes, so other
+    processes can read the file while it runs: the fetcher opens it per queue
+    write and each generic-source write opens its own short-lived store.  Only
+    ``":memory:"`` keeps one store open for the agent's lifetime (exposed as
+    :attr:`store`), because an in-memory database does not outlive its
+    connection.
     """
 
     def __init__(self, name: str = 'ingestion-agent', config: Optional[IngestionAgentConfig] = None) -> None:
@@ -164,27 +176,56 @@ class IngestionAgent(Agent):
         return queues
 
     def _start_impl(self) -> None:
-        """Initialize the DuckDB store and the BigPanda jobs fetcher."""
-        self.store = DuckDBStore(self.config.duckdb_path)
+        """Initialise the BigPanda jobs fetcher and, for ``":memory:"``, the store.
+
+        For a database file the store is opened and closed once here, so a bad
+        path or a lock held by another process fails the start loudly, and the
+        fetcher applies the schema with its own short-lived connection.
+
+        Raises:
+            duckdb.Error: If the database file cannot be opened.
+        """
+        path = self.config.duckdb_path
+        if path == MEMORY_PATH:
+            self.store = DuckDBStore(path)
+        else:
+            DuckDBStore(path).close()
 
         bpcfg = self.config.bigpanda_jobs
         if bpcfg.enabled:
             queues = self._resolve_queues()
             logger.info(
                 "IngestionAgent: BigPanda jobs fetcher enabled – queues=%s "
-                "cycle_interval=%ds inter_queue_delay=%ds",
+                "cycle_interval=%ds inter_queue_delay=%ds retention_days=%s",
                 queues,
                 bpcfg.cycle_interval_s,
                 bpcfg.inter_queue_delay_s,
+                bpcfg.retention_days or "off",
             )
             self._bpjobs_fetcher = BigPandaJobsFetcher(
-                conn=self.store._conn,
+                conn=self.store._conn if self.store is not None else None,
                 queues=queues,
                 cycle_interval_s=bpcfg.cycle_interval_s,
                 inter_queue_delay_s=bpcfg.inter_queue_delay_s,
+                duckdb_path=None if self.store is not None else path,
+                retention_days=bpcfg.retention_days,
             )
         else:
             logger.info("IngestionAgent: BigPanda jobs fetcher disabled")
+
+    @contextmanager
+    def _store_session(self) -> Iterator[DuckDBStore]:
+        """Yield a store for one generic-source write.
+
+        Yields:
+            The lifetime in-memory store, or a short-lived store on the
+            database file that is checkpointed and closed when the block ends.
+        """
+        if self.store is not None:
+            yield self.store
+            return
+        with DuckDBStore(self.config.duckdb_path) as store:
+            yield store
 
     def tick_once(self) -> None:
         """Run a single one-shot tick with the inter-queue delay suppressed.
@@ -234,15 +275,18 @@ class IngestionAgent(Agent):
                 continue
             try:
                 raw = self._fetch_source(s)
-                aid = str(uuid.uuid4())
-                self.store.record_snapshot(aid, s.name, True, raw.content_hash, None)
                 rows = self._normalize(s, raw)
-                table = f"{s.name}_history"
-                self.store.write_table(table, rows)
+                with self._store_session() as store:
+                    store.record_snapshot(str(uuid.uuid4()), s.name, True, raw.content_hash, None)
+                    store.write_table(f"{s.name}_history", rows)
                 self._source_last[s.name] = now
             except Exception as exc:
-                if self.store:
-                    self.store.record_snapshot(str(uuid.uuid4()), s.name, False, None, str(exc))
+                logger.warning("IngestionAgent: source %r failed: %s", s.name, exc)
+                try:
+                    with self._store_session() as store:
+                        store.record_snapshot(str(uuid.uuid4()), s.name, False, None, str(exc))
+                except Exception:
+                    logger.exception("IngestionAgent: could not record the failed snapshot for %r", s.name)
 
         # Run the BigPanda jobs fetcher cycle (no-op if interval hasn't elapsed).
         if self._bpjobs_fetcher is not None:
@@ -254,9 +298,11 @@ class IngestionAgent(Agent):
                 logger.exception("IngestionAgent: BigPanda jobs fetcher cycle failed")
 
     def _stop_impl(self) -> None:
-        """Release the DuckDB store and fetcher."""
+        """Release the fetcher and close the in-memory store, if any."""
         self._bpjobs_fetcher = None
-        self.store = None
+        if self.store is not None:
+            self.store.close()
+            self.store = None
 
     def _fetch_source(self, s: SourceConfig) -> RawSnapshot:
         """Fetch data from a single source.

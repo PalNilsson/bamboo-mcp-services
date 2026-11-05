@@ -34,18 +34,35 @@ The supervisor manages each script in one of two modes:
 
 The script process runs indefinitely.  The supervisor polls it every
 `health_poll_interval_s` seconds (default: 30 s).  If the process exits for any
-reason, the supervisor restarts it.
+reason, the supervisor restarts it.  A script that fails to *launch* — most
+often because its command is not on `PATH` — is retried in exactly the same
+way, so a missing entry point shows up as a repeating ERROR rather than a
+single line followed by silence.
 
-Rapid restarts trigger **exponential back-off**: if a script crashes more than
-three times within 60 seconds, the supervisor waits progressively longer before
-the next restart attempt (5 s → 10 s → 20 s … up to 300 s).
+Repeated **fast failures** trigger exponential back-off.  An exit counts as a
+fast failure when the process had been running for less than 60 s, or never
+started at all.  The first fast failure is restarted at the next tick; each
+further one in a row doubles the wait (5 s → 10 s → 20 s … up to 300 s, rounded
+up to the next tick).  A run that lasts at least 60 s resets the count.  Each
+exit is logged once, with what happened in words:
+
+```
+Daemon agent 'cric' (pid=1716) exited with code 3 after 3s — 2 fast failures in a row, back-off: next attempt in 5s.
+```
 
 ### Scheduled mode
 
 A short-lived `--once` process is launched on a fixed interval
-(`interval_s`).  The supervisor waits for it to finish, records the exit code,
-then schedules the next run.  If a run exceeds `run_timeout_s` (default:
-`interval_s × 2`), the process is killed and the error is logged.
+(`interval_s`).  The supervisor does **not** wait for it: it records the exit
+code on the first tick after the run finishes, then schedules the next run.
+Daemons keep being monitored while a long run (a GitHub sync, an embedding
+pass) is in progress.  If a run exceeds `run_timeout_s` (default:
+`interval_s × 2`), the process is killed and the error is logged.  Both the
+completion and the timeout are noticed at tick granularity, i.e. up to
+`health_poll_interval_s` late.
+
+Every scheduled script is due on the supervisor's first tick, so each runs
+once immediately at startup rather than one interval later.
 
 ### Dependency ordering
 
@@ -141,7 +158,8 @@ Options:
   -c, --config PATH     YAML config file (default: supervisor-agent.yaml)
   --log-file PATH       Rotating log file (default: supervisor-agent.log)
   --log-level LEVEL     DEBUG / INFO / WARNING / ERROR (default: INFO)
-  --once                Run one health-poll tick then exit
+  --once                Smoke test: start, check, run scheduled scripts once, stop
+  --once-settle-s SECS  With --once: how long daemons run before the check (default: 15)
   --status              Print JSON config summary and exit (no agents started)
 ```
 
@@ -174,14 +192,36 @@ bamboo-supervisor --config supervisor-agent.yaml --status
 
 ### `--once`
 
-Starts all daemon scripts, runs one health-poll tick (dispatching any scheduled
-scripts that are due), logs the health report as JSON, then stops cleanly.
-Useful for verifying the configuration end-to-end without leaving background
-processes running:
+A smoke test of the whole configuration that leaves nothing running:
+
+1. Starts all daemon scripts and lets them run for `--once-settle-s` seconds
+   (default 15), then checks that each is still running.
+2. Runs every scheduled script once and waits for all of them to finish
+   (their `run_timeout_s` still applies).
+3. Logs the health report as JSON and stops everything.
+
+The exit status is **1** if a daemon had died by the check or a scheduled run
+exited non-zero, so the command can gate a deployment or a container build.
 
 ```bash
 bamboo-supervisor --config supervisor-agent.yaml --once
 ```
+
+The settle time matters.  A daemon stopped within milliseconds of launch is
+killed before it has installed its SIGTERM handler or opened its log file, so
+it reports nothing; earlier versions of `--once` did exactly that.  If a
+daemon is slow to start (heavy imports on a cold filesystem), raise
+`--once-settle-s`.
+
+With the full default configuration `--once` runs github-sync,
+document-monitor and core-reaper back to back, which can take many minutes.
+
+### Reading exit codes in the log
+
+Child exits are reported in words.  `exited with code 0` is a clean exit.
+`killed by SIGTERM` at shutdown, logged as a WARNING, means the child did
+**not** shut down by itself: SIGTERM's default action killed it, usually
+because it had not yet installed its handler.
 
 ---
 
@@ -299,7 +339,16 @@ Run `pip install -e .` from the repository root to install the entry point.
 **A script keeps restarting**
 
 Check the script's own log file (e.g. `cric-agent.log`).  Back-off delays are
-visible in `supervisor-agent.log` as `WARNING: Rapid-restart back-off for ...`.
+visible in `supervisor-agent.log` as `… fast failures in a row, back-off: next
+attempt in …`.  If the script's own log file does not exist at all, the script
+died before configuring logging: look in the supervisor's stdout/stderr, which
+the children inherit.
+
+**`Failed to launch daemon agent … No such file or directory`, repeating**
+
+The command is not on the supervisor's `PATH`.  The supervisor starts children
+by name, so start it from the activated environment, or put absolute paths to
+the entry points in the `command` lists.
 
 **`cric.duckdb` not found at startup**
 
@@ -310,5 +359,5 @@ even if the file is missing; it will fall back to its built-in queue list.
 **Scheduled script never runs**
 
 Verify that the `command` list includes `--once`.  Without it the scheduled
-process will run indefinitely and the supervisor will wait for it to finish
-before advancing the next-run time, effectively blocking that slot forever.
+process runs indefinitely; the supervisor never sees it finish, so it is
+killed at `run_timeout_s` every time and logged as a timeout.

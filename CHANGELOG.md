@@ -11,6 +11,35 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+#### Retention for `jobs.duckdb` (S-4)
+
+`bigpanda_jobs.retention_days`: at the start of every cycle, delete rows whose
+`_fetched_utc` is older than that from `jobs`, `selectionsummary` and
+`errors_by_count`, in one transaction.  Default `0` (off) in code; the bundled
+`ingestion-agent.yaml` sets `7`.  Deployments with their own YAML must add the
+key.  A failed purge is logged and does not stop the cycle.
+
+#### `scripts/compact_duckdb.py`
+
+DuckDB reuses space freed by deletes but never shrinks the file.  The script
+copies a stopped database into a new file, checks the row count of every
+table, and prints the `mv` commands to swap them.  It never modifies or
+replaces the source.
+
+#### `common/storage/duckdb_store.py`: lock-aware short-lived connections
+
+`short_lived_connection()`, `connect_with_retry()` and `is_lock_conflict()`.
+`is_lock_conflict()` matches DuckDB's message text ("could not set lock on
+file"), not the word "lock", because the message includes the file path.
+
+#### `tests/test_duckdb_cross_process.py` (S-6)
+
+Every lock assertion runs the other side in a real subprocess: DuckDB's lock
+is per process, so an in-process second connection shares the lock instead of
+conflicting, and no mock could have caught the defect above.  28 tests,
+covering the helpers, both agents, retention and the compaction script.
+
+
 #### `core-reaper` — report-only core-dump workspace reaper
 
 **Problem:** `atlas.core_dump_analysis` in Bamboo MCP downloads PanDA job core
@@ -89,6 +118,23 @@ the script is report-only.
 
 ### Changed
 
+#### `bamboo-supervisor --once` is a pass/fail smoke test
+
+New `--once-settle-s` option (default 15).  Exit status 1 when a daemon is not
+running after the settle time or a scheduled run exits non-zero.  Daemon state
+in the health report gains `consecutive_fast_failures`.
+
+#### `DuckDBStore` can be closed and used as a context manager
+
+`close()` checkpoints and closes (idempotent); `with DuckDBStore(path) as s:`
+closes on exit.  A file path that another process holds is retried briefly.
+
+#### Ingestion README: corrected the Python query example
+
+It called `apply_schema()` on a read-only connection, which DuckDB rejects
+(`Cannot execute statement of type "CREATE" … read-only`).
+
+
 #### User-facing documentation no longer calls scripts "agents"
 
 **Rationale:** "agent" carries an unhelpful connotation for readers of the
@@ -109,6 +155,92 @@ changeset and remain to be renamed separately.
 
 
 ### Fixed
+
+#### `bamboo-cric` and `bamboo-ingestion` locked every other process out of their databases (S-1, S-2)
+
+**Problem:** on aipanda033, with the cric daemon running under the supervisor,
+`duckdb.connect('/data/bamboo/db/cric.db', read_only=True)` from another
+process failed with `Could not set lock on file … Conflicting lock is held`.
+Both agents opened their database in `_start_impl` and held the read-write
+connection until `_stop_impl`.  DuckDB allows one read-write process *or* many
+read-only ones, never both, so Bamboo MCP could not read `cric.db` or
+`jobs.duckdb` while either agent ran.  The data also sat in the `.wal` file —
+`cric.db` kept its Oct 9 timestamp — because DuckDB only checkpoints at about
+16 MB of WAL or when the connection closes.
+
+**Fix:** a file-backed agent holds no connection between writes.
+`CricQueuedataFetcher` opens the file only for the SQL of a load (after the
+CVMFS read and row building); `BigPandaJobsFetcher` opens it only for each
+queue's write transaction (after the HTTP download, not across the
+inter-queue sleep).  Both go through the new `short_lived_connection()`,
+which retries briefly on a lock conflict, runs `CHECKPOINT` and always closes.
+The explicit `CHECKPOINT` is needed: closing a connection does not checkpoint
+while another connection in the same process shares the database.  A CRIC
+load that still finds the file locked is retried at the next tick rather than
+after the 10-minute refresh interval.  Both agents open and close the file once
+at startup so a bad path or a held lock fails immediately.  `":memory:"` keeps
+a single connection, as an in-memory database cannot outlive it.
+
+#### First CRIC load skipped for up to 10 minutes after a host reboot
+
+`CricQueuedataFetcher` used `_last_attempt = 0.0` to mean "never attempted"
+and compared it with `time.monotonic()`, which counts from boot.  Within
+`refresh_interval_s` of a reboot the first load looked recent and was skipped.
+Found because the test container had been up for 201 s.  The sentinel is now
+`None`.  (`GitHubDocSyncer` has the same pattern with a 1-hour interval and is
+not changed here.)
+
+#### Supervisor: a daemon that failed to launch was never retried (finding 1)
+
+`_poll_daemons` iterated only over processes that had started, so a command
+not on `PATH` produced one ERROR line and then nothing for the supervisor's
+lifetime.  Restarts are now driven by daemon state: a launch failure counts as
+a fast failure and is retried with back-off.
+
+#### Supervisor: back-off was inert at 30 s polling and wedged at short polling (finding 3)
+
+Back-off fired after more than three exits inside 60 s.  Exits observed 30 s
+apart never reached that, so a crash-looping daemon restarted every 30 s
+forever.  At short poll intervals the dead process handle was kept, so every
+tick during back-off recorded the *same* exit again and re-armed the back-off
+at 300 s — the daemon was never restarted (sandbox: 4 starts, 24 exit reports).
+Each exit is now recorded exactly once, and back-off counts consecutive runs
+shorter than 60 s: the first restart is immediate, then 5 s doubling to 300 s.
+
+#### Supervisor: scheduled runs blocked the whole loop (finding 2)
+
+A scheduled one-shot was waited for inside the tick, for up to its timeout
+(2 h for github-sync).  Meanwhile no daemon was polled or restarted.  Scheduled
+runs are now dispatched and reaped on later ticks; completions and timeouts are
+noticed up to one poll interval late.
+
+#### Supervisor: `--once` killed daemons before they started (finding 8)
+
+`--once` sent SIGTERM within milliseconds of launching each daemon, before it
+had installed its handler or opened its log file (`exited (rc=-15)`, no log
+file).  It now lets daemons run for `--once-settle-s` (default 15 s), checks
+they are alive, runs every scheduled agent once and waits for it, and exits 1
+if any daemon died or any run failed.
+
+#### Supervisor: signal deaths reported as clean shutdowns (finding 9)
+
+`exited (rc=-15)` was logged at INFO, followed by `Supervisor stopped cleanly`.
+Exits are now described in words (`exited with code 0`, `killed by SIGTERM`),
+and a child killed by SIGTERM at shutdown is a WARNING.
+
+#### Supervisor: children still running at the stop deadline were left alive
+
+The shutdown wait loop broke out at the deadline without sending SIGKILL to
+the remaining children.  Each child still running at the deadline is now
+killed.  In-flight scheduled runs are also signalled through their process
+handle and waited for, rather than sent SIGTERM by PID and abandoned.
+
+#### `bamboo-ingestion --max-queues` / `--inter-queue-delay` dropped other settings
+
+The overrides rebuilt `BigPandaJobsConfig` field by field, so any field not
+listed was reset to its default — which would have silently disabled
+retention.  They now use `dataclasses.replace`.
+
 
 #### `CollectionRouter` sidecar slot overwrite — multi-agent clobber bug
 

@@ -11,18 +11,42 @@ method.  On each call to :meth:`BigPandaJobsFetcher.run_cycle` the fetcher check
 whether the configured interval has elapsed since the last full cycle.  If it has, it
 iterates over all queues, downloading jobs data for each one and persisting to DuckDB.
 A short sleep is inserted between consecutive queue requests to be polite to the server.
+
+Connection lifetime
+-------------------
+Given a ``duckdb_path``, the fetcher opens the database once per queue — only
+for that queue's write transaction — and closes it again with a
+``CHECKPOINT`` (see
+:func:`~bamboo_mcp_services.common.storage.duckdb_store.short_lived_connection`).
+The HTTP download and the inter-queue sleep happen with the file closed, so
+other processes can read ``jobs.duckdb`` for nearly all of a cycle, which
+takes hours across the full ATLAS queue list.
+
+Given a ``conn`` instead, it uses that connection and never closes it.  That
+form exists for ``":memory:"`` databases and tests.
+
+Retention
+---------
+With ``retention_days > 0``, every cycle starts by deleting rows whose
+``_fetched_utc`` is older than that many days from ``jobs``,
+``selectionsummary`` and ``errors_by_count``.  ``_fetched_utc`` is refreshed
+each time BigPanda reports a job, so this removes jobs not seen for
+``retention_days``.  DuckDB reuses the freed space but does not shrink the
+file; see ``scripts/compact_duckdb.py``.
 """
 from __future__ import annotations
 
 import json
 import logging
 import time
-from datetime import datetime, timezone
-from typing import Any
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from typing import Any, Iterator, Optional
 
 import duckdb
 import requests
 
+from bamboo_mcp_services.common.storage.duckdb_store import short_lived_connection
 from bamboo_mcp_services.common.storage.schema import apply_schema
 
 logger = logging.getLogger(__name__)
@@ -39,6 +63,12 @@ DEFAULT_CYCLE_INTERVAL_S: int = 30 * 60
 #: Default wait in seconds between successive queue downloads within one cycle.
 DEFAULT_INTER_QUEUE_DELAY_S: int = 60
 
+#: Tables purged by the retention step, all keyed on ``_fetched_utc``.
+RETENTION_TABLES: tuple[str, ...] = ("jobs", "selectionsummary", "errors_by_count")
+
+#: Timestamp format used for ``_fetched_utc`` values (naive UTC).
+_TS_FORMAT = "%Y-%m-%d %H:%M:%S"
+
 
 class BigPandaJobsFetcher:
     """Downloads and persists BigPanda job data for a list of queues.
@@ -52,35 +82,55 @@ class BigPandaJobsFetcher:
         queues: List of BigPanda computing-site queue names to poll.
         cycle_interval_s: Minimum seconds between full cycles.
         inter_queue_delay_s: Seconds to sleep between consecutive queue fetches.
-        conn: Open DuckDB connection shared with the store.
+        retention_days: Rows older than this are purged at the start of each
+            cycle; ``0`` disables the purge.
     """
 
     def __init__(
         self,
-        conn: duckdb.DuckDBPyConnection,
+        conn: Optional[duckdb.DuckDBPyConnection],
         queues: list[str] | None = None,
         cycle_interval_s: int = DEFAULT_CYCLE_INTERVAL_S,
         inter_queue_delay_s: int = DEFAULT_INTER_QUEUE_DELAY_S,
+        duckdb_path: Optional[str] = None,
+        retention_days: int = 0,
     ) -> None:
-        """Initialise the fetcher.
+        """Initialise the fetcher and make sure the schema exists.
+
+        Exactly one of *conn* and *duckdb_path* must be given.
 
         Args:
-            conn: An open, writable DuckDB connection.  The fetcher does **not**
-                close this connection – lifecycle management is the caller's
-                responsibility.
+            conn: An open, writable DuckDB connection that the fetcher uses for
+                every write and does **not** close.  Pass ``None`` when giving
+                *duckdb_path*.
             queues: Queue names to poll.  Defaults to :data:`DEFAULT_QUEUES`.
             cycle_interval_s: Seconds between full polling cycles.
             inter_queue_delay_s: Seconds to sleep between individual queue fetches
                 within a single cycle.
+            duckdb_path: Database file the fetcher opens for each queue write
+                and closes again afterwards.
+            retention_days: Purge rows whose ``_fetched_utc`` is older than this
+                many days at the start of each cycle.  ``0`` keeps everything.
+
+        Raises:
+            ValueError: If both or neither of *conn* and *duckdb_path* are
+                given, or if *retention_days* is negative.
         """
+        if (conn is None) == (duckdb_path is None):
+            raise ValueError("BigPandaJobsFetcher needs exactly one of conn and duckdb_path")
+        if retention_days < 0:
+            raise ValueError(f"retention_days must be >= 0, got {retention_days}")
         self._conn = conn
+        self._duckdb_path = duckdb_path
         self.queues = queues if queues is not None else list(DEFAULT_QUEUES)
         self.cycle_interval_s = cycle_interval_s
         self.inter_queue_delay_s = inter_queue_delay_s
+        self.retention_days = retention_days
         self._last_cycle_time: float = 0.0
 
         # Ensure tables exist.
-        apply_schema(self._conn)
+        with self._writer() as c:
+            apply_schema(c)
 
     # ------------------------------------------------------------------
     # Public API
@@ -113,6 +163,14 @@ class BigPandaJobsFetcher:
             "BigPandaJobsFetcher: starting cycle for queues %s", self.queues
         )
         fetched_utc = datetime.now(timezone.utc)
+
+        if self.retention_days > 0:
+            try:
+                self.purge_expired(now_utc=fetched_utc)
+            except Exception:
+                # A failed purge must not cost a cycle of fresh data; it is
+                # retried at the start of the next cycle.
+                logger.exception("BigPandaJobsFetcher: retention purge failed")
 
         total = len(self.queues)
         for i, queue in enumerate(self.queues):
@@ -183,9 +241,60 @@ class BigPandaJobsFetcher:
             except KeyboardInterrupt:
                 raise
 
+    def purge_expired(self, now_utc: Optional[datetime] = None) -> dict[str, int]:
+        """Delete rows older than ``retention_days`` from every retention table.
+
+        All deletions run in one transaction.
+
+        Args:
+            now_utc: Reference time (timezone-aware UTC).  Defaults to now.
+
+        Returns:
+            ``{table: rows_deleted}`` for each table in :data:`RETENTION_TABLES`;
+            an empty dict when retention is disabled.
+        """
+        if self.retention_days <= 0:
+            return {}
+        now = now_utc or datetime.now(timezone.utc)
+        cutoff = (now - timedelta(days=self.retention_days)).strftime(_TS_FORMAT)
+        deleted: dict[str, int] = {}
+        with self._writer() as conn:
+            conn.execute("BEGIN")
+            try:
+                for table in RETENTION_TABLES:
+                    row = conn.execute(
+                        f"DELETE FROM {table} WHERE _fetched_utc < CAST(? AS TIMESTAMP)", [cutoff]
+                    ).fetchone()
+                    deleted[table] = int(row[0]) if row else 0
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        logger.info(
+            "BigPandaJobsFetcher: retention purge (older than %s UTC, %d days): %s",
+            cutoff, self.retention_days,
+            ", ".join(f"{t}={n}" for t, n in deleted.items()),
+        )
+        return deleted
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    @contextmanager
+    def _writer(self) -> Iterator[duckdb.DuckDBPyConnection]:
+        """Yield a writable connection for one write.
+
+        Yields:
+            The injected connection (left open), or a short-lived connection to
+            ``duckdb_path`` that is checkpointed and closed when the block ends.
+        """
+        if self._conn is not None:
+            yield self._conn
+            return
+        assert self._duckdb_path is not None  # guaranteed by __init__
+        with short_lived_connection(self._duckdb_path) as conn:
+            yield conn
 
     def _fetch_and_persist(self, queue: str, fetched_utc: datetime) -> None:
         """Download jobs JSON for *queue* and upsert into DuckDB.
@@ -219,17 +328,20 @@ class BigPandaJobsFetcher:
             len(errors),
         )
 
-        ts = fetched_utc.strftime("%Y-%m-%d %H:%M:%S")
+        ts = fetched_utc.strftime(_TS_FORMAT)
 
-        self._conn.execute("BEGIN")
-        try:
-            self._upsert_jobs(jobs, queue, ts)
-            self._insert_summary(summary, queue, ts)
-            self._insert_errors(errors, queue, ts)
-            self._conn.execute("COMMIT")
-        except Exception:
-            self._conn.execute("ROLLBACK")
-            raise
+        # The download above ran with the database closed; it is held only
+        # for this transaction.
+        with self._writer() as conn:
+            conn.execute("BEGIN")
+            try:
+                self._upsert_jobs(conn, jobs, queue, ts)
+                self._insert_summary(conn, summary, queue, ts)
+                self._insert_errors(conn, errors, queue, ts)
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     # ------------------------------------------------------------------
     # Per-table persistence helpers
@@ -282,7 +394,7 @@ class BigPandaJobsFetcher:
     })
 
     def _upsert_jobs(
-        self, jobs: list[dict[str, Any]], queue: str, ts: str
+        self, conn: duckdb.DuckDBPyConnection, jobs: list[dict[str, Any]], queue: str, ts: str
     ) -> None:
         """Upsert job rows into the ``jobs`` table using a bulk DataFrame insert.
 
@@ -294,6 +406,7 @@ class BigPandaJobsFetcher:
         one second for the same data.
 
         Args:
+            conn: Writable connection inside the queue's transaction.
             jobs: List of job dicts from the BigPanda API.
             queue: Source queue name (stored in ``_queue``).
             ts: Fetch timestamp string in ``YYYY-MM-DD HH:MM:SS`` format.
@@ -324,7 +437,7 @@ class BigPandaJobsFetcher:
         col_list = present_keys + ["_queue", "_fetched_utc"]
 
         # Build the DataFrame in one pass — much faster than row-by-row appending.
-        data = {c: [job.get(c) for job in jobs] for c in present_keys}
+        data: dict[str, Any] = {c: [job.get(c) for job in jobs] for c in present_keys}
         data["_queue"] = queue
         data["_fetched_utc"] = ts
 
@@ -332,7 +445,7 @@ class BigPandaJobsFetcher:
         cols_sql = ", ".join(col_list)
 
         # DuckDB resolves the name 'df' from the calling frame's local scope.
-        self._conn.execute(
+        conn.execute(
             f"INSERT OR REPLACE INTO jobs ({cols_sql}) SELECT {cols_sql} FROM df"
         )
 
@@ -341,18 +454,19 @@ class BigPandaJobsFetcher:
         )
 
     def _insert_summary(
-        self, summary: list[dict[str, Any]], queue: str, ts: str
+        self, conn: duckdb.DuckDBPyConnection, summary: list[dict[str, Any]], queue: str, ts: str
     ) -> None:
         """Insert selection summary rows, clearing previous rows for this queue first.
 
         Args:
+            conn: Writable connection inside the queue's transaction.
             summary: List of summary dicts from the BigPanda API.
             queue: Source queue name.
             ts: Fetch timestamp string.
         """
         import pandas as pd
 
-        self._conn.execute(
+        conn.execute(
             "DELETE FROM selectionsummary WHERE _queue = ?", [queue]
         )
         if not summary:
@@ -370,25 +484,26 @@ class BigPandaJobsFetcher:
             "_fetched_utc": ts,
         }
         df = pd.DataFrame(data)  # noqa: F841
-        self._conn.execute(
+        conn.execute(
             "INSERT INTO selectionsummary "
             "(id, field, list_json, stats_json, _queue, _fetched_utc) "
             "SELECT id, field, list_json, stats_json, _queue, _fetched_utc FROM df"
         )
 
     def _insert_errors(
-        self, errors: list[dict[str, Any]], queue: str, ts: str
+        self, conn: duckdb.DuckDBPyConnection, errors: list[dict[str, Any]], queue: str, ts: str
     ) -> None:
         """Insert error-by-count rows, clearing previous rows for this queue first.
 
         Args:
+            conn: Writable connection inside the queue's transaction.
             errors: List of error dicts from the BigPanda API.
             queue: Source queue name.
             ts: Fetch timestamp string.
         """
         import pandas as pd
 
-        self._conn.execute(
+        conn.execute(
             "DELETE FROM errors_by_count WHERE _queue = ?", [queue]
         )
         if not errors:
@@ -408,7 +523,7 @@ class BigPandaJobsFetcher:
             "_fetched_utc": ts,
         }
         df = pd.DataFrame(data)  # noqa: F841
-        self._conn.execute(
+        conn.execute(
             "INSERT INTO errors_by_count "
             "(id, error, codename, codeval, diag, error_desc_text, example_pandaid, "
             "count, pandalist_json, _queue, _fetched_utc) "

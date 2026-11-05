@@ -59,6 +59,9 @@ _DEFAULT_CONFIG = (
     "src/bamboo_mcp_services/resources/config/supervisor-agent.yaml"
 )
 
+#: Default seconds ``--once`` lets daemon agents run before checking them.
+_DEFAULT_ONCE_SETTLE_S = 15.0
+
 
 # ── Argument parser ────────────────────────────────────────────────────────────
 
@@ -102,9 +105,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--once",
         action="store_true",
         help=(
-            "Run a single health-poll tick then exit.  "
-            "Useful for smoke-testing the configuration without leaving "
-            "long-running processes behind."
+            "Smoke-test the configuration and exit: start the daemon agents, "
+            "let them run for --once-settle-s seconds, run every scheduled "
+            "agent once and wait for it to finish, then stop everything.  "
+            "Exits 1 if a daemon died or a scheduled run failed."
+        ),
+    )
+    p.add_argument(
+        "--once-settle-s",
+        type=float,
+        default=_DEFAULT_ONCE_SETTLE_S,
+        metavar="SECONDS",
+        help=(
+            "With --once: how long daemon agents run before the check "
+            "(default: %(default)s).  Too short and a daemon is stopped before "
+            "it has finished starting."
         ),
     )
     p.add_argument(
@@ -294,6 +309,50 @@ def _print_status(config_path: str) -> int:
     return 0
 
 
+# ── --once ─────────────────────────────────────────────────────────────────────
+
+def _run_once(supervisor: SupervisorAgent, settle_s: float) -> int:
+    """Run the ``--once`` smoke test on an already-started supervisor.
+
+    Daemons get *settle_s* seconds to start, because stopping one straight
+    after launch kills it before it has installed its SIGTERM handler — it
+    then reports nothing and its log file is never created.  Every scheduled
+    agent is due on the first tick, so each runs once; the supervisor waits
+    for all of them (their run timeouts still apply).
+
+    Args:
+        supervisor: A started supervisor.
+        settle_s: Seconds to let daemon agents run before checking them.
+
+    Returns:
+        ``0`` if every daemon was still running after *settle_s* and every
+        scheduled run exited with code 0; ``1`` otherwise.
+    """
+    if supervisor.daemon_names:
+        logger.info("--once: letting daemon agents run for %.0fs before checking them.", settle_s)
+        time.sleep(settle_s)
+    dead_daemons = supervisor.daemons_not_running()
+
+    supervisor.tick()                 # dispatches every scheduled agent
+    supervisor.wait_for_scheduled()   # and waits until each has finished
+
+    health = supervisor.health()
+    logger.info("--once complete. Health: %s", json.dumps(health.to_dict(), indent=2))
+
+    failed_runs = [
+        name for name, d in health.details["agents"].items()
+        if d.get("mode") == MODE_SCHEDULED and d.get("last_exit_code") != 0
+    ]
+    if dead_daemons:
+        logger.error(
+            "--once: daemon agent(s) not running after %.0fs: %s — see their own log files.",
+            settle_s, ", ".join(dead_daemons),
+        )
+    if failed_runs:
+        logger.error("--once: scheduled agent(s) failed: %s", ", ".join(failed_runs))
+    return 1 if dead_daemons or failed_runs else 0
+
+
 # ── Main entry point ───────────────────────────────────────────────────────────
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -307,7 +366,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         argv: Command-line arguments.  If ``None``, uses ``sys.argv``.
 
     Returns:
-        Exit code (0 for success, 1 for error).
+        Exit code (0 for success, 1 for error, including a failed ``--once``
+        check).
     """
     args = build_parser().parse_args(argv)
     _configure_logging(args.log_file, args.log_level)
@@ -349,10 +409,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logger.info("Supervisor started (state=%s)", supervisor.state.value)
 
         if args.once:
-            logger.info("--once flag set: running a single health-poll tick then exiting.")
-            supervisor.tick()
-            health = supervisor.health()
-            logger.info("Tick complete. Health: %s", json.dumps(health.to_dict(), indent=2))
+            return _run_once(supervisor, args.once_settle_s)
         else:
             logger.info(
                 "Entering run loop (poll_interval=%.0fs). "
@@ -371,7 +428,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     finally:
         try:
             supervisor.stop()
-            logger.info("Supervisor stopped cleanly (state=%s)", supervisor.state.value)
+            logger.info("Supervisor stopped (state=%s)", supervisor.state.value)
         except Exception:
             logger.exception("Error while stopping supervisor.")
 

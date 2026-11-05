@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import logging
 import logging.handlers
 import os
@@ -160,6 +161,7 @@ def _bigpanda_jobs_config_from_dict(cfg: dict) -> BigPandaJobsConfig:
         max_queues=cfg.get('max_queues', 0),
         cycle_interval_s=cfg.get('cycle_interval_s', DEFAULT_CYCLE_INTERVAL_S),
         inter_queue_delay_s=cfg.get('inter_queue_delay_s', DEFAULT_INTER_QUEUE_DELAY_S),
+        retention_days=int(cfg.get('retention_days', 0)),
     )
 
 
@@ -217,28 +219,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.inter_queue_delay,
             bpjobs_cfg.inter_queue_delay_s,
         )
-        bpjobs_cfg = BigPandaJobsConfig(
-            enabled=bpjobs_cfg.enabled,
-            queues=bpjobs_cfg.queues,
-            cric_path=bpjobs_cfg.cric_path,
-            max_queues=bpjobs_cfg.max_queues,
-            cycle_interval_s=bpjobs_cfg.cycle_interval_s,
-            inter_queue_delay_s=args.inter_queue_delay,
-        )
+        bpjobs_cfg = dataclasses.replace(bpjobs_cfg, inter_queue_delay_s=args.inter_queue_delay)
     if args.max_queues is not None:
         logger.info(
             "Overriding max_queues: %d (YAML value was %d)",
             args.max_queues,
             bpjobs_cfg.max_queues,
         )
-        bpjobs_cfg = BigPandaJobsConfig(
-            enabled=bpjobs_cfg.enabled,
-            queues=bpjobs_cfg.queues,
-            cric_path=bpjobs_cfg.cric_path,
-            max_queues=args.max_queues,
-            cycle_interval_s=bpjobs_cfg.cycle_interval_s,
-            inter_queue_delay_s=bpjobs_cfg.inter_queue_delay_s,
-        )
+        bpjobs_cfg = dataclasses.replace(bpjobs_cfg, max_queues=args.max_queues)
     duckdb_path = cfg.get('duckdb_path', ':memory:')
     tick_interval_s = float(cfg.get('tick_interval_s', 1.0))
 
@@ -246,7 +234,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "Configuration: duckdb_path=%s  tick_interval=%.1fs  "
         "bigpanda_jobs.enabled=%s  bigpanda_jobs.cric_path=%s  "
         "bigpanda_jobs.queues=%s  bigpanda_jobs.max_queues=%s  "
-        "bigpanda_jobs.cycle_interval=%ds  bigpanda_jobs.inter_queue_delay=%ds",
+        "bigpanda_jobs.cycle_interval=%ds  bigpanda_jobs.inter_queue_delay=%ds  "
+        "bigpanda_jobs.retention_days=%s",
         duckdb_path,
         tick_interval_s,
         bpjobs_cfg.enabled,
@@ -255,6 +244,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         bpjobs_cfg.max_queues if bpjobs_cfg.max_queues else "unlimited",
         bpjobs_cfg.cycle_interval_s,
         bpjobs_cfg.inter_queue_delay_s,
+        bpjobs_cfg.retention_days or "off",
     )
 
     mac = IngestionAgentConfig(

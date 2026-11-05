@@ -22,15 +22,28 @@ dynamic approach is more robust than a hardcoded table definition.  The
 inference logic (``_to_cell_value``, ``_merge_type``, ``_infer_schema``) is
 derived from the standalone ``json_to_duckdb.py`` utility script.
 
+Connection lifetime
+-------------------
+Given a ``duckdb_path``, the fetcher opens the database only for the SQL part
+of a load and closes it straight after, with a ``CHECKPOINT`` (see
+:func:`~bamboo_mcp_services.common.storage.duckdb_store.short_lived_connection`).
+Between loads it holds no lock, so other processes — Bamboo MCP's
+``cric_query`` — can open the file.  Reading the CVMFS file, hashing it and
+building the rows all happen before the database is opened.
+
+Given a ``conn`` instead, it uses that connection and never closes it.  That
+form exists for ``":memory:"`` databases and tests.
+
 Typical usage
 -------------
 The :class:`CricQueuedataFetcher` is driven by the CRIC agent's
 ``_tick_impl`` method::
 
     fetcher = CricQueuedataFetcher(
-        conn=store._conn,
+        conn=None,
         cric_path="/cvmfs/atlas.cern.ch/repo/sw/local/etc/cric_pandaqueues.json",
         refresh_interval_s=600,
+        duckdb_path="/data/bamboo/db/cric.db",
     )
     # In each tick:
     fetcher.run_cycle()
@@ -40,13 +53,18 @@ from __future__ import annotations
 import json
 import logging
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Iterator, Optional
 
 import duckdb
 
 from bamboo_mcp_services.common.panda.source import BaseSource
-from bamboo_mcp_services.common.storage.duckdb_store import atomic_swap_table
+from bamboo_mcp_services.common.storage.duckdb_store import (
+    atomic_swap_table,
+    is_lock_conflict,
+    short_lived_connection,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,8 +156,9 @@ class CricQueuedataFetcher:
     to the hash from the previous successful load.  The database write is
     skipped when the content is unchanged, avoiding unnecessary churn.
 
-    The fetcher does **not** own the DuckDB connection — lifecycle management
-    (open / close) is the caller's responsibility.
+    The fetcher either opens the database itself for each load
+    (``duckdb_path``) or uses a connection it is given and never closes
+    (``conn``).  See the module docstring.
 
     Attributes:
         cric_path: Filesystem path to ``cric_pandaqueues.json``.
@@ -153,25 +172,40 @@ class CricQueuedataFetcher:
 
     def __init__(
         self,
-        conn: duckdb.DuckDBPyConnection,
+        conn: Optional[duckdb.DuckDBPyConnection],
         cric_path: str,
         refresh_interval_s: int = 600,
+        duckdb_path: Optional[str] = None,
     ) -> None:
         """Initialise the fetcher.
 
+        Exactly one of *conn* and *duckdb_path* must be given.
+
         Args:
-            conn: An open, writable DuckDB connection.  The fetcher does
-                **not** close this connection — lifecycle management is the
-                caller's responsibility.
+            conn: An open, writable DuckDB connection that the fetcher uses
+                for every load and does **not** close.  Pass ``None`` when
+                giving *duckdb_path*.
             cric_path: Filesystem path to the CRIC queuedata JSON file.
             refresh_interval_s: Minimum seconds between successive file reads.
                 Defaults to 600 (10 minutes).
+            duckdb_path: Database file the fetcher opens for each load and
+                closes again afterwards, releasing the lock between loads.
+
+        Raises:
+            ValueError: If both or neither of *conn* and *duckdb_path* are
+                given.
         """
+        if (conn is None) == (duckdb_path is None):
+            raise ValueError("CricQueuedataFetcher needs exactly one of conn and duckdb_path")
         self._conn = conn
+        self._duckdb_path = duckdb_path
         self.cric_path = cric_path
         self.refresh_interval_s = refresh_interval_s
 
-        self._last_attempt: float = 0.0       # monotonic time of last run_cycle attempt
+        # Monotonic time of the last attempt; None means "due now".  Not 0.0:
+        # monotonic time counts from boot, so within refresh_interval_s of a
+        # host reboot 0.0 would look like a recent attempt and skip the load.
+        self._last_attempt: Optional[float] = None
         self._last_hash: str | None = None    # content hash of the last successful load
 
         # Exposed for health reporting
@@ -193,7 +227,7 @@ class CricQueuedataFetcher:
             cycle was skipped (interval not elapsed) or the file was unchanged.
         """
         now = time.monotonic()
-        if now - self._last_attempt < self.refresh_interval_s:
+        if self._last_attempt is not None and now - self._last_attempt < self.refresh_interval_s:
             return False
 
         # Record the attempt time before doing any I/O so that a failure does
@@ -232,8 +266,19 @@ class CricQueuedataFetcher:
 
         try:
             row_count = self._load(snapshot.raw)
-        except Exception:
-            logger.exception("cric_fetcher: load failed")
+        except Exception as exc:
+            if is_lock_conflict(exc):
+                # Another process held the file for longer than the connect
+                # retries allow.  Retry on the next tick rather than waiting a
+                # full refresh interval; the hash is not recorded, so the same
+                # content is loaded then.
+                self._last_attempt = None
+                logger.error(
+                    "cric_fetcher: %s is locked by another process — load deferred to the next tick (%s)",
+                    self._duckdb_path, exc,
+                )
+            else:
+                logger.exception("cric_fetcher: load failed")
             return False
 
         self._last_hash = snapshot.content_hash
@@ -270,6 +315,9 @@ class CricQueuedataFetcher:
         no reader queries.  Only step 4 — a pure metadata rename — touches the
         live name, and it does so atomically.
 
+        Step 1 runs before the database is opened, so with ``duckdb_path`` the
+        file is locked only for steps 2–4 and the closing ``CHECKPOINT``.
+
         Args:
             data: Top-level ``{queue_name: {field: value, ...}}`` dict as
                 parsed from ``cric_pandaqueues.json``.
@@ -287,15 +335,31 @@ class CricQueuedataFetcher:
         # The id column is always TEXT regardless of what inference might say.
         schema[_ID_COLUMN] = "TEXT"
 
-        # --- Build staging table (not yet visible under the live name) -----
-        self._conn.execute("DROP TABLE IF EXISTS queuedata_staging")
-        self._create_staging_table(schema)
-        self._insert_rows(rows, table="queuedata_staging")
+        with self._writer() as conn:
+            # --- Build staging table (not yet visible under the live name) ---
+            conn.execute("DROP TABLE IF EXISTS queuedata_staging")
+            self._create_staging_table(conn, schema)
+            self._insert_rows(conn, rows, table="queuedata_staging")
 
-        # --- Atomic promotion: staging → queuedata -------------------------
-        atomic_swap_table(self._conn, "queuedata_staging", "queuedata")
+            # --- Atomic promotion: staging → queuedata -----------------------
+            atomic_swap_table(conn, "queuedata_staging", "queuedata")
 
         return len(rows)
+
+    @contextmanager
+    def _writer(self) -> Iterator[duckdb.DuckDBPyConnection]:
+        """Yield a writable connection for one load.
+
+        Yields:
+            The injected connection (left open), or a short-lived connection to
+            ``duckdb_path`` that is checkpointed and closed when the block ends.
+        """
+        if self._conn is not None:
+            yield self._conn
+            return
+        assert self._duckdb_path is not None  # guaranteed by __init__
+        with short_lived_connection(self._duckdb_path) as conn:
+            yield conn
 
     def _build_rows(self, data: dict[str, Any]) -> list[dict[str, Any]]:
         """Convert the top-level CRIC dict to a list of flat row dicts.
@@ -324,23 +388,25 @@ class CricQueuedataFetcher:
             rows.append(row)
         return rows
 
-    def _create_staging_table(self, schema: dict[str, str]) -> None:
+    def _create_staging_table(self, conn: duckdb.DuckDBPyConnection, schema: dict[str, str]) -> None:
         """Create the ``queuedata_staging`` table with the inferred schema.
 
         Unlike the old ``_create_table`` helper this method never touches the
         live ``queuedata`` table — it only creates the staging target.
 
         Args:
+            conn: Writable connection for the current load.
             schema: ``{column_name: duckdb_type}`` mapping as returned by
                 :func:`_infer_schema`.
         """
         cols_sql = ", ".join(f'"{col}" {dtype}' for col, dtype in schema.items())
-        self._conn.execute(f"CREATE TABLE queuedata_staging ({cols_sql})")
+        conn.execute(f"CREATE TABLE queuedata_staging ({cols_sql})")
 
-    def _insert_rows(self, rows: list[dict[str, Any]], table: str = "queuedata") -> None:
+    def _insert_rows(self, conn: duckdb.DuckDBPyConnection, rows: list[dict[str, Any]], table: str = "queuedata") -> None:
         """Bulk-insert *rows* into *table*.
 
         Args:
+            conn: Writable connection for the current load.
             rows: Coerced row dicts (all values already converted to DB-safe
                 scalars by :func:`_infer_schema`).
             table: Target table name.  Defaults to ``"queuedata"`` for
@@ -353,7 +419,7 @@ class CricQueuedataFetcher:
         col_list = ", ".join(f'"{c}"' for c in cols)
         placeholders = ", ".join("?" * len(cols))
         tuples = [tuple(r.get(c) for c in cols) for r in rows]
-        self._conn.executemany(
+        conn.executemany(
             f"INSERT INTO {table} ({col_list}) VALUES ({placeholders})",
             tuples,
         )

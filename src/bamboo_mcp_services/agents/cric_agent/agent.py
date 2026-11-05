@@ -23,7 +23,11 @@ from datetime import timezone
 from typing import Any, Mapping, Optional
 
 from bamboo_mcp_services.agents.base import Agent
-from bamboo_mcp_services.common.storage.duckdb_store import DuckDBStore
+from bamboo_mcp_services.common.storage.duckdb_store import (
+    MEMORY_PATH,
+    DuckDBStore,
+    short_lived_connection,
+)
 from bamboo_mcp_services.agents.cric_agent.cric_fetcher import CricQueuedataFetcher
 
 logger = logging.getLogger(__name__)
@@ -64,6 +68,12 @@ class CricAgent(Agent):
 
     The ``queuedata`` table in ``duckdb_path`` always reflects the most
     recent snapshot; no historical rows are retained.
+
+    For a database file the agent holds no connection between loads: the
+    fetcher opens the file for each load and closes it afterwards, so other
+    processes can read ``cric.db`` while the agent runs.  Only ``":memory:"``
+    keeps one connection open for the agent's lifetime, because an in-memory
+    database does not outlive its connection.
     """
 
     def __init__(
@@ -94,17 +104,39 @@ class CricAgent(Agent):
     # ------------------------------------------------------------------
 
     def _start_impl(self) -> None:
-        """Open the DuckDB store and initialise the fetcher."""
-        self._store = DuckDBStore(self.config.duckdb_path)
-        self._fetcher = CricQueuedataFetcher(
-            conn=self._store._conn,
-            cric_path=self.config.cric_path,
-            refresh_interval_s=self.config.refresh_interval_s,
-        )
+        """Initialise the fetcher, checking that the database can be opened.
+
+        For a database file this opens and closes the file once, so that a bad
+        path or a lock held by another process fails the start loudly instead
+        of surfacing at the first load.
+
+        Raises:
+            duckdb.Error: If the database file cannot be opened.
+        """
+        path = self.config.duckdb_path
+        if path == MEMORY_PATH:
+            self._store = DuckDBStore(path)
+            self._fetcher = CricQueuedataFetcher(
+                conn=self._store._conn,
+                cric_path=self.config.cric_path,
+                refresh_interval_s=self.config.refresh_interval_s,
+            )
+            connection_mode = "held open (in-memory)"
+        else:
+            with short_lived_connection(path):
+                pass
+            self._fetcher = CricQueuedataFetcher(
+                conn=None,
+                cric_path=self.config.cric_path,
+                refresh_interval_s=self.config.refresh_interval_s,
+                duckdb_path=path,
+            )
+            connection_mode = "opened per load"
         logger.info(
-            "CricAgent started: cric_path=%s  duckdb=%s  refresh_interval=%ds",
+            "CricAgent started: cric_path=%s  duckdb=%s (%s)  refresh_interval=%ds",
             self.config.cric_path,
-            self.config.duckdb_path,
+            path,
+            connection_mode,
             self.config.refresh_interval_s,
         )
 
@@ -114,9 +146,11 @@ class CricAgent(Agent):
         self._fetcher.run_cycle()
 
     def _stop_impl(self) -> None:
-        """Release the fetcher and close the DuckDB store."""
+        """Release the fetcher and close the in-memory store, if any."""
         self._fetcher = None
-        self._store = None  # DuckDBStore.__del__ closes the connection
+        if self._store is not None:
+            self._store.close()
+            self._store = None
         logger.info("CricAgent stopped")
 
     # ------------------------------------------------------------------

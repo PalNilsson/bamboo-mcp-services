@@ -41,12 +41,16 @@ from bamboo_mcp_services.agents.supervisor_agent.scheduler import (
     ScheduledState,
     MODE_DAEMON,
     MODE_SCHEDULED,
-    BACKOFF_RAPID_RESTART_COUNT,
-    BACKOFF_RAPID_WINDOW_S,
+    BACKOFF_BASE_S,
+    BACKOFF_FREE_RESTARTS,
+    BACKOFF_MAX_S,
+    BACKOFF_MIN_UPTIME_S,
+    describe_exit,
 )
 from bamboo_mcp_services.agents.supervisor_agent.cli import (
     _load_config,
     build_parser,
+    main as supervisor_main,
 )
 
 # Capture the real Popen class at import time, before any @patch decorator
@@ -123,28 +127,58 @@ class TestDaemonState(unittest.TestCase):
         self.assertIsNone(self.state.pid)
         self.assertEqual(self.state.last_exit_code, 1)
 
-    def test_no_backoff_on_first_restarts(self):
-        # Up to BACKOFF_RAPID_RESTART_COUNT exits should produce zero back-off.
-        for _ in range(BACKOFF_RAPID_RESTART_COUNT):
-            self.state.record_exit(exit_code=1)
+    def _fast_exit(self):
+        self.state.record_start(pid=1)
+        self.state.record_exit(exit_code=1)
+
+    def test_no_backoff_for_free_restarts(self):
+        for _ in range(BACKOFF_FREE_RESTARTS):
+            self._fast_exit()
         self.assertEqual(self.state.compute_backoff_s(), 0.0)
 
-    def test_backoff_escalates_beyond_threshold(self):
-        for _ in range(BACKOFF_RAPID_RESTART_COUNT + 1):
-            self.state.record_exit(exit_code=1)
-        delay = self.state.compute_backoff_s()
-        self.assertGreater(delay, 0.0)
-        self.assertLessEqual(delay, 300.0)
+    def test_backoff_doubles_and_caps(self):
+        delays = []
+        for _ in range(BACKOFF_FREE_RESTARTS + 12):
+            self._fast_exit()
+            delays.append(self.state.compute_backoff_s())
+        paid = delays[BACKOFF_FREE_RESTARTS:]
+        self.assertEqual(paid[0], BACKOFF_BASE_S)
+        self.assertEqual(paid[1], BACKOFF_BASE_S * 2)
+        self.assertEqual(paid[2], BACKOFF_BASE_S * 4)
+        self.assertEqual(paid[-1], BACKOFF_MAX_S)
+        self.assertEqual(paid, sorted(paid))
 
-    def test_backoff_old_exits_pruned(self):
-        """Exits older than BACKOFF_RAPID_WINDOW_S should not contribute to back-off."""
-        past = time.monotonic() - BACKOFF_RAPID_WINDOW_S - 1
-        self.state.restart_times = [past] * (BACKOFF_RAPID_RESTART_COUNT + 5)
-        # Trigger a prune by recording a new exit.
-        self.state.record_exit(exit_code=0)
-        # After pruning only the one new timestamp should remain.
-        self.assertEqual(len(self.state.restart_times), 1)
+    def test_backoff_engages_at_a_30s_poll_interval(self):
+        """Regression: the old 3-exits-in-60s rule never fired when exits were seen 30 s apart."""
+        for _ in range(BACKOFF_FREE_RESTARTS + 1):
+            self.state.record_start(pid=1)
+            self.state.started_monotonic = time.monotonic() - 30.0   # ran for 30 s each time
+            self.state.record_exit(exit_code=1)
+        self.assertGreater(self.state.compute_backoff_s(), 0.0)
+
+    def test_long_run_resets_the_count(self):
+        for _ in range(BACKOFF_FREE_RESTARTS + 3):
+            self._fast_exit()
+        self.state.record_start(pid=2)
+        self.state.started_monotonic = time.monotonic() - BACKOFF_MIN_UPTIME_S - 1
+        uptime = self.state.record_exit(exit_code=1)
+        self.assertGreaterEqual(uptime, BACKOFF_MIN_UPTIME_S)
+        self.assertEqual(self.state.consecutive_fast_failures, 0)
         self.assertEqual(self.state.compute_backoff_s(), 0.0)
+
+    def test_exit_exactly_at_the_minimum_uptime_is_not_fast(self):
+        self.state.record_start(pid=2)
+        started = self.state.started_monotonic
+        assert started is not None
+        with patch("bamboo_mcp_services.agents.supervisor_agent.scheduler.time.monotonic",
+                   return_value=started + BACKOFF_MIN_UPTIME_S):
+            self.state.record_exit(exit_code=1)
+        self.assertEqual(self.state.consecutive_fast_failures, 0)
+
+    def test_launch_failure_counts_as_fast_failure(self):
+        uptime = self.state.record_exit(exit_code=-1)   # no record_start: never launched
+        self.assertEqual(uptime, 0.0)
+        self.assertEqual(self.state.consecutive_fast_failures, 1)
 
     def test_to_health_dict_keys(self):
         self.state.record_start(pid=99)
@@ -282,16 +316,16 @@ class TestSupervisorAgentDaemon(unittest.TestCase):
         sv.start()
 
         state = sv._daemon_states["crasher"]
-        # Inject enough rapid restarts to trigger back-off.
-        now = time.monotonic()
-        state.restart_times = [now] * (BACKOFF_RAPID_RESTART_COUNT + 2)
+        # Inject enough earlier fast failures that this exit triggers back-off.
+        state.consecutive_fast_failures = BACKOFF_FREE_RESTARTS + 1
 
         # Simulate exit.
         sv._daemon_procs["crasher"].poll.return_value = 1
         sv.tick()
 
-        # next_restart_after should be set in the future.
+        # next_restart_after should be set in the future, and no relaunch yet.
         self.assertGreater(state.next_restart_after, time.monotonic())
+        self.assertEqual(mock_popen.call_count, 1)
 
         sv.stop()
 
@@ -372,13 +406,18 @@ class TestSupervisorAgentScheduled(unittest.TestCase):
         sv = SupervisorAgent(config=cfg)
         sv.start()
 
-        # next_run defaults to 0.0, so first tick should dispatch it.
+        # next_run defaults to 0.0, so first tick should dispatch it ...
         sv.tick()
-
         mock_popen.assert_called_once()
         state = sv._scheduled_states["hourly"]
+        self.assertEqual(state.run_count, 0, "a tick must not wait for the run")
+
+        # ... and the next tick reaps it.
+        sv.tick()
+        mock_popen.assert_called_once()
         self.assertEqual(state.run_count, 1)
         self.assertEqual(state.last_exit_code, 0)
+        finished_proc.wait.assert_not_called()
 
     @patch("bamboo_mcp_services.agents.supervisor_agent.agent.subprocess.Popen")
     def test_scheduled_agent_not_dispatched_before_interval(self, mock_popen):
@@ -396,7 +435,6 @@ class TestSupervisorAgentScheduled(unittest.TestCase):
     @patch("bamboo_mcp_services.agents.supervisor_agent.agent.subprocess.Popen")
     def test_scheduled_agent_killed_on_timeout(self, mock_popen):
         slow_proc = _make_mock_proc(pid=800, returncode=None)
-        slow_proc.wait.side_effect = subprocess.TimeoutExpired(cmd=["slow"], timeout=1)
         mock_popen.return_value = slow_proc
 
         cfg = SupervisorConfig(agents=[
@@ -410,11 +448,16 @@ class TestSupervisorAgentScheduled(unittest.TestCase):
         ])
         sv = SupervisorAgent(config=cfg)
         sv.start()
-        sv.tick()
+        sv.tick()                                  # dispatch
+        state = sv._scheduled_states["slow"]
+        slow_proc.kill.assert_not_called()
+
+        state.dispatched_monotonic = time.monotonic() - 2.0   # now past run_timeout_s=1.0
+        sv.tick()                                  # reap: overdue → kill
 
         slow_proc.kill.assert_called_once()
-        state = sv._scheduled_states["slow"]
         self.assertEqual(state.last_exit_code, -1)
+        self.assertNotIn("slow", sv._scheduled_procs)
 
     @patch("bamboo_mcp_services.agents.supervisor_agent.agent.subprocess.Popen")
     def test_scheduled_interval_advanced_after_completion(self, mock_popen):
@@ -426,7 +469,8 @@ class TestSupervisorAgentScheduled(unittest.TestCase):
         cfg = SupervisorConfig(agents=[_scheduled_cfg(name="periodic", interval_s=interval)])
         sv = SupervisorAgent(config=cfg)
         sv.start()
-        sv.tick()
+        sv.tick()   # dispatch
+        sv.tick()   # reap
 
         state = sv._scheduled_states["periodic"]
         # next_run should now be approximately now + interval.
@@ -442,7 +486,8 @@ class TestSupervisorAgentScheduled(unittest.TestCase):
         cfg = SupervisorConfig(agents=[_scheduled_cfg(name="job", interval_s=60.0)])
         sv = SupervisorAgent(config=cfg)
         sv.start()
-        sv.tick()
+        sv.tick()   # dispatch
+        sv.tick()   # reap
 
         report = sv.health()
         agents_detail = report.details["agents"]
@@ -725,3 +770,236 @@ agents:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Regressions found on aipanda033 / in the sandbox (S-5, findings 1–3, 8, 9)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestLaunchFailureIsRetried(unittest.TestCase):
+    """Finding 1: a daemon whose launch failed was never tried again."""
+
+    @patch("bamboo_mcp_services.agents.supervisor_agent.agent.subprocess.Popen")
+    def test_failed_launch_is_retried_on_the_next_tick(self, mock_popen):
+        proc = _make_mock_proc(pid=1300)
+        mock_popen.side_effect = [FileNotFoundError("bamboo-cric"), proc]
+
+        sv = SupervisorAgent(config=SupervisorConfig(agents=[_daemon_cfg(name="cric")]))
+        sv.start()
+        self.assertEqual(sv.daemons_not_running(), ["cric"])
+
+        sv.tick()
+
+        self.assertEqual(mock_popen.call_count, 2)
+        self.assertEqual(sv.daemons_not_running(), [])
+        self.assertEqual(sv._daemon_states["cric"].pid, 1300)
+        sv.stop()
+
+    @patch("bamboo_mcp_services.agents.supervisor_agent.agent.subprocess.Popen")
+    def test_repeated_launch_failures_back_off(self, mock_popen):
+        mock_popen.side_effect = FileNotFoundError("bamboo-cric")
+        sv = SupervisorAgent(config=SupervisorConfig(agents=[_daemon_cfg(name="cric")]))
+        sv.start()                                   # failure 1: free, retry at next tick
+        sv.tick()                                    # failure 2: back-off starts
+        state = sv._daemon_states["cric"]
+        self.assertGreater(state.next_restart_after, time.monotonic())
+        calls = mock_popen.call_count
+        sv.tick()                                    # inside back-off: no attempt
+        self.assertEqual(mock_popen.call_count, calls)
+
+
+class TestExitIsRecordedOnce(unittest.TestCase):
+    """Finding 3: during back-off every tick re-recorded the same exit, re-arming 300 s forever."""
+
+    @patch("bamboo_mcp_services.agents.supervisor_agent.agent.subprocess.Popen")
+    def test_back_off_is_not_re_armed_by_later_ticks(self, mock_popen):
+        first = _make_mock_proc(pid=1400, returncode=None)
+        second = _make_mock_proc(pid=1401, returncode=None)
+        mock_popen.side_effect = [first, second]
+        sv = SupervisorAgent(config=SupervisorConfig(agents=[_daemon_cfg(name="crasher")]))
+        sv.start()
+        state = sv._daemon_states["crasher"]
+        state.consecutive_fast_failures = BACKOFF_FREE_RESTARTS   # this exit will incur back-off
+
+        first.poll.return_value = 3
+        sv.tick()
+        failures = state.consecutive_fast_failures
+        restart_after = state.next_restart_after
+
+        for _ in range(5):
+            sv.tick()
+
+        self.assertEqual(state.consecutive_fast_failures, failures, "the same exit was counted again")
+        self.assertEqual(state.next_restart_after, restart_after, "back-off was re-armed without a new exit")
+        self.assertEqual(mock_popen.call_count, 1)
+
+        state.next_restart_after = time.monotonic() - 1     # back-off expires
+        sv.tick()
+        self.assertEqual(mock_popen.call_count, 2)
+        sv.stop()
+
+
+class TestScheduledRunsDoNotBlock(unittest.TestCase):
+    """Finding 2: a scheduled run blocked the tick, so daemons went unmonitored."""
+
+    @patch("bamboo_mcp_services.agents.supervisor_agent.agent.subprocess.Popen")
+    def test_daemon_exit_is_handled_while_a_scheduled_run_is_in_flight(self, mock_popen):
+        daemon_1 = _make_mock_proc(pid=1500)
+        sched = _make_mock_proc(pid=1501, returncode=None)
+        daemon_2 = _make_mock_proc(pid=1502)
+        mock_popen.side_effect = [daemon_1, sched, daemon_2]
+        sv = SupervisorAgent(config=SupervisorConfig(agents=[
+            _daemon_cfg(name="ingestion"),
+            _scheduled_cfg(name="github-sync", interval_s=3600.0),
+        ]))
+        sv.start()
+        sv.tick()                                  # dispatches github-sync, which keeps running
+        sched.wait.assert_not_called()
+
+        daemon_1.poll.return_value = 1             # ingestion dies mid-sync
+        sv.tick()
+
+        self.assertEqual(mock_popen.call_count, 3, "ingestion was not restarted while github-sync ran")
+        self.assertIn("github-sync", sv._scheduled_procs)
+        sv.stop()
+
+    @patch("bamboo_mcp_services.agents.supervisor_agent.agent.subprocess.Popen")
+    def test_stop_terminates_an_in_flight_scheduled_run(self, mock_popen):
+        sched = _make_mock_proc(pid=1600, returncode=None)
+        mock_popen.return_value = sched
+        sv = SupervisorAgent(config=SupervisorConfig(agents=[_scheduled_cfg(name="sync")]))
+        sv.start()
+        sv.tick()
+        sv.stop()
+        sched.send_signal.assert_called_once_with(signal.SIGTERM)
+
+    @patch("bamboo_mcp_services.agents.supervisor_agent.agent.subprocess.Popen")
+    def test_children_still_running_at_the_deadline_are_all_killed(self, mock_popen):
+        """The old wait loop gave up at the deadline and left later children alive."""
+        procs = [_make_mock_proc(pid=1700 + i) for i in range(3)]
+        for p in procs:
+            p.wait.side_effect = [subprocess.TimeoutExpired(cmd=["x"], timeout=0), None]
+        mock_popen.side_effect = procs
+        sv = SupervisorAgent(config=SupervisorConfig(
+            agents=[_daemon_cfg(name=f"d{i}") for i in range(3)], stop_timeout_s=0.0,
+        ))
+        sv.start()
+        sv.stop()
+        for p in procs:
+            p.kill.assert_called_once()
+
+
+class TestExitDescriptions(unittest.TestCase):
+    """Finding 9: rc=-15 was logged at INFO next to 'stopped cleanly'."""
+
+    def test_describe_exit(self):
+        self.assertEqual(describe_exit(0), "exited with code 0")
+        self.assertEqual(describe_exit(3), "exited with code 3")
+        self.assertEqual(describe_exit(-signal.SIGTERM), "killed by SIGTERM")
+        self.assertEqual(describe_exit(-signal.SIGKILL), "killed by SIGKILL")
+        self.assertEqual(describe_exit(None), "still running")
+        self.assertEqual(describe_exit(-999), "killed by signal 999")
+
+    @patch("bamboo_mcp_services.agents.supervisor_agent.agent.subprocess.Popen")
+    def test_child_killed_by_sigterm_is_a_warning(self, mock_popen):
+        proc = _make_mock_proc(pid=1800)
+        proc.returncode = -signal.SIGTERM
+        mock_popen.return_value = proc
+        sv = SupervisorAgent(config=SupervisorConfig(agents=[_daemon_cfg(name="cric")]))
+        sv.start()
+        with self.assertLogs("bamboo_mcp_services.agents.supervisor_agent.agent", level="WARNING") as logs:
+            sv.stop()
+        self.assertTrue(any("killed by SIGTERM" in m for m in logs.output), logs.output)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Real processes — the defects above were invisible to mock-only tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _write_config(tmp_dir: str, body: str) -> str:
+    path = os.path.join(tmp_dir, "supervisor.yaml")
+    with open(path, "w") as fh:
+        fh.write(body)
+    return path
+
+
+class TestRealProcesses(unittest.TestCase):
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_tick_returns_while_a_scheduled_run_is_still_going(self):
+        sv = SupervisorAgent(config=SupervisorConfig(agents=[
+            AgentConfig(name="slow", mode=MODE_SCHEDULED, command=["sleep", "5"], interval_s=60.0),
+        ], stop_timeout_s=5))
+        sv.start()
+        t0 = time.monotonic()
+        sv.tick()
+        self.assertLess(time.monotonic() - t0, 2.0, "tick waited for the scheduled run")
+        sv.stop()
+
+    def test_once_gives_daemons_time_and_passes(self):
+        """Finding 8: --once used to SIGTERM daemons milliseconds after launching them."""
+        marker = os.path.join(self.tmp, "daemon-ran")
+        cfg = _write_config(self.tmp, f"""
+agents:
+  - name: daemon
+    mode: daemon
+    command: [sh, -c, "touch {marker}; exec sleep 60"]
+  - name: job
+    mode: scheduled
+    interval_s: 60
+    command: [sh, -c, "exit 0"]
+""")
+        rc = supervisor_main(["-c", cfg, "--once", "--once-settle-s", "1", "--log-file", ""])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(marker), "daemon was stopped before it ran")
+
+    def test_once_fails_when_a_daemon_dies(self):
+        cfg = _write_config(self.tmp, """
+agents:
+  - name: crasher
+    mode: daemon
+    command: [sh, -c, "exit 3"]
+""")
+        rc = supervisor_main(["-c", cfg, "--once", "--once-settle-s", "0.5", "--log-file", ""])
+        self.assertEqual(rc, 1)
+
+    def test_once_fails_when_a_scheduled_run_fails(self):
+        cfg = _write_config(self.tmp, """
+agents:
+  - name: job
+    mode: scheduled
+    interval_s: 60
+    command: [sh, -c, "exit 2"]
+""")
+        rc = supervisor_main(["-c", cfg, "--once", "--once-settle-s", "0", "--log-file", ""])
+        self.assertEqual(rc, 1)
+
+    def test_once_waits_for_the_scheduled_run(self):
+        out = os.path.join(self.tmp, "ran")
+        cfg = _write_config(self.tmp, f"""
+agents:
+  - name: job
+    mode: scheduled
+    interval_s: 60
+    command: [sh, -c, "sleep 1; touch {out}"]
+""")
+        rc = supervisor_main(["-c", cfg, "--once", "--log-file", ""])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(out), "--once stopped before the scheduled run finished")
+
+    def test_missing_command_is_retried(self):
+        sv = SupervisorAgent(config=SupervisorConfig(agents=[
+            AgentConfig(name="missing", mode=MODE_DAEMON, command=["/nonexistent/bamboo-cric"]),
+        ]))
+        sv.start()
+        with self.assertLogs("bamboo_mcp_services.agents.supervisor_agent.agent", level="ERROR") as logs:
+            sv.tick()
+        self.assertTrue(any("Failed to launch daemon agent 'missing'" in m for m in logs.output))
+        sv.stop()

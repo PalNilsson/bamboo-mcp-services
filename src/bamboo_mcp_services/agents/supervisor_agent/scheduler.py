@@ -22,12 +22,27 @@
 
 This module is intentionally free of subprocess calls so that the scheduling
 logic can be unit-tested without spawning real processes.
+
+Restart back-off
+----------------
+A daemon exit counts as a *fast failure* when the process had been up for
+less than :data:`BACKOFF_MIN_UPTIME_S`, or never started at all (a launch
+failure).  The first :data:`BACKOFF_FREE_RESTARTS` consecutive fast failures
+are restarted at the next tick; after that each further one doubles the delay,
+from :data:`BACKOFF_BASE_S` up to :data:`BACKOFF_MAX_S`.  An exit after a run
+longer than the minimum uptime resets the count.
+
+Counting consecutive short runs — rather than exits inside a time window, as
+earlier versions did — is what lets back-off engage at the default 30 s poll
+interval: a window of 60 s can never hold more than two or three exits
+observed 30 s apart, so a threshold above that was never reached.
 """
 from __future__ import annotations
 
+import signal
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 
@@ -37,17 +52,41 @@ from typing import Any, Optional
 MODE_DAEMON = "daemon"
 MODE_SCHEDULED = "scheduled"
 
-#: Minimum back-off between restart attempts (seconds).
+#: A daemon that exits after running less than this (seconds) is a fast failure.
+BACKOFF_MIN_UPTIME_S = 60.0
+
+#: Consecutive fast failures that are restarted without any delay.
+BACKOFF_FREE_RESTARTS = 1
+
+#: Delay (seconds) after the first fast failure that is not free.
 BACKOFF_BASE_S = 5.0
 
-#: Maximum back-off between restart attempts (seconds).
+#: Maximum delay (seconds) between restart attempts.
 BACKOFF_MAX_S = 300.0
 
-#: Number of rapid restarts within a window that triggers back-off escalation.
-BACKOFF_RAPID_RESTART_COUNT = 3
 
-#: Window (seconds) in which restarts are considered "rapid".
-BACKOFF_RAPID_WINDOW_S = 60.0
+def describe_exit(returncode: Optional[int]) -> str:
+    """Describe a ``Popen.returncode`` in words an operator can act on.
+
+    A negative return code means the process was killed by that signal rather
+    than exiting by itself; reporting it as ``rc=-15`` hides the difference
+    between a clean shutdown and a process that never got to handle SIGTERM.
+
+    Args:
+        returncode: ``Popen.returncode`` — ``None`` while running, negative
+            when killed by a signal.
+
+    Returns:
+        For example ``"exited with code 0"`` or ``"killed by SIGTERM"``.
+    """
+    if returncode is None:
+        return "still running"
+    if returncode < 0:
+        try:
+            return f"killed by {signal.Signals(-returncode).name}"
+        except ValueError:
+            return f"killed by signal {-returncode}"
+    return f"exited with code {returncode}"
 
 
 # ── Config dataclasses ─────────────────────────────────────────────────────────
@@ -91,60 +130,29 @@ class DaemonState:
     Attributes:
         config: Immutable agent configuration.
         pid: OS process ID of the currently running child, or ``None``.
-        restart_count: Total number of times this agent has been restarted
-            since the supervisor started.
-        restart_times: Monotonic timestamps of recent restart events, used to
-            detect rapid-restart loops and apply back-off.
+        restart_count: Number of successful launches since the supervisor
+            started (the first launch included).
+        consecutive_fast_failures: Exits in a row after less than
+            :data:`BACKOFF_MIN_UPTIME_S` of uptime, launch failures included.
         next_restart_after: Monotonic clock value before which the supervisor
             must not restart this agent (back-off enforcement).
         last_exit_code: Exit code of the most recently observed process exit,
-            or ``None`` if the agent has never exited.
+            ``-1`` for a launch failure, or ``None`` if the agent has never
+            exited.
         started_at_utc: UTC timestamp of the most recent ``Popen`` call.
+        started_monotonic: Monotonic time of the most recent launch, or
+            ``None`` when no process is running.
     """
     config: AgentConfig
     pid: Optional[int] = None
     restart_count: int = 0
-    restart_times: list = field(default_factory=list)
+    consecutive_fast_failures: int = 0
     next_restart_after: float = 0.0
     last_exit_code: Optional[int] = None
     started_at_utc: Optional[datetime] = None
+    started_monotonic: Optional[float] = None
 
-    # ── Back-off helpers ───────────────────────────────────────────────────────
-
-    def record_exit(self, exit_code: int) -> None:
-        """Record that the managed process has exited.
-
-        Updates ``last_exit_code``, clears ``pid``, and appends the current
-        monotonic time to ``restart_times`` for back-off tracking.
-
-        Args:
-            exit_code: The process exit code observed via ``proc.poll()``.
-        """
-        self.last_exit_code = exit_code
-        self.pid = None
-        now = time.monotonic()
-        self.restart_times.append(now)
-        # Prune timestamps outside the rapid-restart window.
-        cutoff = now - BACKOFF_RAPID_WINDOW_S
-        self.restart_times = [t for t in self.restart_times if t >= cutoff]
-
-    def compute_backoff_s(self) -> float:
-        """Return the number of seconds the supervisor should wait before the
-        next restart attempt.
-
-        The delay starts at ``BACKOFF_BASE_S`` and doubles for every restart
-        beyond ``BACKOFF_RAPID_RESTART_COUNT`` within ``BACKOFF_RAPID_WINDOW_S``,
-        capped at ``BACKOFF_MAX_S``.
-
-        Returns:
-            Delay in seconds (may be 0.0 if no back-off is warranted).
-        """
-        rapid = len(self.restart_times)
-        if rapid <= BACKOFF_RAPID_RESTART_COUNT:
-            return 0.0
-        excess = rapid - BACKOFF_RAPID_RESTART_COUNT
-        delay = BACKOFF_BASE_S * (2 ** (excess - 1))
-        return min(delay, BACKOFF_MAX_S)
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     def record_start(self, pid: int) -> None:
         """Record that a new child process has been launched.
@@ -155,6 +163,59 @@ class DaemonState:
         self.pid = pid
         self.restart_count += 1
         self.started_at_utc = datetime.now(timezone.utc)
+        self.started_monotonic = time.monotonic()
+
+    def record_exit(self, exit_code: int) -> float:
+        """Record that the managed process has exited, or failed to launch.
+
+        Updates the fast-failure count: an exit after less than
+        :data:`BACKOFF_MIN_UPTIME_S` (or with no recorded start, i.e. a launch
+        failure) increments it; a longer run resets it to zero.
+
+        Call this exactly once per exit.  Calling it again for the same exit
+        would count a failure that did not happen.
+
+        Args:
+            exit_code: The process exit code, or ``-1`` for a launch failure.
+
+        Returns:
+            How long the process had been running, in seconds (``0.0`` for a
+            launch failure).
+        """
+        uptime = 0.0
+        if self.started_monotonic is not None:
+            uptime = max(0.0, time.monotonic() - self.started_monotonic)
+        self.last_exit_code = exit_code
+        self.pid = None
+        self.started_monotonic = None
+        if uptime < BACKOFF_MIN_UPTIME_S:
+            self.consecutive_fast_failures += 1
+        else:
+            self.consecutive_fast_failures = 0
+        return uptime
+
+    def compute_backoff_s(self) -> float:
+        """Return the delay before the next restart attempt.
+
+        Returns:
+            ``0.0`` for up to :data:`BACKOFF_FREE_RESTARTS` consecutive fast
+            failures; otherwise :data:`BACKOFF_BASE_S` doubled for each further
+            one, capped at :data:`BACKOFF_MAX_S`.
+        """
+        excess = self.consecutive_fast_failures - BACKOFF_FREE_RESTARTS
+        if excess <= 0:
+            return 0.0
+        return min(BACKOFF_BASE_S * (2 ** (excess - 1)), BACKOFF_MAX_S)
+
+    def schedule_restart(self) -> float:
+        """Set ``next_restart_after`` from the current back-off.
+
+        Returns:
+            The back-off applied, in seconds.
+        """
+        backoff = self.compute_backoff_s()
+        self.next_restart_after = time.monotonic() + backoff
+        return backoff
 
     def to_health_dict(self) -> dict[str, Any]:
         """Serialise state to a JSON-safe dictionary for health reporting.
@@ -167,6 +228,7 @@ class DaemonState:
             "mode": MODE_DAEMON,
             "pid": self.pid,
             "restarts": max(0, self.restart_count - 1),  # first start not a restart
+            "consecutive_fast_failures": self.consecutive_fast_failures,
             "last_exit_code": self.last_exit_code,
             "started_at_utc": (
                 self.started_at_utc.isoformat() if self.started_at_utc else None
@@ -190,6 +252,8 @@ class ScheduledState:
         running_pid: OS PID of the currently running one-shot process, or ``None``.
             A non-``None`` value means a previous run has not yet been reaped.
         run_count: Total number of completed runs (successful or not).
+        dispatched_monotonic: Monotonic time of the current run's dispatch,
+            or ``None`` when no run is in progress.
     """
     config: AgentConfig
     next_run: float = 0.0          # 0.0 ⇒ run immediately on first tick
@@ -197,6 +261,7 @@ class ScheduledState:
     last_exit_code: Optional[int] = None
     running_pid: Optional[int] = None
     run_count: int = 0
+    dispatched_monotonic: Optional[float] = None
 
     def record_dispatch(self, pid: int) -> None:
         """Record that a one-shot subprocess has been launched.
@@ -206,6 +271,7 @@ class ScheduledState:
         """
         self.running_pid = pid
         self.last_run_utc = datetime.now(timezone.utc)
+        self.dispatched_monotonic = time.monotonic()
 
     def record_completion(self, exit_code: int) -> None:
         """Record that the current one-shot subprocess has completed.
@@ -217,6 +283,7 @@ class ScheduledState:
         """
         self.last_exit_code = exit_code
         self.running_pid = None
+        self.dispatched_monotonic = None
         self.run_count += 1
         interval = self.config.interval_s or 0.0
         self.next_run = time.monotonic() + interval
@@ -229,6 +296,17 @@ class ScheduledState:
             currently in progress.
         """
         return self.running_pid is None and time.monotonic() >= self.next_run
+
+    def is_overdue(self) -> bool:
+        """Return ``True`` if the current run has exceeded its timeout.
+
+        Returns:
+            ``True`` when a run is in progress and has lasted at least
+            :meth:`effective_run_timeout_s` seconds.
+        """
+        if self.dispatched_monotonic is None:
+            return False
+        return time.monotonic() - self.dispatched_monotonic >= self.effective_run_timeout_s()
 
     def effective_run_timeout_s(self) -> float:
         """Return the run timeout in seconds.
@@ -256,10 +334,7 @@ class ScheduledState:
         next_dt: Optional[str] = None
         if self.running_pid is None and self.next_run > now_mono:
             delta_s = self.next_run - now_mono
-            next_dt_obj = datetime.now(timezone.utc)
-            # Approximate next-run wall-clock time.
-            from datetime import timedelta
-            next_dt = (next_dt_obj + timedelta(seconds=delta_s)).isoformat()
+            next_dt = (datetime.now(timezone.utc) + timedelta(seconds=delta_s)).isoformat()
 
         return {
             "mode": MODE_SCHEDULED,

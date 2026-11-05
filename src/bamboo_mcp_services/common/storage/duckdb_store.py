@@ -1,9 +1,145 @@
-"""DuckDB storage backend for agent data persistence."""
+"""DuckDB storage backend for agent data persistence.
+
+Connection lifetime
+-------------------
+DuckDB allows *either* one process that reads and writes a database file *or*
+any number of processes that only read it — never both at once.  A writer that
+keeps its connection open therefore locks every other process out of the file
+for as long as it runs, and a reader that keeps its connection open blocks the
+writer in the same way.
+
+Agents that write a database another process reads must therefore hold the
+file only while they write.  :func:`short_lived_connection` is the one way to
+do that here: it opens the file (retrying briefly if another process holds the
+lock), yields the connection, runs ``CHECKPOINT`` so the data reaches the main
+database file rather than waiting in the write-ahead log, and always closes.
+"""
 from __future__ import annotations
-import duckdb
-from datetime import datetime, timezone
-from typing import Optional, Any
+
 import json
+import logging
+import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from types import TracebackType
+from typing import Any, Iterator, Optional, Type
+
+import duckdb
+
+logger = logging.getLogger(__name__)
+
+#: Path that selects an in-memory database.  It cannot be shared between
+#: processes, so code that would otherwise use short-lived connections keeps a
+#: single connection open for it instead.
+MEMORY_PATH = ":memory:"
+
+#: How many times :func:`connect_with_retry` tries to open a locked file.
+LOCK_RETRY_ATTEMPTS = 10
+
+#: Seconds between attempts in :func:`connect_with_retry`.
+LOCK_RETRY_DELAY_S = 0.5
+
+#: Lower-cased text of DuckDB's error for a file locked by another process.
+_LOCK_CONFLICT_TEXT = "could not set lock on file"
+
+
+def is_lock_conflict(exc: BaseException) -> bool:
+    """Return whether *exc* is DuckDB refusing a file lock held by another process.
+
+    Args:
+        exc: Any exception.
+
+    Matches DuckDB's message text rather than the word "lock" alone, because
+    the message also contains the file path, and a path such as
+    ``/data/blocks/x.db`` in an unrelated error must not be retried.
+
+    Returns:
+        ``True`` for the ``IOException`` DuckDB raises with "Could not set lock
+        on file"; ``False`` for everything else, including other I/O errors
+        such as a missing directory, which must not be retried.
+    """
+    return isinstance(exc, duckdb.IOException) and _LOCK_CONFLICT_TEXT in str(exc).lower()
+
+
+def connect_with_retry(
+    path: str,
+    *,
+    read_only: bool,
+    attempts: Optional[int] = None,
+    delay_s: Optional[float] = None,
+) -> duckdb.DuckDBPyConnection:
+    """Open *path*, retrying while another process holds its lock.
+
+    Only lock conflicts are retried; any other error is raised immediately.
+
+    Args:
+        path: Database file path.
+        read_only: Open read-only (shared) instead of read-write (exclusive).
+        attempts: Total attempts.  ``None`` reads :data:`LOCK_RETRY_ATTEMPTS`
+            at call time, so tests can shorten it.
+        delay_s: Seconds between attempts.  ``None`` reads
+            :data:`LOCK_RETRY_DELAY_S` at call time.
+
+    Returns:
+        An open connection the caller must close.
+
+    Raises:
+        duckdb.IOException: If the lock is still held after the last attempt,
+            or on any I/O error that is not a lock conflict.
+    """
+    n = LOCK_RETRY_ATTEMPTS if attempts is None else attempts
+    delay = LOCK_RETRY_DELAY_S if delay_s is None else delay_s
+    for attempt in range(1, max(n, 1) + 1):
+        try:
+            return duckdb.connect(database=path, read_only=read_only)
+        except duckdb.IOException as exc:
+            if not is_lock_conflict(exc) or attempt >= n:
+                raise
+            logger.debug(
+                "DuckDB file %s is locked by another process (attempt %d/%d) — retrying in %.1fs",
+                path, attempt, n, delay,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")  # pragma: no cover — loop always returns or raises
+
+
+@contextmanager
+def short_lived_connection(
+    path: str,
+    *,
+    read_only: bool = False,
+    attempts: Optional[int] = None,
+    delay_s: Optional[float] = None,
+) -> Iterator[duckdb.DuckDBPyConnection]:
+    """Hold *path* only for the duration of a ``with`` block.
+
+    On a clean exit from a writable block the connection runs ``CHECKPOINT``,
+    so the committed data is in the main database file when the block ends.
+    The connection is closed on every exit path, which releases the lock.
+
+    Args:
+        path: Database file path.  ``":memory:"`` is rejected: an in-memory
+            database does not survive its connection, so a short-lived one
+            would silently discard everything written to it.
+        read_only: Open read-only instead of read-write.
+        attempts: Passed to :func:`connect_with_retry`.
+        delay_s: Passed to :func:`connect_with_retry`.
+
+    Yields:
+        The open connection.
+
+    Raises:
+        ValueError: If *path* is ``":memory:"``.
+    """
+    if path == MEMORY_PATH:
+        raise ValueError("short_lived_connection() cannot be used with ':memory:'")
+    conn = connect_with_retry(path, read_only=read_only, attempts=attempts, delay_s=delay_s)
+    try:
+        yield conn
+        if not read_only:
+            conn.execute("CHECKPOINT")
+    finally:
+        conn.close()
 
 
 def atomic_swap_table(
@@ -74,20 +210,72 @@ class DuckDBStore:
     Provides methods for storing data snapshots, recording metadata,
     and managing structured data tables.
 
+    The store opens its connection on construction.  For a file that another
+    process reads, use it as a context manager so the connection is
+    checkpointed and closed — and the file lock released — as soon as the
+    block ends::
+
+        with DuckDBStore("/data/bamboo/db/jobs.duckdb") as store:
+            store.write_table("t", rows)
+
     Attributes:
-        path: Database file path or \":memory:\" for in-memory database.
+        path: Database file path, or ``":memory:"`` for an in-memory database.
     """
 
-    def __init__(self, path: str = ":memory:") -> None:
+    def __init__(self, path: str = MEMORY_PATH) -> None:
         """Initialize the DuckDB store.
 
         Args:
-            path: Path to the DuckDB database file. Use \":memory:\" for
-                an in-memory database (default).
+            path: Path to the DuckDB database file.  Use ``":memory:"`` for
+                an in-memory database (default).  A file that another process
+                holds is retried briefly (see :func:`connect_with_retry`).
         """
         self.path = path
-        self._conn = duckdb.connect(database=path, read_only=False)
+        self._conn: duckdb.DuckDBPyConnection
+        if path == MEMORY_PATH:
+            self._conn = duckdb.connect(database=path, read_only=False)
+        else:
+            self._conn = connect_with_retry(path, read_only=False)
+        self._closed = False
         self._init_meta()
+
+    def close(self) -> None:
+        """Checkpoint (for a file-backed store) and close the connection.
+
+        Safe to call more than once.  Any use of the store after this raises
+        DuckDB's ``ConnectionException``.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self.path != MEMORY_PATH:
+                self._conn.execute("CHECKPOINT")
+        finally:
+            self._conn.close()
+
+    def __enter__(self) -> "DuckDBStore":
+        """Return the store itself for use in a ``with`` block.
+
+        Returns:
+            This store.
+        """
+        return self
+
+    def __exit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType],
+    ) -> None:
+        """Close the store at the end of a ``with`` block.
+
+        Args:
+            exc_type: Exception type, if the block raised.
+            exc: Exception instance, if the block raised.
+            tb: Traceback, if the block raised.
+        """
+        self.close()
 
     def _init_meta(self) -> None:
         """Initialize metadata tables and extensions.

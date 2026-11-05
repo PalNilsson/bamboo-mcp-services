@@ -25,12 +25,22 @@ two modes per agent:
 
 * **daemon** — the child process runs indefinitely; the supervisor monitors it
   and restarts it automatically when it exits, with exponential back-off on
-  rapid failures.
+  repeated fast failures (see :mod:`.scheduler`).
 * **scheduled** — a short-lived ``--once`` process is launched on a configurable
-  interval; the supervisor waits for it to complete, records the exit code, then
+  interval; the supervisor records its exit code when it finishes, then
   schedules the next run.
 
 The two modes may be mixed freely within a single supervisor configuration.
+
+Nothing in a tick waits for a child.  Scheduled runs are dispatched and then
+reaped on later ticks, so a long one-shot (a GitHub sync can take minutes)
+never delays the health check of the daemons.  The cost is granularity: a
+scheduled run's completion, and its timeout, are noticed at the first tick
+after they happen, i.e. up to ``health_poll_interval_s`` late.
+
+Daemon state drives restarts, not the presence of a process handle: a daemon
+whose launch failed (for example, a command that is not on ``PATH``) has no
+process at all, and is retried with back-off like any other failure.
 
 Future extension point
 ----------------------
@@ -58,6 +68,7 @@ from bamboo_mcp_services.agents.supervisor_agent.scheduler import (
     ScheduledState,
     MODE_DAEMON,
     MODE_SCHEDULED,
+    describe_exit,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,6 +80,9 @@ DEFAULT_HEALTH_POLL_INTERVAL_S = 30.0
 
 #: Default seconds to wait for a child to exit after SIGTERM before SIGKILL.
 DEFAULT_STOP_TIMEOUT_S = 30.0
+
+#: Seconds to wait for a timed-out scheduled run to die after SIGKILL.
+_KILL_REAP_TIMEOUT_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -119,8 +133,11 @@ class SupervisorAgent(Agent):
         self._daemon_states: dict[str, DaemonState] = {}
         self._scheduled_states: dict[str, ScheduledState] = {}
 
-        # Raw subprocess.Popen handles keyed by agent name (daemon agents).
+        # Popen handles of live children, keyed by agent name.  An entry is
+        # removed as soon as its exit has been recorded, so an exit is never
+        # recorded twice.
         self._daemon_procs: dict[str, subprocess.Popen] = {}
+        self._scheduled_procs: dict[str, subprocess.Popen] = {}
 
     # ── Agent lifecycle ────────────────────────────────────────────────────────
 
@@ -128,9 +145,10 @@ class SupervisorAgent(Agent):
         """Validate config and launch all enabled daemon agents.
 
         Scheduled agents are not launched here; they are dispatched by
-        ``_tick_impl()`` when their interval first elapses.
+        ``_tick_impl()`` when they are first due — on the first tick.
 
         Raises:
+            TypeError: If an entry is not an :class:`AgentConfig`.
             ValueError: If any ``AgentConfig`` has an unknown ``mode``.
         """
         for cfg in self._config.agents:
@@ -148,14 +166,12 @@ class SupervisorAgent(Agent):
                 continue
 
             if cfg.mode == MODE_DAEMON:
-                state = DaemonState(config=cfg)
-                self._daemon_states[cfg.name] = state
+                self._daemon_states[cfg.name] = DaemonState(config=cfg)
                 self._wait_for_dependency(cfg)
                 self._launch_daemon(cfg.name)
 
             elif cfg.mode == MODE_SCHEDULED:
-                state = ScheduledState(config=cfg)
-                self._scheduled_states[cfg.name] = state
+                self._scheduled_states[cfg.name] = ScheduledState(config=cfg)
                 logger.info(
                     "Scheduled agent '%s' registered (interval=%.0fs).",
                     cfg.name,
@@ -165,77 +181,68 @@ class SupervisorAgent(Agent):
     def _tick_impl(self) -> None:
         """Perform one supervisor health-poll cycle.
 
-        For daemon agents: check whether the managed process is still alive;
-        restart it (with back-off) if it has exited.
-
-        For scheduled agents: dispatch a new one-shot run if the interval has
-        elapsed and no run is currently in progress.
+        Returns without waiting for any child: daemons are polled, finished
+        or timed-out scheduled runs are reaped, and due scheduled runs are
+        dispatched.
         """
         self._poll_daemons()
+        self._reap_scheduled()
         self._dispatch_scheduled()
 
     def _stop_impl(self) -> None:
         """Send SIGTERM to all child processes and wait for them to exit.
 
-        After ``config.stop_timeout_s`` any process that has not exited receives
-        SIGKILL.
+        Any child still running ``config.stop_timeout_s`` after the SIGTERM
+        receives SIGKILL.
         """
-        live_procs = [
+        live = [
             (name, proc)
-            for name, proc in self._daemon_procs.items()
+            for procs in (self._daemon_procs, self._scheduled_procs)
+            for name, proc in procs.items()
             if proc.poll() is None
         ]
-        self._sigterm_scheduled()
-        self._sigterm_daemons(live_procs)
-        self._wait_for_daemons(live_procs)
-
-    def _sigterm_scheduled(self) -> None:
-        """Send SIGTERM to any scheduled one-shot processes currently in flight."""
-        for name, state in self._scheduled_states.items():
-            if state.running_pid is None:
-                continue
-            try:
-                os.kill(state.running_pid, signal.SIGTERM)
-                logger.info(
-                    "Sent SIGTERM to scheduled agent '%s' (pid=%d).",
-                    name, state.running_pid,
-                )
-            except ProcessLookupError:
-                pass
-
-    def _sigterm_daemons(self, live_procs: list) -> None:
-        """Send SIGTERM to each live daemon process."""
-        for name, proc in live_procs:
-            logger.info(
-                "Sending SIGTERM to daemon agent '%s' (pid=%d).", name, proc.pid
-            )
+        for name, proc in live:
+            logger.info("Sending SIGTERM to agent '%s' (pid=%d).", name, proc.pid)
             try:
                 proc.send_signal(signal.SIGTERM)
             except ProcessLookupError:
                 pass
+        self._wait_for_children(live)
+        self._daemon_procs.clear()
+        self._scheduled_procs.clear()
 
-    def _wait_for_daemons(self, live_procs: list) -> None:
-        """Wait for daemon processes to exit; escalate to SIGKILL on timeout."""
+    def _wait_for_children(self, live: list) -> None:
+        """Wait for children to exit; SIGKILL any still running at the deadline.
+
+        A child killed by the SIGTERM itself (negative return code) is logged
+        as a warning: it did not get to shut down cleanly, typically because
+        it had not yet installed its SIGTERM handler.
+
+        Args:
+            live: ``(name, Popen)`` pairs that were sent SIGTERM.
+        """
         deadline = time.monotonic() + self._config.stop_timeout_s
-        for name, proc in live_procs:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
+        for name, proc in live:
             try:
-                proc.wait(timeout=remaining)
-                logger.info(
-                    "Daemon agent '%s' exited (rc=%s).", name, proc.returncode
-                )
+                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
                 logger.warning(
-                    "Daemon agent '%s' did not exit within %.0fs — sending SIGKILL.",
-                    name, self._config.stop_timeout_s,
+                    "Agent '%s' (pid=%d) did not exit within %.0fs of SIGTERM — sending SIGKILL.",
+                    name, proc.pid, self._config.stop_timeout_s,
                 )
                 proc.kill()
                 try:
-                    proc.wait()
-                except Exception:
-                    pass
+                    proc.wait(timeout=_KILL_REAP_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    logger.error("Agent '%s' (pid=%d) survived SIGKILL.", name, proc.pid)
+                continue
+            if proc.returncode is not None and proc.returncode < 0:
+                logger.warning(
+                    "Agent '%s' (pid=%d) %s before it could shut down cleanly.",
+                    name, proc.pid, describe_exit(proc.returncode),
+                )
+            else:
+                logger.info("Agent '%s' %s.", name, describe_exit(proc.returncode))
 
     def _health_details(self) -> Mapping[str, Any]:
         """Return per-agent health details for inclusion in the ``HealthReport``.
@@ -256,43 +263,59 @@ class SupervisorAgent(Agent):
             details[name] = state.to_health_dict()
         return {"agents": details}
 
+    # ── Queries used by ``--once`` ─────────────────────────────────────────────
+
+    @property
+    def daemon_names(self) -> list[str]:
+        """Names of the enabled daemon agents, in configuration order."""
+        return list(self._daemon_states)
+
+    def daemons_not_running(self) -> list[str]:
+        """Return the names of enabled daemons that have no live process.
+
+        Returns:
+            Agent names, in configuration order.
+        """
+        return [
+            name for name in self._daemon_states
+            if name not in self._daemon_procs or self._daemon_procs[name].poll() is not None
+        ]
+
+    def wait_for_scheduled(self, poll_s: float = 1.0) -> None:
+        """Block until every in-flight scheduled run has been reaped.
+
+        Run timeouts still apply: an overdue run is killed by the reaper.
+
+        Args:
+            poll_s: Seconds between checks.
+        """
+        while self._scheduled_procs:
+            time.sleep(poll_s)
+            self._reap_scheduled()
+
     # ── Daemon management ──────────────────────────────────────────────────────
 
     def _launch_daemon(self, name: str) -> None:
         """Start (or restart) the daemon agent with the given name.
 
-        Respects back-off: if the state says it is too soon to restart, this
-        method returns without starting a process and the supervisor will retry
-        on the next tick.
+        A launch failure is recorded as a fast failure and the next attempt is
+        scheduled with back-off; ``_poll_daemons`` makes it.
 
         Args:
             name: Agent name, must be a key in ``_daemon_states``.
         """
         state = self._daemon_states[name]
-
-        # Enforce back-off.
-        if time.monotonic() < state.next_restart_after:
-            remaining = state.next_restart_after - time.monotonic()
-            logger.debug(
-                "Back-off active for '%s': %.0fs remaining before next restart attempt.",
-                name, remaining,
-            )
-            return
-
         cmd = state.config.command
         logger.info("Starting daemon agent '%s': %s", name, " ".join(str(c) for c in cmd))
         try:
             proc = subprocess.Popen(cmd)
         except (FileNotFoundError, PermissionError) as exc:
-            logger.error("Failed to launch daemon agent '%s': %s", name, exc)
-            # Schedule a retry with back-off even on launch failure.
             state.record_exit(exit_code=-1)
-            backoff = state.compute_backoff_s()
-            if backoff > 0:
-                state.next_restart_after = time.monotonic() + backoff
-                logger.warning(
-                    "Will retry daemon agent '%s' in %.0fs (back-off).", name, backoff
-                )
+            backoff = state.schedule_restart()
+            logger.error(
+                "Failed to launch daemon agent '%s': %s — retrying %s.",
+                name, exc, f"in {backoff:.0f}s" if backoff > 0 else "at the next tick",
+            )
             return
 
         self._daemon_procs[name] = proc
@@ -300,35 +323,72 @@ class SupervisorAgent(Agent):
         logger.info("Daemon agent '%s' started (pid=%d).", name, proc.pid)
 
     def _poll_daemons(self) -> None:
-        """Check all daemon processes for unexpected exits and restart them."""
-        for name, proc in list(self._daemon_procs.items()):
-            rc = proc.poll()
-            if rc is None:
-                # Process is still running — nothing to do.
-                continue
+        """Record daemon exits and (re)launch every daemon that is due.
 
-            state = self._daemon_states[name]
-            logger.warning(
-                "Daemon agent '%s' (pid=%d) exited unexpectedly (rc=%d). "
-                "Scheduling restart.",
-                name, proc.pid, rc,
-            )
-            state.record_exit(exit_code=rc)
+        Each exit is recorded exactly once: the process handle is dropped as
+        soon as its exit is seen.  A daemon without a process — exited, or
+        never launched successfully — is launched once its back-off expires.
+        """
+        for name, state in self._daemon_states.items():
+            proc = self._daemon_procs.get(name)
+            if proc is not None:
+                rc = proc.poll()
+                if rc is None:
+                    continue
+                del self._daemon_procs[name]
+                uptime = state.record_exit(exit_code=rc)
+                backoff = state.schedule_restart()
+                if backoff > 0:
+                    logger.warning(
+                        "Daemon agent '%s' (pid=%d) %s after %.0fs — %d fast failures in a row, "
+                        "back-off: next attempt in %.0fs.",
+                        name, proc.pid, describe_exit(rc), uptime,
+                        state.consecutive_fast_failures, backoff,
+                    )
+                else:
+                    logger.warning(
+                        "Daemon agent '%s' (pid=%d) %s after %.0fs — restarting.",
+                        name, proc.pid, describe_exit(rc), uptime,
+                    )
 
-            backoff = state.compute_backoff_s()
-            if backoff > 0:
-                state.next_restart_after = time.monotonic() + backoff
-                logger.warning(
-                    "Rapid-restart back-off for '%s': waiting %.0fs before next attempt.",
-                    name, backoff,
+            if time.monotonic() >= state.next_restart_after:
+                self._launch_daemon(name)
+            else:
+                logger.debug(
+                    "Back-off active for '%s': %.0fs remaining.",
+                    name, state.next_restart_after - time.monotonic(),
                 )
-
-            self._launch_daemon(name)
 
     # ── Scheduled management ───────────────────────────────────────────────────
 
+    def _reap_scheduled(self) -> None:
+        """Record finished scheduled runs and kill runs past their timeout."""
+        for name, proc in list(self._scheduled_procs.items()):
+            state = self._scheduled_states[name]
+            rc = proc.poll()
+            if rc is not None:
+                del self._scheduled_procs[name]
+                state.record_completion(rc)
+                logger.log(
+                    logging.INFO if rc == 0 else logging.WARNING,
+                    "Scheduled agent '%s' %s. Next run in %.0fs.",
+                    name, describe_exit(rc), state.config.interval_s or 0,
+                )
+            elif state.is_overdue():
+                logger.error(
+                    "Scheduled agent '%s' (pid=%d) exceeded its timeout (%.0fs) — killing.",
+                    name, proc.pid, state.effective_run_timeout_s(),
+                )
+                proc.kill()
+                try:
+                    proc.wait(timeout=_KILL_REAP_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    logger.error("Scheduled agent '%s' (pid=%d) survived SIGKILL.", name, proc.pid)
+                del self._scheduled_procs[name]
+                state.record_completion(exit_code=-1)
+
     def _dispatch_scheduled(self) -> None:
-        """Dispatch scheduled one-shot agents that are due."""
+        """Launch scheduled one-shot agents that are due, without waiting for them."""
         for name, state in self._scheduled_states.items():
             if not state.is_due():
                 continue
@@ -350,28 +410,8 @@ class SupervisorAgent(Agent):
                 state.record_completion(exit_code=-1)
                 continue
 
+            self._scheduled_procs[name] = proc
             state.record_dispatch(proc.pid)
-            timeout = state.effective_run_timeout_s()
-            try:
-                proc.wait(timeout=timeout)
-                state.record_completion(proc.returncode)
-                level = logging.INFO if proc.returncode == 0 else logging.WARNING
-                logger.log(
-                    level,
-                    "Scheduled agent '%s' finished (rc=%d). Next run in %.0fs.",
-                    name, proc.returncode, state.config.interval_s or 0,
-                )
-            except subprocess.TimeoutExpired:
-                logger.error(
-                    "Scheduled agent '%s' exceeded timeout (%.0fs) — killing.",
-                    name, timeout,
-                )
-                proc.kill()
-                try:
-                    proc.wait()
-                except Exception:
-                    pass
-                state.record_completion(exit_code=-1)
 
     # ── Dependency helpers ─────────────────────────────────────────────────────
 
