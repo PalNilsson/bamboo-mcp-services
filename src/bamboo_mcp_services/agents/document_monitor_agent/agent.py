@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional, List, Dict
 
 from bamboo_mcp_services.agents.base import Agent
+from bamboo_mcp_services.common.fs import is_hidden_name
 from .utils import (
     extract_text_from_file,
     chunk_text,
@@ -25,6 +26,25 @@ from .utils import (
 from .storage import ChromaWrapper, CollectionRouter
 
 LOG = logging.getLogger(__name__)
+
+
+def list_watched_files(directory: Path) -> List[Path]:
+    """Return the files under *directory* that document-monitor should consider.
+
+    Dot-files are skipped: they include the temporary files github-sync writes
+    and then renames into place (and any left behind by a sync killed
+    mid-write), plus clutter such as ``.DS_Store``.  Any other file is read,
+    whatever its extension, so a temporary file would otherwise be embedded.
+    Only the file's own name is checked, so documents under a dot-directory
+    such as ``.github/`` are still indexed.
+
+    Args:
+        directory: Watched directory.
+
+    Returns:
+        Matching files, sorted.
+    """
+    return sorted(p for p in directory.rglob("*") if p.is_file() and not is_hidden_name(p))
 
 
 class DocumentMonitorAgent(Agent):
@@ -302,7 +322,7 @@ class DocumentMonitorAgent(Agent):
         Errors are caught per-file so one bad file does not abort the whole cycle.
         """
         try:
-            files = sorted([p for p in self.directory.rglob("*") if p.is_file()])
+            files = list_watched_files(self.directory)
         except Exception as exc:
             LOG.exception("Failed listing directory %s: %s", self.directory, exc)
             self._last_error = str(exc)

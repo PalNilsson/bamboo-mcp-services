@@ -216,6 +216,23 @@ daemon is slow to start (heavy imports on a cold filesystem), raise
 With the full default configuration `--once` runs github-sync,
 document-monitor and core-reaper back to back, which can take many minutes.
 
+### Signals: stopping the supervisor
+
+Ctrl-C, `kill -TERM <supervisor pid>`, `docker stop` and closing the terminal
+or tmux pane (SIGHUP) all do the same thing: the supervisor sends SIGTERM to
+every child, waits up to `stop_timeout_s`, and sends SIGKILL to any that are
+left.
+
+Each child runs in a session of its own, so terminal signals reach only the
+supervisor.  (Before this, Ctrl-C reached the children directly and raced the
+supervisor's SIGTERM, which produced spurious `killed by SIGTERM` warnings for
+children that had already stopped cleanly.)
+
+On Linux each child is also set to receive SIGTERM if the supervisor dies for
+any reason, `kill -9` included, so no child outlives its supervisor.  That
+safeguard is not available on macOS; there, killing the supervisor with
+`kill -9` leaves its children running.
+
 ### Reading exit codes in the log
 
 Child exits are reported in words.  `exited with code 0` is a clean exit.

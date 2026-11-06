@@ -42,6 +42,22 @@ Daemon state drives restarts, not the presence of a process handle: a daemon
 whose launch failed (for example, a command that is not on ``PATH``) has no
 process at all, and is retried with back-off like any other failure.
 
+Children and signals
+--------------------
+Every child is started in a session of its own, so signals from the terminal
+— Ctrl-C (SIGINT) and hang-up (SIGHUP) go to the terminal's foreground process
+group — reach only the supervisor.  The supervisor then stops the children in
+order with SIGTERM.  Without this, a child received SIGINT and began exiting at
+the same moment the supervisor sent it SIGTERM; the SIGTERM landed during
+interpreter shutdown, after Python had restored the default handler, and a
+child that had already shut down cleanly was reported as killed by SIGTERM.
+
+Leaving the terminal's process group also means a child no longer dies with
+the supervisor by accident.  On Linux each child therefore asks the kernel to
+send it SIGTERM when the supervisor exits for any reason, SIGKILL included
+(``prctl(PR_SET_PDEATHSIG)``), so no child outlives its supervisor.  On other
+platforms (macOS development machines) that step is skipped.
+
 Future extension point
 ----------------------
 A lightweight HTTP health endpoint (e.g. ``GET /health → JSON``) is a natural
@@ -53,13 +69,15 @@ intended integration points.
 """
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, Optional
 
 from bamboo_mcp_services.agents.base import Agent
 from bamboo_mcp_services.agents.supervisor_agent.scheduler import (
@@ -83,6 +101,74 @@ DEFAULT_STOP_TIMEOUT_S = 30.0
 
 #: Seconds to wait for a timed-out scheduled run to die after SIGKILL.
 _KILL_REAP_TIMEOUT_S = 5.0
+
+#: ``PR_SET_PDEATHSIG`` from ``<linux/prctl.h>``.
+_PR_SET_PDEATHSIG = 1
+
+
+def _load_prctl() -> Optional[Callable[..., int]]:
+    """Return libc's ``prctl`` on Linux, or ``None`` where it is unavailable.
+
+    Resolved once, in the parent, so the child does no symbol lookup between
+    ``fork`` and ``exec``.
+
+    Returns:
+        The ``prctl`` function, or ``None``.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        return ctypes.CDLL(None, use_errno=True).prctl
+    except (OSError, AttributeError):
+        return None
+
+
+_PRCTL = _load_prctl()
+
+
+def _die_with_parent(parent_pid: int) -> Optional[Callable[[], None]]:
+    """Return a ``preexec_fn`` that makes the child get SIGTERM when its parent dies.
+
+    The check of ``getppid()`` afterwards closes the race in which the parent
+    died between ``fork`` and the ``prctl`` call: the death signal would then
+    never come, so the child sends it to itself.
+
+    Args:
+        parent_pid: PID of the supervisor (the process calling ``Popen``).
+
+    Returns:
+        The callable, or ``None`` when ``prctl`` is unavailable.
+    """
+    prctl = _PRCTL
+    if prctl is None:
+        return None
+
+    def _preexec() -> None:
+        prctl(_PR_SET_PDEATHSIG, int(signal.SIGTERM))
+        if os.getppid() != parent_pid:
+            os.kill(os.getpid(), signal.SIGTERM)
+
+    return _preexec
+
+
+def _spawn(cmd: list) -> subprocess.Popen:
+    """Start a child in its own session, tied to the supervisor's lifetime.
+
+    Args:
+        cmd: Argument list for the child.
+
+    Returns:
+        The child's ``Popen`` handle.
+
+    Raises:
+        FileNotFoundError: If the command does not exist.
+        PermissionError: If the command is not executable.
+    """
+    return subprocess.Popen(
+        cmd,
+        start_new_session=True,
+        preexec_fn=_die_with_parent(os.getpid()),
+    )
 
 
 @dataclass(frozen=True)
@@ -308,7 +394,7 @@ class SupervisorAgent(Agent):
         cmd = state.config.command
         logger.info("Starting daemon agent '%s': %s", name, " ".join(str(c) for c in cmd))
         try:
-            proc = subprocess.Popen(cmd)
+            proc = _spawn(cmd)
         except (FileNotFoundError, PermissionError) as exc:
             state.record_exit(exit_code=-1)
             backoff = state.schedule_restart()
@@ -400,7 +486,7 @@ class SupervisorAgent(Agent):
                 name, state.run_count + 1, " ".join(str(c) for c in cmd),
             )
             try:
-                proc = subprocess.Popen(cmd)
+                proc = _spawn(cmd)
             except (FileNotFoundError, PermissionError) as exc:
                 logger.error(
                     "Failed to launch scheduled agent '%s': %s", name, exc

@@ -254,7 +254,12 @@ def _load_config(config_path: str) -> Optional[SupervisorConfig]:
 # ── Signal handler ─────────────────────────────────────────────────────────────
 
 def _make_signal_handler(agent: SupervisorAgent):
-    """Return a SIGTERM handler that stops the supervisor (and its children) gracefully.
+    """Return a SIGTERM/SIGHUP handler that stops the supervisor (and its children) gracefully.
+
+    SIGHUP is handled like SIGTERM because the children run in their own
+    sessions: when a terminal or tmux pane closes, only the supervisor receives
+    the hang-up, and dying from it would leave the shutdown to
+    ``PR_SET_PDEATHSIG`` instead of the ordered stop.
 
     Args:
         agent: Running supervisor instance.
@@ -402,7 +407,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logger.info("  [disabled]  %s", a.name)
 
     supervisor = SupervisorAgent(config=cfg)
-    signal.signal(signal.SIGTERM, _make_signal_handler(supervisor))
+    handler = _make_signal_handler(supervisor)
+    signal.signal(signal.SIGTERM, handler)
+    signal.signal(signal.SIGHUP, handler)
 
     try:
         supervisor.start()

@@ -31,8 +31,8 @@ With ``retention_days > 0``, every cycle starts by deleting rows whose
 ``_fetched_utc`` is older than that many days from ``jobs``,
 ``selectionsummary`` and ``errors_by_count``.  ``_fetched_utc`` is refreshed
 each time BigPanda reports a job, so this removes jobs not seen for
-``retention_days``.  DuckDB reuses the freed space but does not shrink the
-file; see ``scripts/compact_duckdb.py``.
+``retention_days``.  DuckDB reuses the freed space but shrinks the file only
+when the free space is at its end; see ``scripts/compact_duckdb.py``.
 """
 from __future__ import annotations
 

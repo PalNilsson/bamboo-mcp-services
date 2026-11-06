@@ -23,6 +23,7 @@ processes are spawned during the test run.
 from __future__ import annotations
 
 import json
+import sys
 import os
 import signal
 import subprocess
@@ -1003,3 +1004,100 @@ agents:
             sv.tick()
         self.assertTrue(any("Failed to launch daemon agent 'missing'" in m for m in logs.output))
         sv.stop()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# S-8: terminal signals reach only the supervisor; children die with it
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CHILD = """
+import pathlib, signal, sys, time
+out = pathlib.Path(sys.argv[1])
+def _on(signum, frame):
+    out.write_text(signal.Signals(signum).name)
+    sys.exit(0)
+signal.signal(signal.SIGTERM, _on)
+signal.signal(signal.SIGINT, _on)
+pathlib.Path(sys.argv[1] + ".started").write_text("x")
+while True:
+    time.sleep(0.05)
+"""
+
+
+class TestChildSessions(unittest.TestCase):
+    """A Ctrl-C used to reach the children directly, racing the supervisor's SIGTERM."""
+
+    @patch("bamboo_mcp_services.agents.supervisor_agent.agent.subprocess.Popen")
+    def test_children_get_their_own_session(self, mock_popen):
+        mock_popen.return_value = _make_mock_proc(pid=1900)
+        sv = SupervisorAgent(config=SupervisorConfig(agents=[_daemon_cfg(name="cric")]))
+        sv.start()
+        self.assertIs(mock_popen.call_args.kwargs.get("start_new_session"), True)
+        sv.stop()
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        self.child_script = os.path.join(self.tmp, "child.py")
+        with open(self.child_script, "w") as fh:
+            fh.write(_CHILD)
+        self.log = os.path.join(self.tmp, "supervisor.log")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _start_supervisor(self, n_children: int = 2):
+        import sys
+        outs = [os.path.join(self.tmp, f"child{i}.signal") for i in range(n_children)]
+        agents = "\n".join(
+            f"  - name: child{i}\n    mode: daemon\n    command: [{sys.executable!r}, {self.child_script!r}, {out!r}]"
+            for i, out in enumerate(outs)
+        )
+        cfg = _write_config(self.tmp, f"health_poll_interval_s: 1\nstop_timeout_s: 5\nagents:\n{agents}\n")
+        code = (
+            "from bamboo_mcp_services.agents.supervisor_agent.cli import main; "
+            f"raise SystemExit(main(['-c', {cfg!r}, '--log-file', {self.log!r}]))"
+        )
+        # Own session, so the test can signal the supervisor's process group the
+        # way a terminal does on Ctrl-C, without signalling the test runner.
+        sup = subprocess.Popen([sys.executable, "-c", code], start_new_session=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 20
+        while not all(os.path.exists(o + ".started") for o in outs):
+            self.assertLess(time.monotonic(), deadline, "children did not start")
+            time.sleep(0.05)
+        return sup, outs
+
+    def _read(self, path):
+        with open(path) as fh:
+            return fh.read()
+
+    def test_ctrl_c_on_the_process_group_stops_children_cleanly(self):
+        sup, outs = self._start_supervisor()
+        os.killpg(sup.pid, signal.SIGINT)           # what the terminal does on Ctrl-C
+        self.assertEqual(sup.wait(timeout=20), 0)
+        for out in outs:
+            self.assertEqual(self._read(out), "SIGTERM", "child got the terminal's SIGINT, not the supervisor's SIGTERM")
+        log = self._read(self.log)
+        self.assertNotIn("killed by", log)
+        self.assertEqual(log.count("exited with code 0"), len(outs))
+
+    def test_sighup_is_an_orderly_stop(self):
+        sup, outs = self._start_supervisor(n_children=1)
+        os.killpg(sup.pid, signal.SIGHUP)           # tmux pane / terminal closed
+        self.assertEqual(sup.wait(timeout=20), 0)
+        self.assertEqual(self._read(outs[0]), "SIGTERM")
+        self.assertIn("exited with code 0", self._read(self.log))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "PR_SET_PDEATHSIG is Linux-only")
+    def test_children_die_when_the_supervisor_is_killed(self):
+        sup, outs = self._start_supervisor()
+        os.kill(sup.pid, signal.SIGKILL)            # no cleanup possible in the supervisor
+        sup.wait(timeout=10)
+        deadline = time.monotonic() + 10
+        while not all(os.path.exists(o) for o in outs):
+            self.assertLess(time.monotonic(), deadline, "a child outlived its SIGKILLed supervisor")
+            time.sleep(0.05)
+        for out in outs:
+            self.assertEqual(self._read(out), "SIGTERM")

@@ -30,8 +30,9 @@ bigpanda_jobs:
   # Delete job rows that BigPanda has not reported for this many days.  Runs at
   # the start of every cycle on the jobs, selectionsummary and errors_by_count
   # tables (keyed on _fetched_utc).  0 disables the purge and keeps everything.
-  # DuckDB reuses the freed space but does not shrink the file; to reclaim
-  # space already used, stop the agent and run scripts/compact_duckdb.py.
+  # DuckDB reuses the freed space but shrinks the file only when the freed
+  # space is at its end; to reclaim scattered free space, stop the agent and
+  # run scripts/compact_duckdb.py.
   retention_days: 7
 
 duckdb_path: "jobs.duckdb"

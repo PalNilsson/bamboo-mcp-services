@@ -16,7 +16,6 @@ import json
 import logging
 import logging.handlers
 import re
-import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -26,6 +25,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import yaml
+
+from bamboo_mcp_services.common.fs import atomic_copy, atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -187,7 +188,7 @@ def save_state(path: Path, state: SyncState) -> None:
         state: SyncState to persist.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state.__dict__, indent=2))
+    atomic_write_text(path, json.dumps(state.__dict__, indent=2))
 
 
 def normalize_text(
@@ -519,7 +520,7 @@ def sync_wiki_repo(cfg: RepoConfig) -> None:
             src = clone_dir / rel_path
             out_path = dest / rel_path
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, out_path)
+            atomic_copy(src, out_path)
             downloaded += 1
 
             if cfg.normalize_for_rag and norm_dest:
@@ -538,7 +539,7 @@ def sync_wiki_repo(cfg: RepoConfig) -> None:
                 )
                 norm_path = norm_dest / rel_path
                 norm_path.parent.mkdir(parents=True, exist_ok=True)
-                norm_path.write_text(normalized, encoding="utf-8")
+                atomic_write_text(norm_path, normalized)
 
     new_state = SyncState(
         last_commit_sha=sha,
@@ -645,7 +646,7 @@ def sync_git_repo(cfg: RepoConfig) -> None:
             src = clone_dir / rel_path
             out_path = dest / rel_path
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, out_path)
+            atomic_copy(src, out_path)
             downloaded += 1
 
             if cfg.normalize_for_rag and norm_dest:
@@ -664,7 +665,7 @@ def sync_git_repo(cfg: RepoConfig) -> None:
                 )
                 norm_path = norm_dest / rel_path
                 norm_path.parent.mkdir(parents=True, exist_ok=True)
-                norm_path.write_text(normalized, encoding="utf-8")
+                atomic_write_text(norm_path, normalized)
 
     new_state = SyncState(
         last_commit_sha=sha,
@@ -781,7 +782,7 @@ def sync_repo(cfg: RepoConfig) -> None:
             )
             norm_path = norm_dest / file_path
             norm_path.parent.mkdir(parents=True, exist_ok=True)
-            norm_path.write_text(normalized, encoding="utf-8")
+            atomic_write_text(norm_path, normalized)
 
     new_state = SyncState(
         last_commit_sha=sha,

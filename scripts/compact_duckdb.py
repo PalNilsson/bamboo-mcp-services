@@ -21,9 +21,11 @@
 
 """Copy a DuckDB database into a fresh file, reclaiming space freed by deletes.
 
-DuckDB reuses the space that ``DELETE`` frees but does not shrink the file, so
-after a retention purge ``jobs.duckdb`` stays at its largest size.  Copying the
-database into a new file writes only the live rows.
+DuckDB reuses the space that ``DELETE`` frees, but it returns space to the
+filesystem only when the free blocks are at the end of the file.  A routine
+retention purge frees blocks scattered through the file, so ``jobs.duckdb``
+stops growing but does not get smaller.  Copying the database into a new file
+writes only the live rows.
 
 The script never touches the source and never replaces it.  It writes
 ``DST``, checks that every table has the same row count in both files, and

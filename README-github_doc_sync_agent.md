@@ -91,6 +91,15 @@ source links in Bamboo responses.
 
 ## Integration with `document-monitor`
 
+**Atomic writes.** document-monitor reads these files while github-sync may be
+rewriting them.  Every file github-sync writes — normalised documents, raw
+copies and its state file — goes to a temporary file in the same directory,
+named `.<name>.<random>.tmp`, is flushed to disk, and is then renamed over the
+target.  A reader sees the old file or the new one, never an empty or
+half-written one, however the two scripts are scheduled.  The temporary name
+starts with a dot because document-monitor ignores dot-files, so a leftover
+from a sync killed mid-write is never embedded.
+
 The two scripts form a pipeline.  Each repo declares its target ChromaDB
 collection via the `collection:` key in the YAML config; the document-monitor
 is then invoked with one `--watch DIR COLLECTION` pair per collection:

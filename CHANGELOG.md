@@ -11,6 +11,14 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+#### `common/fs.py`: atomic file writes (S-7)
+
+`atomic_write_text()` and `atomic_copy()` write to `.<name>.<random>.tmp` in the
+destination directory, `fsync`, then `os.replace` — a reader sees the old file
+or the new one, never a partial one.  Existing permissions are kept; new files
+get the mode `open()` would give rather than `mkstemp`'s 0600.  `copy2`
+metadata (mtime) is preserved.  `is_hidden_name()` tests the final component.
+
 #### Retention for `jobs.duckdb` (S-4)
 
 `bigpanda_jobs.retention_days`: at the start of every cycle, delete rows whose
@@ -21,7 +29,9 @@ key.  A failed purge is logged and does not stop the cycle.
 
 #### `scripts/compact_duckdb.py`
 
-DuckDB reuses space freed by deletes but never shrinks the file.  The script
+DuckDB reuses space freed by deletes and shrinks the file only when the free
+space is at its end — emptying a table does that (1.5 GB → 18.8 MiB on
+aipanda033), routine purges do not.  The script
 copies a stopped database into a new file, checks the row count of every
 table, and prints the `mv` commands to swap them.  It never modifies or
 replaces the source.
@@ -155,6 +165,41 @@ changeset and remain to be renamed separately.
 
 
 ### Fixed
+
+#### document-monitor could embed half-written files from github-sync (S-7)
+
+**Problem:** github-sync wrote its normalised documents with
+`Path.write_text`, which truncates before writing.  document-monitor reads the
+same directories, so a run that coincided with a sync could hash and embed an
+empty or partial file; the next run, up to 10 minutes later, corrected it.
+The window widened when S-5 stopped the supervisor from waiting for scheduled
+runs: before, the blocking dispatch happened to run github-sync and
+document-monitor one after the other.  A real-process test confirms the race:
+in-place writes of a 4 MB file produce partial reads.
+
+**Fix:** all six github-sync write sites (three normalised documents, two raw
+copies, the sync state file) use `common/fs.py`.  document-monitor skips
+dot-files (`list_watched_files()`), so github-sync's temporary files — and any
+left by a sync killed mid-write — are never embedded.  Only the file's own
+name is checked: documents under `.github/`, which the `*.md` patterns already
+sync, are indexed as before.
+
+#### Supervisor: Ctrl-C produced spurious "killed by SIGTERM" warnings; children could outlive the supervisor (S-8, finding 7)
+
+**Problem:** children shared the supervisor's process group.  Ctrl-C delivered
+SIGINT to all of them at once; each child shut down by itself, and the
+supervisor's SIGTERM then landed during the child's interpreter shutdown,
+after Python had restored the default handler, so a cleanly stopped child was
+reported as `killed by SIGTERM` (seen on aipanda033, 2026-11-06).  A
+supervisor killed with SIGKILL also left its children running.
+
+**Fix:** children start in their own session (`start_new_session=True`), so
+terminal signals reach only the supervisor, which stops the children in order.
+SIGHUP (terminal or tmux pane closed) is handled like SIGTERM — necessary now,
+or the supervisor would die of the hang-up and leave children it no longer
+shares a process group with.  On Linux each child sets
+`prctl(PR_SET_PDEATHSIG, SIGTERM)`, re-checking `getppid()` to close the fork
+race, so it is terminated when the supervisor dies for any reason.
 
 #### `bamboo-cric` and `bamboo-ingestion` locked every other process out of their databases (S-1, S-2)
 

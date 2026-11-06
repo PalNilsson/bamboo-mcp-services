@@ -19,6 +19,15 @@ A production-oriented script that watches one or more directories for new or cha
 
 ## Design guarantees
 
+### Dot-files are ignored
+
+Every other file under a watched directory is read, whatever its extension
+(unknown types are decoded as text).  Files whose own name starts with `.` are
+skipped: github-sync's temporary files (see its README), anything left by a
+sync killed mid-write, and clutter such as `.DS_Store`.  Only the file name is
+checked, so documents under a dot-directory such as `.github/` are still
+indexed, as before.
+
 ### Deterministic IDs
 
 Chunk IDs are derived from `absolute_file_path + chunk_index`, hashed with SHA-256, and prefixed with `doc:`. This ensures stable IDs across re-ingestion and replace-in-place behaviour when content changes.

@@ -390,9 +390,12 @@ not jobs created that long ago.  A row exactly `retention_days` old is kept.
 A failed purge is logged and retried at the start of the next cycle; it does
 not stop the cycle.
 
-DuckDB reuses the space a purge frees but does **not** shrink the file.  To
-reclaim space already used, stop the agent (and every reader) and copy the
-database into a new file:
+DuckDB reuses the space a purge frees, but it shrinks the file only when the
+freed space is at the end of it.  Emptying a table does that — the first purge
+on aipanda033 deleted every job and took `jobs.duckdb` from 1.5 GB to 18.8 MiB
+— but routine purges free space scattered through the file, which is reused
+rather than returned.  To reclaim it, stop the agent (and every reader) and
+copy the database into a new file:
 
 ```bash
 python scripts/compact_duckdb.py /data/bamboo/db/jobs.duckdb /data/bamboo/db/jobs.compact.duckdb
