@@ -82,6 +82,7 @@ def make_workspace(
     manifest_version: int = 1,
     job_dir: bool = True,
     extra_clutter: bool = True,
+    now: datetime = NOW,
 ) -> Path:
     """Create a workspace on disk that mirrors the real layout.
 
@@ -96,13 +97,17 @@ def make_workspace(
         manifest_version: Value for ``manifest_version``.
         job_dir: Whether to create ``job/``.
         extra_clutter: Whether to drop a stray ``probe.sh`` in the workspace.
+        now: The moment *age_hours* is measured back from.  Defaults to the
+            fixed :data:`NOW` that tests pass to ``sweep(now=NOW)``.  Tests
+            that go through ``main()`` must pass :func:`_wall_now`, because
+            ``main()`` sweeps with the real clock.
 
     Returns:
         Path to the created workspace.
     """
     workspace = root / f"job-{job_id}"
     workspace.mkdir(parents=True, exist_ok=True)
-    finished = NOW - timedelta(hours=age_hours)
+    finished = now - timedelta(hours=age_hours)
 
     if job_dir:
         job = workspace / JOB_SUBDIR
@@ -132,6 +137,20 @@ def make_workspace(
 
     _backdate(workspace, finished)
     return workspace
+
+
+def _wall_now() -> datetime:
+    """Return the real current time, for workspaces swept through ``main()``.
+
+    ``main()`` calls ``sweep()`` without ``now``, so ages are measured from the
+    wall clock.  A workspace aged from the fixed :data:`NOW` instead only had
+    its intended age on 2026-08-24; ``test_config_file_values_are_used`` began
+    failing four days later.
+
+    Returns:
+        ``datetime.now(timezone.utc)``.
+    """
+    return datetime.now(timezone.utc)
 
 
 def _backdate(workspace: Path, when: datetime) -> None:
@@ -1023,7 +1042,7 @@ class TestCli:
         """A clean sweep below the pressure mark exits 0."""
         root = tmp_path / "core-analysis"
         root.mkdir()
-        make_workspace(root, job_id="1", age_hours=500.0, core_bytes=1024)
+        make_workspace(root, job_id="1", now=_wall_now(), age_hours=500.0, core_bytes=1024)
         monkeypatch.setattr(reaper, "ALLOWED_PREFIXES", (str(root),))
         code = main([
             "--config", str(tmp_path / "absent.yaml"),
@@ -1041,7 +1060,7 @@ class TestCli:
         """Usage above the pressure mark with reclaimable space exits 3."""
         root = tmp_path / "core-analysis"
         root.mkdir()
-        make_workspace(root, job_id="1", age_hours=500.0, core_bytes=200_000)
+        make_workspace(root, job_id="1", now=_wall_now(), age_hours=500.0, core_bytes=200_000)
         monkeypatch.setattr(reaper, "ALLOWED_PREFIXES", (str(root),))
         code = main([
             "--config", str(tmp_path / "absent.yaml"),
@@ -1057,7 +1076,7 @@ class TestCli:
         """``--format json`` emits a parseable report."""
         root = tmp_path / "core-analysis"
         root.mkdir()
-        make_workspace(root, job_id="1", age_hours=500.0)
+        make_workspace(root, job_id="1", now=_wall_now(), age_hours=500.0)
         monkeypatch.setattr(reaper, "ALLOWED_PREFIXES", (str(root),))
         main([
             "--config", str(tmp_path / "absent.yaml"),
@@ -1082,7 +1101,7 @@ class TestCli:
         """Settings come from the config file when no flag overrides them."""
         root = tmp_path / "core-analysis"
         root.mkdir()
-        make_workspace(root, job_id="1", age_hours=5.0)
+        make_workspace(root, job_id="1", now=_wall_now(), age_hours=5.0)
         cfg = tmp_path / "reaper.yaml"
         cfg.write_text(f"root: {root}\nmin_age_hours: 100.0\nquota_bytes: 100000000\n", encoding="utf-8")
         monkeypatch.setattr(reaper, "ALLOWED_PREFIXES", (str(root),))
@@ -1095,7 +1114,7 @@ class TestCli:
         """A flag beats the same setting in the config file."""
         root = tmp_path / "core-analysis"
         root.mkdir()
-        make_workspace(root, job_id="1", age_hours=5.0)
+        make_workspace(root, job_id="1", now=_wall_now(), age_hours=5.0)
         cfg = tmp_path / "reaper.yaml"
         cfg.write_text(f"root: {root}\nmin_age_hours: 100.0\nquota_bytes: 100000000\n", encoding="utf-8")
         monkeypatch.setattr(reaper, "ALLOWED_PREFIXES", (str(root),))

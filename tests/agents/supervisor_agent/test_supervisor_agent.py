@@ -168,11 +168,13 @@ class TestDaemonState(unittest.TestCase):
         self.assertEqual(self.state.compute_backoff_s(), 0.0)
 
     def test_exit_exactly_at_the_minimum_uptime_is_not_fast(self):
+        # Pin the start to an integer: with a real monotonic value t,
+        # (t + 60.0) - t is often 59.99999999999818, which made this test fail
+        # intermittently.  1000.0 and 1060.0 are exact in binary floating point.
         self.state.record_start(pid=2)
-        started = self.state.started_monotonic
-        assert started is not None
+        self.state.started_monotonic = 1000.0
         with patch("bamboo_mcp_services.agents.supervisor_agent.scheduler.time.monotonic",
-                   return_value=started + BACKOFF_MIN_UPTIME_S):
+                   return_value=1000.0 + BACKOFF_MIN_UPTIME_S):
             self.state.record_exit(exit_code=1)
         self.assertEqual(self.state.consecutive_fast_failures, 0)
 

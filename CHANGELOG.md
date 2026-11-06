@@ -166,6 +166,25 @@ changeset and remain to be renamed separately.
 
 ### Fixed
 
+#### Three tests depended on the wall clock (S-9; tests only)
+
+- **`test_config_file_values_are_used` (core-reaper) failed from 2026-08-28.**
+  Workspaces were aged from a fixed `NOW` (2026-08-24), but `main()` sweeps with
+  the real clock, so a "5-hour-old" workspace was 1,783 h old by November.
+  `make_workspace()` takes a `now` argument; the `TestCli` tests use the real
+  clock.
+- **`test_cli_overrides_the_config_file` passed for the wrong reason.**  For
+  the same cause, the workspace was a candidate whether or not
+  `--min-age-hours` overrode the config; with the override disabled the old
+  test still passed.  It now fails in that case.
+- **`test_exit_exactly_at_the_minimum_uptime_is_not_fast` (supervisor) failed
+  intermittently.**  `(t + 60.0) - t` is not exactly 60.0 when `t + 60` crosses
+  a power of two, which happens to a real monotonic clock within 60 s below
+  2^k (46% of values there).  The test now uses an exact start time.
+- **The race-control test in `test_atomic_writes.py` skips** instead of
+  failing when a machine never shows the in-place-write race; not observing
+  it means the atomic-write test is unproven there, not that anything broke.
+
 #### document-monitor could embed half-written files from github-sync (S-7)
 
 **Problem:** github-sync wrote its normalised documents with
