@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Dict, List, Optional, Set
+
+from chromadb.api.models.Collection import Collection
 
 from bamboo_mcp_services.agents.base import Agent
 from bamboo_mcp_services.common.fs import is_hidden_name
@@ -23,9 +26,72 @@ from .utils import (
     summarise_chunks,
     CheckpointStore,
 )
-from .storage import ChromaWrapper, CollectionRouter
+from .storage import ChromaWrapper, CollectionRouter, FileVersions
 
 LOG = logging.getLogger(__name__)
+
+
+@dataclass
+class _CyclePlan:
+    """What one poll cycle found on disk.
+
+    Attributes:
+        present: Files that yielded text, mapped to their content hash.
+        candidates: New or changed files, mapped to their text.
+        unreadable: Files whose text could not be read this cycle.
+        removed: Checkpointed files that are gone or no longer yield text.
+    """
+
+    present: Dict[str, str] = field(default_factory=dict)
+    candidates: Dict[str, str] = field(default_factory=dict)
+    unreadable: Set[str] = field(default_factory=set)
+    removed: List[str] = field(default_factory=list)
+
+
+@dataclass
+class _CycleResult:
+    """What one poll cycle wrote into the idle slot.
+
+    Attributes:
+        expected: File versions the idle slot must hold, with record counts.
+        updates: Checkpoint snapshots for files embedded this cycle.
+        ingested: Files embedded successfully.
+        repaired: Of those, files re-embedded because the live slot lacked them.
+        carried: Files carried over from the live slot.
+        failed: Files whose embedding failed.
+    """
+
+    expected: FileVersions = field(default_factory=dict)
+    updates: Dict[str, Dict] = field(default_factory=dict)
+    ingested: int = 0
+    repaired: int = 0
+    carried: int = 0
+    failed: int = 0
+
+
+def compare_versions(expected: FileVersions, actual: FileVersions) -> List[str]:
+    """List the differences between the file versions a slot should and does hold.
+
+    Args:
+        expected: ``{source_file: {content_hash: record count}}`` written this cycle.
+        actual: The same, as read back from the slot.
+
+    Returns:
+        One human-readable line per differing file; empty when they match.
+    """
+    problems: List[str] = []
+    for path_str in sorted(expected.keys() | actual.keys()):
+        want = expected.get(path_str)
+        got = actual.get(path_str)
+        if want == got:
+            continue
+        if got is None:
+            problems.append(f"missing {path_str}")
+        elif want is None:
+            problems.append(f"unexpected {path_str}")
+        else:
+            problems.append(f"{path_str}: expected {want}, found {got}")
+    return problems
 
 
 def list_watched_files(directory: Path) -> List[Path]:
@@ -172,40 +238,47 @@ class DocumentMonitorAgent(Agent):
 
         return True, h, prev_chunk_ids
 
+    def _processed(self) -> Dict[str, Dict]:
+        """Return the checkpoint's ``processed`` mapping (filename -> snapshot).
+
+        Returns:
+            The live mapping held by the checkpoint store.
+        """
+        return self.checkpoint._data.get("processed", {})
+
     def _ingest_file(
         self,
         path_str: str,
         text: str,
         h: str,
         target_col: object,
-    ) -> None:
+    ) -> Dict:
         """Chunk, embed, and write a single file's vectors into *target_col*.
 
         This method is a **pure writer** — it has no knowledge of blue/green
-        slots or routing.  Slot lifecycle (idle slot creation, promotion, and
-        cleanup on failure) is managed entirely by :meth:`_tick_impl`, which
-        calls this method for every changed file in a cycle and passes the same
-        idle collection object each time.  This ensures the idle slot
-        accumulates all changed files before being promoted as a complete corpus.
+        slots, routing or the checkpoint.  It returns the checkpoint snapshot
+        for the file; :meth:`_tick_impl` records it only after the slot it was
+        written into has gone live, so the checkpoint never claims a version
+        readers cannot see.
 
         Args:
             path_str: Absolute path to the file being ingested.
             text: Full extracted text of the file.
             h: SHA-256 content hash of *text*.
             target_col: Open ChromaDB Collection object to write into.
+
+        Returns:
+            Checkpoint snapshot: ``content_hash``, ``processed_ts``, ``chunks``
+            and ``chunk_ids``.
         """
         chunks = chunk_text(text, chunk_size=self.chunk_size, overlap=self.chunk_overlap)
         ts = datetime.now(timezone.utc).isoformat()
 
         if not chunks:
             LOG.debug("No chunks generated for %s; recording empty checkpoint.", path_str)
-            self.checkpoint.mark_processed(
-                path_str,
-                {"content_hash": h, "processed_ts": ts, "chunks": 0, "chunk_ids": []},
-            )
             self._last_processed_file = path_str
             self._last_error = None
-            return
+            return {"content_hash": h, "processed_ts": ts, "chunks": 0, "chunk_ids": []}
 
         # For PDF files, log a chunk-quality summary so operators can verify
         # that text extraction produced sensible content.  Scanned PDFs that
@@ -237,51 +310,174 @@ class DocumentMonitorAgent(Agent):
             embeddings=embeddings,
         )
 
-        self.checkpoint.mark_processed(
-            path_str,
-            {"content_hash": h, "processed_ts": ts, "chunks": len(chunks), "chunk_ids": ids},
-        )
-
         self._last_processed_file = path_str
         self._last_error = None
         LOG.info("Processed file %s -> chunks=%d", path_str, len(chunks))
+        return {"content_hash": h, "processed_ts": ts, "chunks": len(chunks), "chunk_ids": ids}
 
-    def _promote_idle_slot(
-        self,
-        idle_physical: str,
-        processed_count: int,
-        skipped_count: int,
-        candidate_count: int,
-    ) -> None:
-        """Promote or discard the idle slot based on ingestion results.
-
-        Called once per cycle after all candidates have been processed.
-
-        If *processed_count* is 0, every file failed — the idle slot is cleaned
-        up and the live slot is left untouched.  Otherwise the idle slot is
-        atomically promoted via :meth:`~storage.CollectionRouter.commit_swap`,
-        and a post-cycle routing invariant check is run.
+    def _plan_cycle(self, files: List[Path]) -> _CyclePlan:
+        """Read every watched file and decide what this cycle has to do.
 
         Args:
-            idle_physical: Name of the physical idle collection built this cycle.
-            processed_count: Number of files successfully ingested this cycle.
-            skipped_count: Number of files skipped (unchanged content hash).
-            candidate_count: Total number of candidates attempted this cycle.
+            files: Files returned by :func:`list_watched_files`.
+
+        Returns:
+            The cycle plan.  A file whose text cannot be read is listed as
+            unreadable rather than removed, so a transient read error never
+            drops a document from the store.
         """
-        if processed_count == 0:
+        plan = _CyclePlan()
+        total = len(files)
+        for file_num, p in enumerate(files, start=1):
+            path_str = str(p.resolve())
+            try:
+                text = extract_text_from_file(path_str)
+            except Exception as exc:
+                LOG.exception("Error reading file %s: %s", path_str, exc)
+                self._last_error = str(exc)
+                plan.unreadable.add(path_str)
+                continue
+            if not text:
+                LOG.debug("No text extracted from %s; skipping.", path_str)
+                continue
+            changed, h, _ = self._is_file_changed(path_str, text, file_num, total)
+            plan.present[path_str] = h
+            if changed:
+                plan.candidates[path_str] = text
+
+        plan.removed = [p for p in self._processed() if p not in plan.present and p not in plan.unreadable]
+        for path_str in plan.removed:
+            LOG.info("File removed or no longer yields text, dropping: %s", path_str)
+        return plan
+
+    def _plan_carry(self, plan: _CyclePlan, live: FileVersions) -> tuple[Dict[str, str], Dict[str, str]]:
+        """Split the files this cycle does not re-embed into carried and repaired.
+
+        An unchanged file is carried over from the live slot when the live slot
+        holds the version the checkpoint records.  If it does not — a store
+        left inconsistent by an earlier version of this agent — the file is
+        re-embedded instead, so the new slot is complete.
+
+        Args:
+            plan: The cycle plan.
+            live: Versions held by the live slot.
+
+        Returns:
+            ``(carry, repair)``: files to carry as ``{path: content_hash}``, and
+            files to re-embed as ``{path: text}``.
+        """
+        processed = self._processed()
+        carry: Dict[str, str] = {}
+        repair: Dict[str, str] = {}
+        keep = [p for p in plan.present if p not in plan.candidates] + sorted(plan.unreadable)
+        for path_str in keep:
+            meta = processed.get(path_str) or {}
+            h = meta.get("content_hash")
+            if not meta.get("chunks") or not h:
+                continue
+            if live.get(path_str, {}).get(h):
+                carry[path_str] = h
+            elif path_str in plan.unreadable:
+                LOG.warning("Cannot carry or re-read %s; it will be missing until it is readable.", path_str)
+            else:
+                try:
+                    repair[path_str] = extract_text_from_file(path_str)
+                except Exception as exc:
+                    LOG.exception("Error re-reading %s for repair: %s", path_str, exc)
+                    self._last_error = str(exc)
+        if repair:
             LOG.warning(
-                "Poll cycle: all %d candidate(s) failed; idle slot cleaned up, "
-                "no swap performed.", candidate_count,
+                "Live slot is missing %d checkpointed file(s); re-embedding them.", len(repair),
+            )
+        return carry, repair
+
+    def _build_idle_slot(self, plan: _CyclePlan, idle_col: Collection) -> _CycleResult:
+        """Write the complete corpus for this cycle into the idle slot.
+
+        Changed, new and repaired files are embedded.  Every other file is
+        carried over from the live slot by copying its stored records, so the
+        idle slot holds the whole corpus, not just what changed.  A changed
+        file whose embedding fails keeps its previous version.
+
+        Args:
+            plan: The cycle plan.
+            idle_col: The freshly recreated idle collection.
+
+        Returns:
+            What was written and what the slot is expected to contain.
+        """
+        result = _CycleResult()
+        processed = self._processed()
+        live = self.chroma.file_versions(self.collection)
+        carry, repair = self._plan_carry(plan, live)
+        result.repaired = len(repair)
+
+        for path_str, text in {**plan.candidates, **repair}.items():
+            h = plan.present[path_str]
+            try:
+                snapshot = self._ingest_file(path_str, text, h, idle_col)
+            except Exception as exc:
+                LOG.exception("Error processing file %s: %s", path_str, exc)
+                self._last_error = str(exc)
+                result.failed += 1
+                old = processed.get(path_str) or {}
+                old_hash = old.get("content_hash")
+                if old.get("chunks") and old_hash and live.get(path_str, {}).get(old_hash):
+                    carry[path_str] = old_hash
+                continue
+            result.ingested += 1
+            result.updates[path_str] = snapshot
+            if snapshot["chunks"]:
+                result.expected[path_str] = {h: snapshot["chunks"]}
+
+        copied = self.chroma.copy_files(self.collection, idle_col, carry)
+        result.carried = len(copied)
+        for path_str, h in carry.items():
+            result.expected[path_str] = {h: live[path_str][h]}
+        return result
+
+    def _promote_idle_slot(self, plan: _CyclePlan, idle_physical: str, idle_col: Collection, result: _CycleResult) -> None:
+        """Promote the idle slot if it is complete, then commit the checkpoint.
+
+        The slot is discarded, and the live slot left serving, when nothing
+        was written successfully, when it would hold no documents, or when its
+        contents differ from what this cycle wrote into it.  The checkpoint is
+        updated only after a successful swap.
+
+        Args:
+            plan: The cycle plan.
+            idle_physical: Name of the idle collection.
+            idle_col: The idle collection.
+            result: What :meth:`_build_idle_slot` wrote.
+        """
+        if result.ingested == 0 and not plan.removed:
+            LOG.warning(
+                "Poll cycle: all %d file(s) to embed failed; idle slot cleaned up, no swap performed.",
+                result.failed,
             )
             self.chroma.delete_collection(idle_physical)
             return
+        if not result.expected:
+            LOG.warning("Poll cycle would leave '%s' with no documents; keeping the live slot.", self._logical_name)
+            self.chroma.delete_collection(idle_physical)
+            return
+        problems = compare_versions(result.expected, self.chroma.file_versions(idle_col))
+        if problems:
+            message = (
+                f"Idle slot '{idle_physical}' does not hold the expected corpus "
+                f"({len(problems)} file(s) differ); not promoted, live slot unchanged: "
+                + "; ".join(problems[:5])
+            )
+            LOG.error("%s", message)
+            self._last_error = message
+            self.chroma.delete_collection(idle_physical)
+            return
 
-        # Atomically promote the idle slot.  commit_swap raises RuntimeError
-        # if the new slot is empty.
         self.router.commit_swap(self._logical_name, self.chroma)
         new_live = self.router.live_name(self._logical_name)
         self.collection = self.chroma.get_or_create_collection(new_live)
         self.chroma.persist()
+        self.checkpoint.apply(result.updates, plan.removed)
 
         # Post-cycle invariant check: verify all routed collections are non-empty.
         try:
@@ -291,35 +487,33 @@ class DocumentMonitorAgent(Agent):
             self._last_error = str(inv_exc)
 
         LOG.info(
-            "Poll cycle complete: %d file(s) ingested, %d unchanged. "
-            "Live slot: %s. Next poll in %ds.",
-            processed_count, skipped_count, new_live, self.poll_interval_sec,
+            "Poll cycle complete: %d file(s) embedded (%d repaired), %d carried over, "
+            "%d removed, %d failed. Live slot: %s. Next poll in %ds.",
+            result.ingested, result.repaired, result.carried, len(plan.removed),
+            result.failed, new_live, self.poll_interval_sec,
         )
 
     def _tick_impl(self) -> None:
-        """Perform one polling cycle: detect new/changed files, ingest into ChromaDB.
+        """Perform one polling cycle: detect changes and rebuild the idle slot.
 
         Blue/green slot lifecycle
         -------------------------
-        The idle slot is managed at the **cycle** level, not the file level:
+        1. Read every watched file.  If no file is new, changed or removed,
+           skip the cycle without touching ChromaDB.
+        2. Delete and recreate the idle slot.  Recreating from scratch clears
+           any embedding dimension inherited from a previous cycle.
+        3. Embed new and changed files into the idle slot, and carry every
+           unchanged file over from the live slot by copying its stored
+           records.  Removed files are not carried.  A changed file whose
+           embedding fails keeps its previous version.
+        4. Check that the idle slot holds exactly the expected file versions;
+           if not, discard it and leave the live slot serving.
+        5. Promote the idle slot with
+           :meth:`~storage.CollectionRouter.commit_swap`, then record the
+           cycle in the checkpoint.
 
-        1. Scan all files; if none have changed skip slot management entirely.
-        2. Delete and recreate the idle slot once at the start of the cycle.
-           Recreating from scratch clears any embedding dimension inherited from
-           a previous cycle, guarding against dimension-mismatch errors when the
-           embedder model changes.
-        3. Write every changed file's chunks into the **same** idle collection.
-           All files accumulate into one slot before any swap occurs.
-        4. After all files are written, call :meth:`~storage.CollectionRouter.commit_swap`
-           once.  The routing sidecar is updated atomically (``os.replace``) and
-           readers are transparently redirected to the new slot.
-        5. If any file write fails the error is logged and the file is skipped,
-           but the cycle continues.  The slot is still promoted at the end with
-           whatever was successfully written — a partial update is better than no
-           update.  If *no* files were written successfully the idle slot is
-           cleaned up and no swap occurs, leaving the live slot untouched.
-
-        Errors are caught per-file so one bad file does not abort the whole cycle.
+        The idle slot therefore always holds the whole corpus, never just the
+        files that changed, and the checkpoint is never ahead of the live slot.
         """
         try:
             files = list_watched_files(self.directory)
@@ -329,60 +523,21 @@ class DocumentMonitorAgent(Agent):
             time.sleep(self.poll_interval_sec)
             return
 
-        # --- First pass: identify which files need ingesting ---------------
-        candidates: list[tuple[str, str, str]] = []  # (path_str, text, hash)
-        skipped_count = 0
-        total_files = len(files)
-
-        for file_num, p in enumerate(files, start=1):
-            path_str = str(p.resolve())
-            try:
-                text = extract_text_from_file(path_str)
-                if not text:
-                    LOG.debug("No text extracted from %s; skipping.", path_str)
-                    continue
-                changed, h, _ = self._is_file_changed(path_str, text, file_num, total_files)
-                if not changed:
-                    skipped_count += 1
-                    continue
-                candidates.append((path_str, text, h))
-            except Exception as exc:
-                LOG.exception("Error reading file %s: %s", path_str, exc)
-                self._last_error = str(exc)
-
-        if not candidates:
+        plan = self._plan_cycle(files)
+        if not plan.candidates and not plan.removed:
             LOG.debug(
                 "Poll cycle complete: no changes detected (%d file(s) unchanged). "
-                "Next poll in %ds.", skipped_count, self.poll_interval_sec,
+                "Next poll in %ds.", len(plan.present), self.poll_interval_sec,
             )
             time.sleep(self.poll_interval_sec)
             return
 
-        # --- Open the idle slot once for the whole cycle -------------------
         idle_physical = self.router.idle_name(self._logical_name)
-
-        # Always delete then recreate — clears any locked embedding dimension
-        # from a previous cycle so a changed embedder model never causes a
-        # dimension-mismatch error.
         self.chroma.delete_collection(idle_physical)
         idle_col = self.chroma.create_collection(idle_physical)
-
-        # --- Second pass: write all candidates into the idle slot ----------
-        processed_count = 0
-
         try:
-            for path_str, text, h in candidates:
-                try:
-                    self._ingest_file(path_str, text, h, idle_col)
-                    processed_count += 1
-                except Exception as exc:
-                    LOG.exception("Error processing file %s: %s", path_str, exc)
-                    self._last_error = str(exc)
-
-            self._promote_idle_slot(
-                idle_physical, processed_count, skipped_count, len(candidates),
-            )
-
+            result = self._build_idle_slot(plan, idle_col)
+            self._promote_idle_slot(plan, idle_physical, idle_col, result)
         except Exception as exc:
             # Unexpected error outside the per-file loop — clean up and bail.
             LOG.exception("Unexpected error during poll cycle: %s", exc)

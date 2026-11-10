@@ -46,11 +46,14 @@ Two physical ChromaDB collections are maintained per logical collection name:
 Only one slot is live at any time.  The other is the idle build target.  On each update cycle:
 
 1. The idle slot is **deleted and recreated from scratch**.  This clears any embedding dimension locked in from a previous cycle — see [Dimension mismatch protection](#dimension-mismatch-protection) below.
-2. New chunks are embedded and written into the idle slot.  Readers still address the live slot; they are unaffected.
-3. A routing sidecar file (`<chroma-dir>/collection_routing.json`) is updated via `os.replace` — a POSIX atomic rename — to point the logical collection name at the newly-built slot.
-4. The old live slot is deleted.
+2. New and changed files are embedded and written into the idle slot.  Every unchanged file is **carried over** from the live slot by copying its stored records (ids, vectors, text, metadata), so nothing is re-embedded and the idle slot holds the whole corpus, not just what changed.  Removed files are not carried.  Readers still address the live slot; they are unaffected.
+3. The idle slot is checked against what was written into it: every expected file, at the expected version, with the expected number of chunks.  If anything differs, the idle slot is discarded and the live slot keeps serving.
+4. A routing sidecar file (`<chroma-dir>/collection_routing.json`) is updated via `os.replace` — a POSIX atomic rename — to point the logical collection name at the newly-built slot.
+5. The old live slot is deleted, and only then is the checkpoint updated, so it never records a version readers cannot see.
 
-Between steps 2 and 4 the old slot remains fully queryable.  There is no window where the collection is empty or partially filled.
+Between steps 2 and 5 the old slot remains fully queryable.  There is no window where the collection is empty or partially filled.
+
+A cycle runs when a file is new, changed or removed (deleted, or no longer yielding text); otherwise ChromaDB is not touched.  A changed file whose embedding fails keeps its previous version until the next cycle retries it.  A file that cannot be read this cycle is carried over rather than dropped.  If the live slot lacks a file the checkpoint lists — a store written by an earlier version of this agent — the file is re-embedded.  A cycle that would leave the collection with no documents does not swap.
 
 #### Routing sidecar
 
@@ -109,7 +112,7 @@ With the blue/green design this can never corrupt live data:
 
 ### Replace-on-change strategy
 
-When a file's content hash changes, the full blue/green cycle runs for that file: the idle slot is rebuilt with the new chunk set (which includes the updated file's chunks and all other files' chunks), and the swap promotes it atomically.  Stale vectors from the changed file never appear in query results.
+When a file's content hash changes, the full blue/green cycle runs: the idle slot is rebuilt with the changed file's new chunks plus every other file's chunks carried over from the live slot, and the swap promotes it atomically.  Stale vectors from the changed file never appear in query results.
 
 ---
 
@@ -505,6 +508,8 @@ conda activate bamboo-mcp-services
   }
 }
 ```
+
+The checkpoint is written once per cycle, after the swap.  Entries for files that were removed are deleted.
 
 ---
 

@@ -12,7 +12,7 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import List, Dict
+from typing import Dict, Iterable, List
 
 from pdfminer.high_level import extract_text as pdf_extract_text
 import docx
@@ -311,6 +311,23 @@ class CheckpointStore:
             snapshot: Metadata dict to store (e.g., content_hash, processed_ts).
         """
         self._data.setdefault("processed", {})[filename] = snapshot
+        self.save()
+
+    def apply(self, updates: Dict[str, Dict], removed: Iterable[str]) -> None:
+        """Record a whole cycle's outcome and save once.
+
+        Called after the cycle's slot has gone live, so the checkpoint never
+        claims a file version that readers cannot see.
+
+        Args:
+            updates: Mapping of absolute filename to its new snapshot.
+            removed: Filenames to forget (no longer on disk or no longer
+                yielding text).
+        """
+        processed = self._data.setdefault("processed", {})
+        processed.update(updates)
+        for filename in removed:
+            processed.pop(filename, None)
         self.save()
 
     def is_processed(self, filename: str, content_hash_str: str) -> bool:

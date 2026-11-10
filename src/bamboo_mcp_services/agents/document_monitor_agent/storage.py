@@ -33,7 +33,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import chromadb
 from chromadb.config import Settings
@@ -43,6 +43,26 @@ LOG = logging.getLogger(__name__)
 
 #: The two physical slot suffixes used for blue/green rotation.
 _SLOTS = ("__a", "__b")
+
+#: Records read per ``collection.get`` call when scanning or copying a slot.
+_PAGE_SIZE = 1000
+
+#: Source file -> {content hash -> number of records}, as held by one collection.
+FileVersions = Dict[str, Dict[str, int]]
+
+
+def _as_float_list(vector: Any) -> List[float]:
+    """Convert one stored embedding (list or numpy array) to a list of floats.
+
+    Args:
+        vector: Embedding as returned by ``collection.get``.
+
+    Returns:
+        The embedding as plain Python floats.
+    """
+    if hasattr(vector, "tolist"):
+        return [float(x) for x in vector.tolist()]
+    return [float(x) for x in vector]
 
 
 class CollectionRouter:
@@ -455,6 +475,75 @@ class ChromaWrapper:
         except Exception:
             LOG.warning("ChromaWrapper: could not list collections for count snapshot.")
             return {}
+
+    def file_versions(self, collection: Collection) -> FileVersions:
+        """Count the records in *collection* per source file and content hash.
+
+        Pages through the collection reading metadata only.  A record without
+        a ``source_file`` is ignored; one without a ``content_hash`` is counted
+        under the empty string, which never matches a real hash.
+
+        Args:
+            collection: Collection to inspect.
+
+        Returns:
+            Mapping of source file to ``{content_hash: record count}``.
+        """
+        versions: FileVersions = {}
+        for offset in range(0, collection.count(), _PAGE_SIZE):
+            got = collection.get(limit=_PAGE_SIZE, offset=offset, include=["metadatas"])
+            for meta in got.get("metadatas") or []:
+                if not meta or not meta.get("source_file"):
+                    continue
+                per_hash = versions.setdefault(str(meta["source_file"]), {})
+                key = str(meta.get("content_hash", ""))
+                per_hash[key] = per_hash.get(key, 0) + 1
+        return versions
+
+    def copy_files(self, source: Collection, target: Collection, keep: Dict[str, str]) -> Dict[str, int]:
+        """Copy the stored records of selected file versions from *source* to *target*.
+
+        Records are copied as stored — ids, embeddings, documents and metadata —
+        so nothing is re-embedded.  A record is copied only when its
+        ``source_file`` is a key of *keep* and its ``content_hash`` equals the
+        value for that key, so a stale version of a file is never carried.
+
+        Args:
+            source: Collection to read from (the live slot).
+            target: Collection to write into (the idle slot being built).
+            keep: Mapping of source file to the content hash to carry.
+
+        Returns:
+            Mapping of source file to the number of records copied.
+        """
+        copied: Dict[str, int] = {}
+        if not keep:
+            return copied
+        for offset in range(0, source.count(), _PAGE_SIZE):
+            got = source.get(limit=_PAGE_SIZE, offset=offset, include=["embeddings", "documents", "metadatas"])
+            ids = got.get("ids") or []
+            embeddings = got.get("embeddings")
+            documents = got.get("documents") or []
+            metadatas = got.get("metadatas") or []
+            rows = [
+                i for i, meta in enumerate(metadatas)
+                if meta and keep.get(str(meta.get("source_file"))) == meta.get("content_hash")
+            ]
+            if not rows:
+                continue
+            if embeddings is None:
+                raise RuntimeError("source collection returned no embeddings; cannot carry records over")
+            self.add_documents(
+                target,
+                ids=[ids[i] for i in rows],
+                documents=[documents[i] for i in rows],
+                metadatas=[dict(metadatas[i]) for i in rows],
+                embeddings=[_as_float_list(embeddings[i]) for i in rows],
+            )
+            for i in rows:
+                name = str(metadatas[i]["source_file"])
+                copied[name] = copied.get(name, 0) + 1
+        return copied
 
     def delete_documents_by_ids(self, collection: Collection, ids: List[str]) -> None:
         """Delete documents from a collection by their ids (best-effort).

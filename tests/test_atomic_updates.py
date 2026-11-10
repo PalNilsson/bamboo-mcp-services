@@ -774,15 +774,27 @@ class TestChromaWrapperCreateCollection:
             call_order.append(f"create:{name}") or idle_col
         )
         mock_chroma.get_or_create_collection.return_value = MagicMock()
-        mock_chroma.add_documents.return_value = None
         mock_chroma.persist.return_value = None
+
+        # S-11: the cycle reads back what the idle slot holds before promoting
+        # it.  The live slot is empty; the idle slot holds whatever was added.
+        written: dict[str, dict[str, int]] = {}
+
+        def _record_add(col, ids, documents, metadatas, embeddings=None):
+            for meta in metadatas:
+                per_hash = written.setdefault(meta["source_file"], {})
+                per_hash[meta["content_hash"]] = per_hash.get(meta["content_hash"], 0) + 1
+
+        mock_chroma.add_documents.side_effect = _record_add
+        mock_chroma.file_versions.side_effect = lambda col: dict(written) if col is idle_col else {}
+        mock_chroma.copy_files.return_value = {}
 
         mock_router = MagicMock()
         mock_router.live_name.return_value = "docs__a"
         mock_router.idle_name.return_value = "docs__b"
 
         mock_embedder = MagicMock()
-        mock_embedder.encode.return_value = [[0.1] * 3]
+        mock_embedder.encode.side_effect = lambda chunks, **kw: [[0.1] * 3 for _ in chunks]
 
         mock_checkpoint = MagicMock()
         mock_checkpoint._data = {"processed": {}}

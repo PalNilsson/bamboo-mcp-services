@@ -166,6 +166,57 @@ changeset and remain to be renamed separately.
 
 ### Fixed
 
+#### document-monitor: an incremental cycle replaced the collection with the changed files only (S-11)
+
+**Problem:** every cycle deleted and recreated the idle slot, wrote only the
+new and changed files into it, and promoted it.  Unchanged files were never
+carried over, so after one file changed the live collection held that file and
+nothing else — and the checkpoint still listed the rest as ingested, so they
+were never re-embedded.  Reproduced with the real agent: three files, one
+changed, live slot left with one.  A full first run is unaffected (every file
+is new), which is why the existing store looked healthy; the first run after
+any github-sync update would have triggered it.  The README already described
+the intended behaviour ("all other files' chunks").
+
+Two related problems made a correct completeness check impossible:
+
+- **The checkpoint was written before the swap**, file by file.  A cycle that
+  died between embedding and swap — a supervisor `run_timeout_s` kill, a
+  crash, a failed swap — left the checkpoint claiming versions the live slot
+  did not hold.  New files were then never ingested and changed files stayed
+  stale.  This is a possible, unconfirmed cause of the 42 checkpointed files missing from the
+  old aipanda033 store.
+- **Removed files never triggered a cycle** and were never removed from the
+  checkpoint.
+
+**Fix:**
+
+- **S-11.1** Unchanged files are carried over from the live slot by copying
+  their stored records (`ChromaWrapper.copy_files`): ids, vectors, text and
+  metadata, so nothing is re-embedded.  Only the version the checkpoint
+  records is copied.
+- **S-11.2** A deleted file, or one that no longer yields text, triggers a
+  cycle on its own, is not carried, and its checkpoint entry is removed.  A
+  file that cannot be read this cycle is carried, not dropped.
+- **S-11.3** Before the swap the idle slot is read back
+  (`ChromaWrapper.file_versions`) and must hold exactly the expected files, at
+  the expected content hash, with the expected chunk count.  If not, it is
+  discarded, the live slot keeps serving, and the error names the files.  A
+  changed file whose embedding fails keeps its previous version.  A cycle that
+  would leave the collection empty does not swap.
+- **S-11.5** The checkpoint is written once per cycle, after the swap
+  (`CheckpointStore.apply`).  `_ingest_file` returns the snapshot instead of
+  writing it.
+- **S-11.6** A file the checkpoint lists but the live slot does not hold at
+  that version is re-embedded rather than carried, so a store left
+  inconsistent by an earlier version repairs itself on its next cycle.
+
+**Tests (S-11.4):** `test_document_monitor_incremental.py`, 17 tests against
+real ChromaDB with one agent per cycle, as `--once` under the supervisor
+runs it.  10 fail against the previous code.  14 mutants of the safeguards
+above are each killed.  `test_tick_impl_deletes_and_creates_idle_slot_once_per_cycle`
+now tells its mock what the slots contain; its assertions are unchanged.
+
 #### Three tests depended on the wall clock (S-9; tests only)
 
 - **`test_config_file_values_are_used` (core-reaper) failed from 2026-08-28.**
