@@ -41,7 +41,6 @@ agents:
   # ── cric-agent ──────────────────────────────────────────────────────────────
   # Reads ATLAS queue metadata from CVMFS and stores it in cric.duckdb.
   # Runs as a long-lived daemon; re-reads the CVMFS file every 10 minutes.
-  # The ingestion agent depends on this file, so cric is started first.
   - name: cric
     enabled: true
     mode: daemon
@@ -56,13 +55,12 @@ agents:
 
   # ── ingestion-agent ─────────────────────────────────────────────────────────
   # Downloads job metadata from BigPanda for all ATLAS queues; stores results
-  # in jobs.duckdb.  Consumes the CRIC queue list from cric.duckdb.
-  # Waits up to 120 s for cric.duckdb to appear before starting.
+  # in jobs.duckdb.  Reads the CRIC queue list from the CVMFS JSON file named
+  # in ingestion-agent.yaml — not from cric.duckdb — so it needs no
+  # depends_on_file.
   - name: ingestion
     enabled: true
     mode: daemon
-    depends_on_file: cric.duckdb
-    depends_timeout_s: 120
     command:
       - bamboo-ingestion
       - --config

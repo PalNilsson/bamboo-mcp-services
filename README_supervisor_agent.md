@@ -67,17 +67,25 @@ once immediately at startup rather than one interval later.
 ### Dependency ordering
 
 A script can declare a file dependency with `depends_on_file`.  The supervisor
-waits up to `depends_timeout_s` seconds (default: 120 s) for that file to
-exist before starting the script.  This is used to ensure `cric.duckdb` is
-written by the CRIC script before the ingestion script tries to read it.  If the
-file does not appear in time, the script starts anyway with a warning — it falls
-back to its own defaults.
+does not start the script until that file exists, or until `depends_timeout_s`
+seconds (default: 120 s) have passed, after which it starts it anyway with a
+warning.  A daemon waits only before its first launch; a scheduled script waits
+before every run while the file is missing.
+
+The wait does not block the supervisor.  The file is checked once per tick, so
+the script starts up to `health_poll_interval_s` after the file appears, and
+every other script is polled, restarted and dispatched as usual meanwhile.
+(Earlier versions slept inside the loop for the whole wait.)  The health report
+shows a waiting script's file under `waiting_for`.
+
+No script in the default configuration needs a dependency: the ingestion
+script reads the CRIC queue list from the CVMFS JSON file itself, not from the
+CRIC script's database.
 
 ### Startup sequence (default config)
 
 1. `bamboo-cric` starts immediately as a daemon — creates `cric.duckdb`.
-2. `bamboo-ingestion` waits up to 120 s for `cric.duckdb`, then starts as a
-   daemon.
+2. `bamboo-ingestion` starts immediately as a daemon.
 3. `bamboo-github-sync` is registered as a scheduled job (hourly); it runs for
    the first time on the next tick.
 4. `bamboo-document-monitor` is registered as a scheduled job (every 10 min).
@@ -160,35 +168,54 @@ Options:
   --log-level LEVEL     DEBUG / INFO / WARNING / ERROR (default: INFO)
   --once                Smoke test: start, check, run scheduled scripts once, stop
   --once-settle-s SECS  With --once: how long daemons run before the check (default: 15)
-  --status              Print JSON config summary and exit (no agents started)
+  --heartbeat-file PATH Heartbeat written after every tick (default: supervisor-heartbeat.json)
+  --status              Check the running supervisor's heartbeat; exit 0 if fresh, 1 if not
+  --max-age SECS        With --status: oldest acceptable heartbeat (default: 120)
 ```
 
 ### `--status`
 
-Prints a JSON summary of what the supervisor *would* manage, without starting
-anything.  Useful for verifying configuration on a new machine:
+Reports whether a running supervisor is alive and its loop is making progress.
+The running supervisor rewrites a heartbeat file (`--heartbeat-file`, default
+`supervisor-heartbeat.json` in the working directory) after every tick, with
+its full health report.  `--status` reads that file and exits:
+
+* **0** — the heartbeat is at most `--max-age` seconds old (default 120) and
+  the supervisor is in state `running`;
+* **1** — the file is missing, malformed, stale, or was written by a
+  supervisor that has stopped (a clean stop writes a final heartbeat in state
+  `stopped`).
 
 ```bash
-bamboo-supervisor --config supervisor-agent.yaml --status
+bamboo-supervisor --status --heartbeat-file /data/bamboo/supervisor/heartbeat.json
 ```
 
 ```json
 {
-  "config": "supervisor-agent.yaml",
-  "health_poll_interval_s": 30.0,
-  "agents": [
-    {
-      "name": "cric",
-      "mode": "daemon",
-      "enabled": true,
-      "interval_s": null,
-      "depends_on_file": null,
-      "command": ["bamboo-cric", "--config", "...", "--data", "cric.duckdb", "--log-file", "cric-agent.log"]
+  "age_s": 12.4,
+  "heartbeat": {
+    "health": {
+      "details": {"agents": {"cric": {"mode": "daemon", "pid": 1716, "restarts": 0, ...}, ...}},
+      "state": "running",
+      ...
     },
-    ...
-  ]
+    "schema_version": 1,
+    "supervisor_pid": 1702,
+    "written_at_epoch": 1794573600.1,
+    "written_at_utc": "2026-11-13T10:40:00.100000+00:00"
+  },
+  "ok": true,
+  "reason": "supervisor running, heartbeat 12s old"
 }
 ```
+
+The verdict is about the supervisor loop only.  The agents' states are in the
+report, but an agent in back-off never fails the check: the supervisor
+restarts agents itself, and a liveness probe that restarted the whole
+container for one agent would take all of them down.
+
+`--status` reads no config and writes no log, so a liveness probe can run it
+every few seconds.  Keep `--max-age` several times `health_poll_interval_s`.
 
 ### `--once`
 
@@ -370,8 +397,8 @@ the entry points in the `command` lists.
 **`cric.duckdb` not found at startup**
 
 Ensure `bamboo-cric` can reach the CVMFS path configured in `cric-agent.yaml`
-(`cric_path`).  The ingestion script will start after `depends_timeout_s` seconds
-even if the file is missing; it will fall back to its built-in queue list.
+(`cric_path`).  The ingestion script does not need `cric.duckdb`; if its own
+`cric_path` is unreadable it falls back to its configured queue list.
 
 **Scheduled script never runs**
 

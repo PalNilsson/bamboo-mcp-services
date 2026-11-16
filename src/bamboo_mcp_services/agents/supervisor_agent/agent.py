@@ -58,14 +58,12 @@ send it SIGTERM when the supervisor exits for any reason, SIGKILL included
 (``prctl(PR_SET_PDEATHSIG)``), so no child outlives its supervisor.  On other
 platforms (macOS development machines) that step is skipped.
 
-Future extension point
-----------------------
-A lightweight HTTP health endpoint (e.g. ``GET /health → JSON``) is a natural
-next step once the system is deployed on a remote machine.  The ``health()``
-method already returns a fully-populated ``HealthReport`` with per-agent detail;
-the HTTP layer would be a thin wrapper that serialises ``agent.health().to_dict()``
-on each request.  See ``TODO: HTTP health endpoint`` comments below for the
-intended integration points.
+Health
+------
+``health()`` returns a ``HealthReport`` with per-agent detail.  The CLI writes
+it to a heartbeat file after every tick, which ``bamboo-supervisor --status``
+and container liveness probes read (see :mod:`.heartbeat`).  That replaced the
+HTTP endpoint once planned here: a file needs no port and no thread.
 """
 from __future__ import annotations
 
@@ -83,6 +81,8 @@ from bamboo_mcp_services.agents.base import Agent
 from bamboo_mcp_services.agents.supervisor_agent.scheduler import (
     AgentConfig,
     DaemonState,
+    DependencyStatus,
+    DependencyWait,
     ScheduledState,
     MODE_DAEMON,
     MODE_SCHEDULED,
@@ -181,11 +181,6 @@ class SupervisorConfig:
             polls daemon-process health and dispatches due scheduled jobs.
         stop_timeout_s: Seconds to wait for a child to exit gracefully after
             SIGTERM before escalating to SIGKILL.
-
-        # TODO: HTTP health endpoint
-        # http_host: str = "127.0.0.1"
-        # http_port: int = 8765
-        # http_enabled: bool = False
     """
     agents: list = field(default_factory=list)
     health_poll_interval_s: float = DEFAULT_HEALTH_POLL_INTERVAL_S
@@ -252,9 +247,10 @@ class SupervisorAgent(Agent):
                 continue
 
             if cfg.mode == MODE_DAEMON:
-                self._daemon_states[cfg.name] = DaemonState(config=cfg)
-                self._wait_for_dependency(cfg)
-                self._launch_daemon(cfg.name)
+                state = DaemonState(config=cfg)
+                self._daemon_states[cfg.name] = state
+                if self._daemon_may_launch(state):
+                    self._launch_daemon(cfg.name)
 
             elif cfg.mode == MODE_SCHEDULED:
                 self._scheduled_states[cfg.name] = ScheduledState(config=cfg)
@@ -335,12 +331,7 @@ class SupervisorAgent(Agent):
 
         Returns:
             Dictionary with one entry per managed agent, keyed by agent name.
-
-        # TODO: HTTP health endpoint
-        # The dict returned here is exactly what the HTTP /health endpoint would
-        # serialise as JSON.  A future aiohttp/Flask handler would call:
-        #   report = supervisor.health()
-        #   return json.dumps(report.to_dict())
+            The heartbeat file carries it under ``health.details``.
         """
         details: dict[str, Any] = {}
         for name, state in self._daemon_states.items():
@@ -367,17 +358,38 @@ class SupervisorAgent(Agent):
             if name not in self._daemon_procs or self._daemon_procs[name].poll() is not None
         ]
 
-    def wait_for_scheduled(self, poll_s: float = 1.0) -> None:
-        """Block until every in-flight scheduled run has been reaped.
+    def wait_for_daemon_dependencies(self, poll_s: float = 2.0) -> None:
+        """Block until no daemon is held back by its ``depends_on_file``.
 
-        Run timeouts still apply: an overdue run is killed by the reaper.
+        Used by ``--once`` only, so that a daemon waiting for its dependency
+        file is given the same chance to start as before the wait became
+        non-blocking.  Each wait ends at its ``depends_timeout_s``, so this
+        returns.  Daemons that exit meanwhile are restarted as on any tick.
 
         Args:
             poll_s: Seconds between checks.
         """
-        while self._scheduled_procs:
+        while any(not s.dependency_cleared for s in self._daemon_states.values()):
+            time.sleep(poll_s)
+            self._poll_daemons()
+
+    def wait_for_scheduled(self, poll_s: float = 1.0) -> None:
+        """Block until every in-flight scheduled run has been reaped.
+
+        A scheduled agent that is waiting for its ``depends_on_file`` keeps
+        this waiting too: it is dispatched once the file appears or the wait
+        times out, and its run is then waited for like any other.  Run
+        timeouts still apply: an overdue run is killed by the reaper.
+
+        Args:
+            poll_s: Seconds between checks.
+        """
+        while self._scheduled_procs or any(
+            s.dependency.waiting for s in self._scheduled_states.values()
+        ):
             time.sleep(poll_s)
             self._reap_scheduled()
+            self._dispatch_scheduled(only_waiting=True)
 
     # ── Daemon management ──────────────────────────────────────────────────────
 
@@ -438,7 +450,8 @@ class SupervisorAgent(Agent):
                     )
 
             if time.monotonic() >= state.next_restart_after:
-                self._launch_daemon(name)
+                if self._daemon_may_launch(state):
+                    self._launch_daemon(name)
             else:
                 logger.debug(
                     "Back-off active for '%s': %.0fs remaining.",
@@ -473,13 +486,22 @@ class SupervisorAgent(Agent):
                 del self._scheduled_procs[name]
                 state.record_completion(exit_code=-1)
 
-    def _dispatch_scheduled(self) -> None:
-        """Launch scheduled one-shot agents that are due, without waiting for them."""
+    def _dispatch_scheduled(self, only_waiting: bool = False) -> None:
+        """Launch scheduled one-shot agents that are due, without waiting for them.
+
+        Args:
+            only_waiting: Consider only agents whose dependency wait is in
+                progress.  ``wait_for_scheduled`` uses this so that it never
+                starts a second run of an agent that has already run.
+        """
         for name, state in self._scheduled_states.items():
+            if only_waiting and not state.dependency.waiting:
+                continue
             if not state.is_due():
                 continue
+            if not self._dependency_allows_start(state.config, state.dependency):
+                continue
 
-            self._wait_for_dependency(state.config)
             cmd = state.config.command
             logger.info(
                 "Dispatching scheduled agent '%s' (run #%d): %s",
@@ -501,37 +523,53 @@ class SupervisorAgent(Agent):
 
     # ── Dependency helpers ─────────────────────────────────────────────────────
 
-    def _wait_for_dependency(self, cfg: AgentConfig) -> None:
-        """Block until ``cfg.depends_on_file`` exists or the timeout elapses.
+    def _daemon_may_launch(self, state: DaemonState) -> bool:
+        """Return whether a daemon's dependency allows it to be launched.
 
-        If the file does not appear within ``cfg.depends_timeout_s``, the
-        method logs a warning and returns so the agent starts anyway — it may
-        fall back to its own default configuration (e.g. the ingestion agent
-        falling back to its built-in queue list).
+        Only the first launch waits for ``depends_on_file``.  Once the wait
+        has ended, by the file appearing or by timing out, restarts never
+        consult it again — as before the wait became non-blocking.
+
+        Args:
+            state: The daemon's runtime state.
+
+        Returns:
+            ``True`` if the daemon may be launched now.
+        """
+        if state.dependency_cleared:
+            return True
+        if self._dependency_allows_start(state.config, state.dependency):
+            state.dependency_cleared = True
+            return True
+        return False
+
+    def _dependency_allows_start(self, cfg: AgentConfig, wait: DependencyWait) -> bool:
+        """Check *cfg*'s ``depends_on_file`` once, without blocking, and log the outcome.
 
         Args:
             cfg: Agent configuration that may contain a ``depends_on_file``.
+            wait: The agent's wait state, updated in place.
+
+        Returns:
+            ``True`` if the agent may be started now: there is no dependency,
+            the file exists, or the wait has timed out.
         """
-        if not cfg.depends_on_file:
-            return
-        if os.path.exists(cfg.depends_on_file):
-            return
-
-        logger.info(
-            "Agent '%s' waiting for dependency file '%s' (timeout=%.0fs).",
-            cfg.name, cfg.depends_on_file, cfg.depends_timeout_s,
+        status = wait.check(
+            cfg.depends_on_file, cfg.depends_timeout_s, time.monotonic(), os.path.exists,
         )
-        deadline = time.monotonic() + cfg.depends_timeout_s
-        while time.monotonic() < deadline:
-            time.sleep(2.0)
-            if os.path.exists(cfg.depends_on_file):
-                logger.info(
-                    "Dependency file '%s' found — starting agent '%s'.",
-                    cfg.depends_on_file, cfg.name,
-                )
-                return
-
-        logger.warning(
-            "Dependency file '%s' not found after %.0fs — starting agent '%s' anyway.",
-            cfg.depends_on_file, cfg.depends_timeout_s, cfg.name,
-        )
+        if status is DependencyStatus.STARTED_WAITING:
+            logger.info(
+                "Agent '%s' waiting for dependency file '%s' (timeout=%.0fs).",
+                cfg.name, cfg.depends_on_file, cfg.depends_timeout_s,
+            )
+        elif status is DependencyStatus.FOUND:
+            logger.info(
+                "Dependency file '%s' found — starting agent '%s'.",
+                cfg.depends_on_file, cfg.name,
+            )
+        elif status is DependencyStatus.TIMED_OUT:
+            logger.warning(
+                "Dependency file '%s' not found after %.0fs — starting agent '%s' anyway.",
+                cfg.depends_on_file, cfg.depends_timeout_s, cfg.name,
+            )
+        return status.may_start

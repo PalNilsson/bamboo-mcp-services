@@ -100,9 +100,24 @@ runs out-of-process and must not assume reconciliation has happened, so it
 leaves those workspaces alone.
 
 **Workers are never signalled.** Liveness is checked by looking for
-`/proc/<pid>`; no signal is sent, not even signal 0. PID reuse can only make
-the check report a dead worker as alive, which makes the reaper more
-conservative, never less.
+`/proc/<pid>`; no signal is sent, not even signal 0. Within one PID namespace,
+PID reuse can only make the check report a dead worker as alive, which makes
+the reaper more conservative.
+
+### Deployment invariant: one PID namespace
+
+Rule 4 holds only when the reaper and Bamboo MCP's workers share a PID
+namespace. `worker_pid` is a PID in Bamboo MCP's namespace; looked up from a
+separate container, `/proc/<pid>` almost never exists, so a **live worker reads
+as dead**. Deploy accordingly (S-23):
+
+- **Docker, Bamboo MCP on the host:** run the services container with
+  `--pid=host`.
+- **Kubernetes:** Bamboo MCP and the services in one pod with
+  `shareProcessNamespace: true`.
+
+While the reaper only reports, a broken invariant gives wrong reports. It must
+hold before any deletion code is written.
 
 ### Workspaces with no manifest
 

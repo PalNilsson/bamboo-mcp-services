@@ -37,6 +37,11 @@ from bamboo_mcp_services.agents.supervisor_agent.agent import (
     SupervisorAgent,
     SupervisorConfig,
 )
+from bamboo_mcp_services.agents.supervisor_agent.heartbeat import (
+    DEFAULT_MAX_AGE_S,
+    HeartbeatWriter,
+    check_heartbeat,
+)
 from bamboo_mcp_services.agents.supervisor_agent.scheduler import (
     AgentConfig,
     MODE_DAEMON,
@@ -51,6 +56,7 @@ logger = logging.getLogger(__name__)
 _LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s  %(message)s"
 _LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 _DEFAULT_LOG_FILE = "supervisor-agent.log"
+_DEFAULT_HEARTBEAT_FILE = "supervisor-heartbeat.json"
 _LOG_MAX_BYTES = 10 * 1024 * 1024
 _LOG_BACKUP_COUNT = 5
 
@@ -123,13 +129,34 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--heartbeat-file",
+        default=_DEFAULT_HEARTBEAT_FILE,
+        metavar="PATH",
+        help=(
+            "JSON file the running supervisor rewrites after every tick with its "
+            "health report, and that --status reads (default: %(default)s).  "
+            "Pass an empty string to disable writing it."
+        ),
+    )
+    p.add_argument(
         "--status",
         action="store_true",
         help=(
-            "Print a JSON health report of currently-running managed processes "
-            "and exit without starting or stopping anything.  "
-            "Requires the supervisor to already be running (reads config only, "
-            "does not start agents)."
+            "Read the heartbeat file of a running supervisor, print its health "
+            "report as JSON and exit: 0 if the heartbeat is at most --max-age "
+            "seconds old and the supervisor is running, 1 otherwise.  Starts "
+            "nothing, reads no config and writes no log — suitable as a "
+            "container liveness probe."
+        ),
+    )
+    p.add_argument(
+        "--max-age",
+        type=float,
+        default=DEFAULT_MAX_AGE_S,
+        metavar="SECONDS",
+        help=(
+            "With --status: oldest acceptable heartbeat (default: %(default)s).  "
+            "Keep it several times the config's health_poll_interval_s."
         ),
     )
     return p
@@ -253,6 +280,25 @@ def _load_config(config_path: str) -> Optional[SupervisorConfig]:
 
 # ── Signal handler ─────────────────────────────────────────────────────────────
 
+def _final_heartbeat(supervisor: SupervisorAgent, heartbeat: Optional[HeartbeatWriter]) -> None:
+    """Write the heartbeat once more after a stop, so it records the final state.
+
+    ``--status`` then reports ``stopped`` (or ``failed``) instead of a
+    heartbeat that merely went stale.  Runs from ``main``'s ``finally``, which
+    a signal-initiated stop also reaches (its ``sys.exit`` unwinds through it).
+
+    Args:
+        supervisor: The stopped supervisor.
+        heartbeat: The writer, or ``None`` when no heartbeat file is written.
+    """
+    if heartbeat is None:
+        return
+    try:
+        heartbeat.write(supervisor.health().to_dict())
+    except Exception:
+        logger.exception("Error while writing the final heartbeat.")
+
+
 def _make_signal_handler(agent: SupervisorAgent):
     """Return a SIGTERM/SIGHUP handler that stops the supervisor (and its children) gracefully.
 
@@ -279,39 +325,26 @@ def _make_signal_handler(agent: SupervisorAgent):
 
 # ── Status command ─────────────────────────────────────────────────────────────
 
-def _print_status(config_path: str) -> int:
-    """Load config and print a JSON status skeleton, then exit.
+def _print_status(heartbeat_file: str, max_age_s: float) -> int:
+    """Print the running supervisor's heartbeat verdict as JSON and return its exit code.
 
-    This is a lightweight inspection mode: it shows what *would* be managed
-    without actually starting anything.
+    Runs before logging is configured, so a probe that calls it every few
+    seconds adds nothing to the supervisor's log file or to stderr.
 
     Args:
-        config_path: Path to the YAML config file.
+        heartbeat_file: Heartbeat file written by the running supervisor.
+        max_age_s: Oldest acceptable heartbeat, in seconds.
 
     Returns:
-        Exit code.
+        ``0`` if the supervisor is running and its heartbeat is fresh,
+        ``1`` otherwise (including when no heartbeat file is configured).
     """
-    cfg = _load_config(config_path)
-    if cfg is None:
+    if not heartbeat_file:
+        print(json.dumps({"ok": False, "reason": "--status needs a --heartbeat-file"}, indent=2))
         return 1
-
-    status = {
-        "config": config_path,
-        "health_poll_interval_s": cfg.health_poll_interval_s,
-        "agents": [
-            {
-                "name": a.name,
-                "mode": a.mode,
-                "enabled": a.enabled,
-                "interval_s": a.interval_s,
-                "depends_on_file": a.depends_on_file,
-                "command": a.command,
-            }
-            for a in cfg.agents
-        ],
-    }
-    print(json.dumps(status, indent=2))
-    return 0
+    result = check_heartbeat(heartbeat_file, max_age_s)
+    print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+    return 0 if result.ok else 1
 
 
 # ── --once ─────────────────────────────────────────────────────────────────────
@@ -319,9 +352,11 @@ def _print_status(config_path: str) -> int:
 def _run_once(supervisor: SupervisorAgent, settle_s: float) -> int:
     """Run the ``--once`` smoke test on an already-started supervisor.
 
-    Daemons get *settle_s* seconds to start, because stopping one straight
-    after launch kills it before it has installed its SIGTERM handler — it
-    then reports nothing and its log file is never created.  Every scheduled
+    A daemon waiting for its ``depends_on_file`` is waited for first (up to
+    its ``depends_timeout_s``).  Daemons then get *settle_s* seconds to start,
+    because stopping one straight after launch kills it before it has
+    installed its SIGTERM handler — it then reports nothing and its log file
+    is never created.  Every scheduled
     agent is due on the first tick, so each runs once; the supervisor waits
     for all of them (their run timeouts still apply).
 
@@ -333,6 +368,7 @@ def _run_once(supervisor: SupervisorAgent, settle_s: float) -> int:
         ``0`` if every daemon was still running after *settle_s* and every
         scheduled run exited with code 0; ``1`` otherwise.
     """
+    supervisor.wait_for_daemon_dependencies()
     if supervisor.daemon_names:
         logger.info("--once: letting daemon agents run for %.0fs before checking them.", settle_s)
         time.sleep(settle_s)
@@ -375,11 +411,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         check).
     """
     args = build_parser().parse_args(argv)
+    if args.status:
+        return _print_status(args.heartbeat_file, args.max_age)
+
     _configure_logging(args.log_file, args.log_level)
     log_startup_banner(logger, "bamboo-supervisor")
-
-    if args.status:
-        return _print_status(args.config)
 
     logger.info("Starting (config=%s)", args.config)
 
@@ -407,6 +443,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         logger.info("  [disabled]  %s", a.name)
 
     supervisor = SupervisorAgent(config=cfg)
+    heartbeat = HeartbeatWriter(args.heartbeat_file) if args.heartbeat_file and not args.once else None
     handler = _make_signal_handler(supervisor)
     signal.signal(signal.SIGTERM, handler)
     signal.signal(signal.SIGHUP, handler)
@@ -418,6 +455,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.once:
             return _run_once(supervisor, args.once_settle_s)
         else:
+            if heartbeat is not None:
+                # The first write follows the first tick, which runs at once.
+                logger.info("Heartbeat file: %s", os.path.abspath(heartbeat.path))
             logger.info(
                 "Entering run loop (poll_interval=%.0fs). "
                 "Press Ctrl-C or send SIGTERM to stop.",
@@ -425,6 +465,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             while True:
                 supervisor.tick()
+                if heartbeat is not None:
+                    heartbeat.write(supervisor.health().to_dict())
                 time.sleep(cfg.health_poll_interval_s)
 
     except KeyboardInterrupt:
@@ -438,6 +480,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             logger.info("Supervisor stopped (state=%s)", supervisor.state.value)
         except Exception:
             logger.exception("Error while stopping supervisor.")
+        _final_heartbeat(supervisor, heartbeat)
 
     return 0
 

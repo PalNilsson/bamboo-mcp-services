@@ -39,6 +39,8 @@ from bamboo_mcp_services.agents.supervisor_agent.agent import (
 from bamboo_mcp_services.agents.supervisor_agent.scheduler import (
     AgentConfig,
     DaemonState,
+    DependencyStatus,
+    DependencyWait,
     ScheduledState,
     MODE_DAEMON,
     MODE_SCHEDULED,
@@ -503,93 +505,202 @@ class TestSupervisorAgentScheduled(unittest.TestCase):
 # agent.py — dependency waiting
 # ─────────────────────────────────────────────────────────────────────────────
 
+class TestDependencyWait(unittest.TestCase):
+    """scheduler.DependencyWait: the non-blocking replacement for the old sleep loop."""
+
+    PATH = "/data/cric.db"
+
+    def setUp(self):
+        self.wait = DependencyWait()
+        self.present = False
+
+    def _check(self, now, timeout=10.0):
+        return self.wait.check(self.PATH, timeout, now, lambda p: self.present)
+
+    def test_no_dependency_is_ready(self):
+        self.assertIs(self.wait.check(None, 10.0, 0.0, lambda p: False), DependencyStatus.READY)
+        self.assertIs(self.wait.check("", 10.0, 0.0, lambda p: False), DependencyStatus.READY)
+        self.assertFalse(self.wait.waiting)
+
+    def test_file_already_present_is_ready(self):
+        self.present = True
+        self.assertIs(self._check(100.0), DependencyStatus.READY)
+        self.assertFalse(self.wait.waiting)
+
+    def test_first_miss_starts_the_wait(self):
+        self.assertIs(self._check(100.0), DependencyStatus.STARTED_WAITING)
+        self.assertTrue(self.wait.waiting)
+        self.assertEqual(self.wait.deadline, 110.0)
+
+    def test_miss_before_the_deadline_keeps_waiting(self):
+        self._check(100.0)
+        self.assertIs(self._check(109.999), DependencyStatus.WAITING)
+        self.assertTrue(self.wait.waiting)
+
+    def test_miss_at_the_deadline_times_out(self):
+        """Same boundary as the old loop, which ran while monotonic() < deadline."""
+        self._check(100.0)
+        self.assertIs(self._check(110.0), DependencyStatus.TIMED_OUT)
+        self.assertFalse(self.wait.waiting)
+
+    def test_file_appearing_during_the_wait_is_found(self):
+        self._check(100.0)
+        self.present = True
+        self.assertIs(self._check(105.0), DependencyStatus.FOUND)
+        self.assertFalse(self.wait.waiting)
+
+    def test_a_new_wait_after_one_ended_gets_a_fresh_deadline(self):
+        self._check(100.0)
+        self._check(110.0)                  # timed out
+        self.assertIs(self._check(500.0), DependencyStatus.STARTED_WAITING)
+        self.assertEqual(self.wait.deadline, 510.0)
+
+    def test_may_start(self):
+        allowed = {s for s in DependencyStatus if s.may_start}
+        self.assertEqual(
+            allowed,
+            {DependencyStatus.READY, DependencyStatus.FOUND, DependencyStatus.TIMED_OUT},
+        )
+
+
+class _Clock:
+    """A settable stand-in for ``time.monotonic``."""
+
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
 class TestSupervisorAgentDependency(unittest.TestCase):
+    """Finding 6: waiting for a dependency file used to block the supervisor loop."""
 
-    @patch("bamboo_mcp_services.agents.supervisor_agent.agent.subprocess.Popen")
-    def test_dependency_file_already_exists(self, mock_popen):
-        """Agent with a depends_on_file that already exists should start immediately."""
-        mock_popen.return_value = _make_mock_proc(pid=1000)
+    DEP = "/data/bamboo/db/cric.db"
 
-        with patch("bamboo_mcp_services.agents.supervisor_agent.agent.os.path.exists", return_value=True):
-            cfg = SupervisorConfig(agents=[
-                _daemon_cfg(name="dependent", depends_on_file="/some/cric.duckdb")
-            ])
-            sv = SupervisorAgent(config=cfg)
-            sv.start()
+    def setUp(self):
+        self.existing: set = set()
+        real_exists = os.path.exists
+        self.clock = _Clock()
+        patchers = [
+            patch(
+                "bamboo_mcp_services.agents.supervisor_agent.agent.os.path.exists",
+                side_effect=lambda p: p in self.existing if p == self.DEP else real_exists(p),
+            ),
+            patch("bamboo_mcp_services.agents.supervisor_agent.agent.time.monotonic", new=self.clock),
+            # Nothing in start() or tick() may sleep: that was the defect.
+            patch(
+                "bamboo_mcp_services.agents.supervisor_agent.agent.time.sleep",
+                side_effect=AssertionError("the supervisor loop blocked"),
+            ),
+            patch("bamboo_mcp_services.agents.supervisor_agent.agent.subprocess.Popen"),
+        ]
+        mocks = [p.start() for p in patchers]
+        for p in patchers:
+            self.addCleanup(p.stop)
+        self.popen = mocks[-1]
+        self.procs: dict = {}  # agent name -> latest mock process
 
-        self.assertEqual(mock_popen.call_count, 1)
+        def _spawn(cmd, **kwargs):
+            proc = _make_mock_proc(pid=2000 + self.popen.call_count)
+            self.procs[cmd[1]] = proc
+            return proc
+        self.popen.side_effect = _spawn
 
-    @patch("bamboo_mcp_services.agents.supervisor_agent.agent.subprocess.Popen")
-    @patch("bamboo_mcp_services.agents.supervisor_agent.agent.time.sleep")
-    @patch("bamboo_mcp_services.agents.supervisor_agent.agent.time.monotonic")
-    def test_dependency_file_appears_during_wait(self, mock_mono, mock_sleep, mock_popen):
-        """Agent should start once the dependency file appears mid-wait."""
-        mock_popen.return_value = _make_mock_proc(pid=1001)
+    def _launched(self):
+        return [c.args[0][1] for c in self.popen.call_args_list]
 
-        t0 = 1000.0
-        mock_mono.side_effect = [t0, t0, t0, t0]
+    def test_dependency_file_already_exists(self):
+        self.existing.add(self.DEP)
+        sv = SupervisorAgent(config=SupervisorConfig(agents=[
+            _daemon_cfg(name="dependent", depends_on_file=self.DEP),
+        ]))
+        sv.start()
+        self.assertEqual(self._launched(), ["dependent"])
 
-        dep_path = "/tmp/cric-test-sentinel.duckdb"
-        # Call counter: first call to dep_path → False, subsequent → True.
-        # All other paths (e.g. logging handler checking its own log file) are
-        # passed through to the real os.path.exists so they never exhaust a list.
-        import os as _real_os
-        dep_call_count = [0]
+    def test_start_returns_at_once_and_launches_when_the_file_appears(self):
+        sv = SupervisorAgent(config=SupervisorConfig(agents=[
+            _daemon_cfg(name="waiter", depends_on_file=self.DEP, depends_timeout_s=120.0),
+        ]))
+        sv.start()
+        self.assertEqual(self._launched(), [])
+        self.assertEqual(sv.health().details["agents"]["waiter"]["waiting_for"], self.DEP)
 
-        def _exists_side_effect(path):
-            if path == dep_path:
-                dep_call_count[0] += 1
-                return dep_call_count[0] > 1
-            return _real_os.path.exists(path)
+        self.clock.now += 30
+        sv.tick()
+        self.assertEqual(self._launched(), [])
 
-        with patch(
-            "bamboo_mcp_services.agents.supervisor_agent.agent.os.path.exists",
-            side_effect=_exists_side_effect,
-        ):
-            cfg = SupervisorConfig(agents=[
-                _daemon_cfg(
-                    name="waiter",
-                    depends_on_file=dep_path,
-                    depends_timeout_s=10.0,
-                )
-            ])
-            sv = SupervisorAgent(config=cfg)
-            sv.start()
+        self.existing.add(self.DEP)
+        self.clock.now += 30
+        with self.assertLogs("bamboo_mcp_services.agents.supervisor_agent.agent", level="INFO") as logs:
+            sv.tick()
+        self.assertEqual(self._launched(), ["waiter"])
+        self.assertTrue(any("found — starting agent 'waiter'" in m for m in logs.output))
+        self.assertIsNone(sv.health().details["agents"]["waiter"]["waiting_for"])
 
-        self.assertEqual(mock_popen.call_count, 1)
+    def test_timeout_starts_the_agent_anyway(self):
+        sv = SupervisorAgent(config=SupervisorConfig(agents=[
+            _daemon_cfg(name="impatient", depends_on_file=self.DEP, depends_timeout_s=60.0),
+        ]))
+        sv.start()
+        self.clock.now += 59.9
+        sv.tick()
+        self.assertEqual(self._launched(), [])
 
-    @patch("bamboo_mcp_services.agents.supervisor_agent.agent.subprocess.Popen")
-    @patch("bamboo_mcp_services.agents.supervisor_agent.agent.time.sleep")
-    @patch("bamboo_mcp_services.agents.supervisor_agent.agent.time.monotonic")
-    def test_dependency_timeout_starts_agent_anyway(self, mock_mono, mock_sleep, mock_popen):
-        """After depends_timeout_s, the agent starts even without the file."""
-        mock_popen.return_value = _make_mock_proc(pid=1002)
+        self.clock.now += 0.1
+        with self.assertLogs("bamboo_mcp_services.agents.supervisor_agent.agent", level="WARNING") as logs:
+            sv.tick()
+        self.assertEqual(self._launched(), ["impatient"])
+        self.assertTrue(any("starting agent 'impatient' anyway" in m for m in logs.output))
 
-        # monotonic() calls through _wait_for_dependency and into _launch_daemon:
-        #   1. deadline = monotonic() + timeout                  → t0
-        #   2. while monotonic() < deadline  (enters loop)       → t0        (t0 < t0+5 → True)
-        #   3. while monotonic() < deadline  (exits loop)        → t0+6      (t0+6 < t0+5 → False)
-        #   4. _launch_daemon: if monotonic() < next_restart_after → t0+6    (0.0 → no back-off)
-        t0 = 1000.0
-        timeout = 5.0
-        mock_mono.side_effect = [t0, t0, t0 + timeout + 1, t0 + timeout + 1]
+    def test_a_waiting_daemon_does_not_hold_up_the_others(self):
+        """The defect itself: one wait stopped every other agent being handled."""
+        sv = SupervisorAgent(config=SupervisorConfig(agents=[
+            _daemon_cfg(name="waiter", depends_on_file=self.DEP, depends_timeout_s=600.0),
+            _daemon_cfg(name="other"),
+            _scheduled_cfg(name="job", interval_s=600.0),
+        ]))
+        sv.start()
+        self.assertEqual(self._launched(), ["other"])
+        sv.tick()
+        self.assertEqual(self._launched(), ["other", "job"])
 
-        with patch(
-            "bamboo_mcp_services.agents.supervisor_agent.agent.os.path.exists",
-            return_value=False,
-        ):
-            cfg = SupervisorConfig(agents=[
-                _daemon_cfg(
-                    name="impatient",
-                    depends_on_file="/never/exists.db",
-                    depends_timeout_s=timeout,
-                )
-            ])
-            sv = SupervisorAgent(config=cfg)
-            sv.start()
+        # "other" exits; it is restarted on the next tick while "waiter" still waits.
+        self.procs["other"].poll.return_value = 1
+        self.clock.now += 120
+        sv.tick()
+        self.assertEqual(self._launched(), ["other", "job", "other"])
 
-        # Agent must still be started despite missing dependency.
-        self.assertEqual(mock_popen.call_count, 1)
+    def test_a_restart_does_not_wait_again(self):
+        """Only a daemon's first launch waits, as before the change."""
+        self.existing.add(self.DEP)
+        sv = SupervisorAgent(config=SupervisorConfig(agents=[
+            _daemon_cfg(name="dependent", depends_on_file=self.DEP),
+        ]))
+        sv.start()
+        self.existing.clear()
+        self.procs["dependent"].poll.return_value = 1
+        self.clock.now += 120
+        sv.tick()
+        self.assertEqual(self._launched(), ["dependent", "dependent"])
+
+    def test_scheduled_agent_waits_without_holding_up_the_others(self):
+        sv = SupervisorAgent(config=SupervisorConfig(agents=[
+            AgentConfig(
+                name="dependent-job", mode=MODE_SCHEDULED, command=["echo", "dependent-job"],
+                interval_s=600.0, depends_on_file=self.DEP, depends_timeout_s=300.0,
+            ),
+            _scheduled_cfg(name="free-job", interval_s=600.0),
+        ]))
+        sv.start()
+        sv.tick()
+        self.assertEqual(self._launched(), ["free-job"])
+        self.assertEqual(sv.health().details["agents"]["dependent-job"]["waiting_for"], self.DEP)
+
+        self.existing.add(self.DEP)
+        self.clock.now += 30
+        sv.tick()
+        self.assertEqual(self._launched(), ["free-job", "dependent-job"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -746,29 +857,62 @@ agents:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestCLIStatus(unittest.TestCase):
+    """--status reads the heartbeat file (S-18); it used to echo the config."""
 
-    def test_status_flag_prints_json(self):
+    def setUp(self):
         import tempfile
-        from bamboo_mcp_services.agents.supervisor_agent.cli import _print_status
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "heartbeat.json")
 
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "sup.yaml")
-            with open(path, "w") as fh:
-                fh.write("""
-agents:
-  - name: cric
-    mode: daemon
-    command: [bamboo-cric, --data, cric.duckdb]
-""")
-            with patch("builtins.print") as mock_print:
-                rc = _print_status(path)
+    def tearDown(self):
+        self._tmp.cleanup()
 
+    def _status(self, *extra):
+        from io import StringIO
+        from contextlib import redirect_stdout
+        out = StringIO()
+        with redirect_stdout(out):
+            rc = supervisor_main(["--status", "--heartbeat-file", self.path, *extra])
+        return rc, json.loads(out.getvalue())
+
+    def _write(self, state="running", age_s=0.0):
+        from bamboo_mcp_services.agents.supervisor_agent.heartbeat import build_heartbeat
+        doc = build_heartbeat({"name": "supervisor-agent", "state": state, "details": {}},
+                              pid=4242, now=time.time() - age_s)
+        with open(self.path, "w") as fh:
+            json.dump(doc, fh)
+
+    def test_fresh_heartbeat_exits_0(self):
+        self._write()
+        rc, out = self._status()
         self.assertEqual(rc, 0)
-        mock_print.assert_called_once()
-        printed = mock_print.call_args[0][0]
-        parsed = json.loads(printed)
-        self.assertIn("agents", parsed)
-        self.assertEqual(parsed["agents"][0]["name"], "cric")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["heartbeat"]["supervisor_pid"], 4242)
+
+    def test_stale_heartbeat_exits_1(self):
+        self._write(age_s=300)
+        rc, out = self._status("--max-age", "120")
+        self.assertEqual(rc, 1)
+        self.assertIn("stale", out["reason"])
+
+    def test_missing_heartbeat_exits_1(self):
+        rc, out = self._status()
+        self.assertEqual(rc, 1)
+        self.assertIn("no heartbeat file", out["reason"])
+
+    def test_no_heartbeat_file_configured_exits_1(self):
+        from io import StringIO
+        from contextlib import redirect_stdout
+        with redirect_stdout(StringIO()):
+            self.assertEqual(supervisor_main(["--status", "--heartbeat-file", ""]), 1)
+
+    def test_status_writes_no_log_and_reads_no_config(self):
+        """A probe runs --status every few seconds; it must not touch the log file."""
+        self._write()
+        log = os.path.join(self._tmp.name, "supervisor.log")
+        rc, _ = self._status("--log-file", log, "--config", "/nonexistent/supervisor.yaml")
+        self.assertEqual(rc, 0)
+        self.assertFalse(os.path.exists(log))
 
 
 if __name__ == "__main__":
@@ -997,6 +1141,54 @@ agents:
         self.assertEqual(rc, 0)
         self.assertTrue(os.path.exists(out), "--once stopped before the scheduled run finished")
 
+    def test_once_waits_for_a_daemon_dependency(self):
+        """--once still gives a dependent daemon its chance, as the blocking wait did."""
+        dep = os.path.join(self.tmp, "cric.db")
+        marker = os.path.join(self.tmp, "dependent-ran")
+        cfg = _write_config(self.tmp, f"""
+agents:
+  - name: producer
+    mode: daemon
+    command: [sh, -c, "sleep 1; touch {dep}; exec sleep 60"]
+  - name: dependent
+    mode: daemon
+    depends_on_file: {dep}
+    depends_timeout_s: 30
+    command: [sh, -c, "touch {marker}; exec sleep 60"]
+""")
+        rc = supervisor_main(["-c", cfg, "--once", "--once-settle-s", "1", "--log-file", ""])
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(marker), "the dependent daemon never ran")
+
+    def test_once_dispatches_a_waiting_scheduled_agent_and_runs_nothing_twice(self):
+        """--once waits for a dependent scheduled run, without re-running agents that are due again.
+
+        The dependency appears only after quick-job has finished and been
+        reaped, so --once must keep waiting with no run in flight.
+        """
+        dep = os.path.join(self.tmp, "ready")
+        runs = os.path.join(self.tmp, "runs")
+        cfg = _write_config(self.tmp, f"""
+agents:
+  - name: producer
+    mode: daemon
+    command: [sh, -c, "sleep 3; touch {dep}; exec sleep 60"]
+  - name: dependent-job
+    mode: scheduled
+    interval_s: 60
+    depends_on_file: {dep}
+    depends_timeout_s: 30
+    command: [sh, -c, "echo dependent >> {runs}"]
+  - name: quick-job
+    mode: scheduled
+    interval_s: 0.01
+    command: [sh, -c, "echo quick >> {runs}"]
+""")
+        rc = supervisor_main(["-c", cfg, "--once", "--once-settle-s", "0", "--log-file", ""])
+        self.assertEqual(rc, 0)
+        with open(runs) as fh:
+            self.assertEqual(sorted(fh.read().split()), ["dependent", "quick"])
+
     def test_missing_command_is_retried(self):
         sv = SupervisorAgent(config=SupervisorConfig(agents=[
             AgentConfig(name="missing", mode=MODE_DAEMON, command=["/nonexistent/bamboo-cric"]),
@@ -1045,6 +1237,7 @@ class TestChildSessions(unittest.TestCase):
         with open(self.child_script, "w") as fh:
             fh.write(_CHILD)
         self.log = os.path.join(self.tmp, "supervisor.log")
+        self.heartbeat = os.path.join(self.tmp, "heartbeat.json")
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -1059,7 +1252,8 @@ class TestChildSessions(unittest.TestCase):
         cfg = _write_config(self.tmp, f"health_poll_interval_s: 1\nstop_timeout_s: 5\nagents:\n{agents}\n")
         code = (
             "from bamboo_mcp_services.agents.supervisor_agent.cli import main; "
-            f"raise SystemExit(main(['-c', {cfg!r}, '--log-file', {self.log!r}]))"
+            f"raise SystemExit(main(['-c', {cfg!r}, '--log-file', {self.log!r}, "
+            f"'--heartbeat-file', {self.heartbeat!r}]))"
         )
         # Own session, so the test can signal the supervisor's process group the
         # way a terminal does on Ctrl-C, without signalling the test runner.
@@ -1091,6 +1285,37 @@ class TestChildSessions(unittest.TestCase):
         self.assertEqual(sup.wait(timeout=20), 0)
         self.assertEqual(self._read(outs[0]), "SIGTERM")
         self.assertIn("exited with code 0", self._read(self.log))
+
+    def test_heartbeat_tracks_the_running_supervisor_and_records_the_stop(self):
+        """S-18 end to end: a real supervisor writes the file that --status reads."""
+        from bamboo_mcp_services.agents.supervisor_agent.heartbeat import check_heartbeat
+
+        def _written_at():
+            beat = check_heartbeat(self.heartbeat, max_age_s=10).heartbeat
+            return None if beat is None else beat["written_at_epoch"]
+
+        sup, _ = self._start_supervisor(n_children=1)
+        try:
+            deadline = time.monotonic() + 10
+            while not os.path.exists(self.heartbeat):
+                self.assertLess(time.monotonic(), deadline, "no heartbeat written after start")
+                time.sleep(0.05)
+            result = check_heartbeat(self.heartbeat, max_age_s=10)
+            self.assertTrue(result.ok, result.reason)
+            assert result.heartbeat is not None
+            self.assertEqual(result.heartbeat["supervisor_pid"], sup.pid)
+            self.assertIn("child0", result.heartbeat["health"]["details"]["agents"])
+            first = result.heartbeat["written_at_epoch"]
+            deadline = time.monotonic() + 10        # health_poll_interval_s is 1
+            while _written_at() == first:
+                self.assertLess(time.monotonic(), deadline, "heartbeat not rewritten by the loop")
+                time.sleep(0.1)
+        finally:
+            os.killpg(sup.pid, signal.SIGTERM)
+            self.assertEqual(sup.wait(timeout=20), 0)
+        stopped = check_heartbeat(self.heartbeat, max_age_s=10)
+        self.assertFalse(stopped.ok)
+        self.assertIn("'stopped'", stopped.reason)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "PR_SET_PDEATHSIG is Linux-only")
     def test_children_die_when_the_supervisor_is_killed(self):

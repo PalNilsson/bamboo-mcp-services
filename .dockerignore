@@ -1,0 +1,15 @@
+# Allow-list: the build context holds only what the Dockerfile copies.
+# Anything else (logs the test suite writes into the repo root, local
+# databases, virtualenvs, .git) never reaches the image or the build cache.
+**
+!pyproject.toml
+!LICENSE
+!README.md
+!src/
+!requirements/runtime-py312.txt
+!scripts/fetch_model.py
+!scripts/check_embedding_model.py
+!docker/model-manifest.sha256
+**/__pycache__
+**/*.py[co]
+**/*.egg-info

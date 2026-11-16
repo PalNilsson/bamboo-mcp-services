@@ -102,16 +102,19 @@ juggling of individual processes needed.
 cp src/bamboo_mcp_services/resources/config/supervisor-agent.yaml ./supervisor-agent.yaml
 $EDITOR supervisor-agent.yaml   # adjust paths, enable/disable scripts as needed
 
+# Smoke-test the config: start everything, check it, stop (exit 0 or 1)
+bamboo-supervisor --config supervisor-agent.yaml --once
+
 # Start everything
 bamboo-supervisor --config supervisor-agent.yaml
 
-# Verify the config without starting anything
-bamboo-supervisor --config supervisor-agent.yaml --status
+# Is the running supervisor alive?  Reads its heartbeat file (exit 0 or 1)
+bamboo-supervisor --status
 ```
 
 Stop with **Ctrl-C** or `kill -TERM <pid>`.
 
-Full documentation: [README-supervisor-agent.md](./README-supervisor-agent.md)
+Full documentation: [README_supervisor_agent.md](./README_supervisor_agent.md)
 
 #### Run the ingestion script
 

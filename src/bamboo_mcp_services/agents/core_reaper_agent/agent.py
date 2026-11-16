@@ -37,6 +37,18 @@ MCP's own ``reconcile_state`` may still want a workspace whose worker died
 mid-download.  Worker liveness is tested by looking for ``/proc/<pid>``; no
 signal is ever sent, so Bamboo MCP's "leave processes alone" rule for this
 directory holds by construction rather than by argument.
+
+Deployment invariant: one PID namespace
+---------------------------------------
+Rule 4 is only meaningful when this process and Bamboo MCP's workers share a
+PID namespace.  ``worker_pid`` is a PID in Bamboo MCP's namespace; looked up in
+another one (a separate container), ``/proc/<pid>`` almost never exists, so a
+live worker reads as dead and rule 4 stops protecting it.  Run the reaper on
+the same host as Bamboo MCP with no PID isolation between them: for Docker,
+``--pid=host`` when Bamboo MCP runs on the host; in Kubernetes, both containers
+in one pod with ``shareProcessNamespace: true`` (decision S-23).  While the
+reaper only reports, a broken invariant produces wrong reports; it must hold
+before any deletion code exists.
 """
 from __future__ import annotations
 
@@ -450,8 +462,11 @@ def is_pid_alive(pid: Optional[int]) -> bool:
     falls back to ``os.kill(pid, 0)``, which sends no signal either but does
     consult process permissions.
 
-    PID reuse can only make this return True for a worker that is actually
-    gone, which makes the reaper more conservative, never less.
+    Within one PID namespace, PID reuse can only make this return True for a
+    worker that is actually gone, which makes the reaper more conservative.
+    Across namespaces the error goes the other way — a live worker reads as
+    dead — which is why the module requires a shared PID namespace (see the
+    module docstring).
 
     Args:
         pid: Process ID, or ``None``.

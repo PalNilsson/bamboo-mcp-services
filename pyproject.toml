@@ -8,7 +8,11 @@ version = "1.0.0"
 description = "Bamboo MCP Services"
 requires-python = ">=3.10"
 dependencies = [
-    "duckdb>=0.10",
+    # duckdb and chromadb write files that bamboo-mcp reads, so their on-disk
+    # formats must match the versions bamboo-mcp runs.  The exact pins live in
+    # requirements/runtime-py312.txt (S-21); these ranges stop an unpinned
+    # install from crossing a minor version by accident.
+    "duckdb>=1.5,<1.6",
     "requests>=2.31",
     "pyyaml>=6.0",
     "pandas>=2.0",
@@ -24,7 +28,7 @@ dependencies = [
     "langchain-huggingface>=1.2",
     "langchain-community>=0.4",
     # Agent dependencies
-    "chromadb>=0.4.0",
+    "chromadb>=1.5,<1.6",
     "pdfminer.six>=20221105",
     "python-docx>=0.8.11",
     # Dashboard agent
@@ -37,6 +41,9 @@ dev = [
     "flake8",
     "pytest",
     "pytest-cov",
+    # tests/test_packaging.py builds a wheel in-process; setuptools 70.1 is
+    # the first with bdist_wheel built in, so no separate "wheel" package.
+    "setuptools>=70.1",
 ]
 
 [tool.setuptools]
@@ -44,6 +51,17 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# Non-Python files the package reads at run time.  Without this table the
+# built wheel ships none of them, and only an editable install (which reads
+# the source tree) has them.  tests/test_packaging.py builds a wheel and
+# checks that every file listed here is in it.
+[tool.setuptools.package-data]
+bamboo_mcp_services = [
+    "resources/config/*.yaml",
+    "resources/config/*.json",
+    "agents/dashboard_agent/static/*.html",
+]
 
 [project.scripts]
 bamboo-document-monitor = "bamboo_mcp_services.agents.document_monitor_agent.cli:main"

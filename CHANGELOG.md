@@ -11,6 +11,53 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Added
 
+#### Container image (S-12 – S-24)
+
+`Dockerfile`, `.dockerignore`, `docker/build.sh`, `README-container.md`.  One
+image runs every agent under `bamboo-supervisor`: `python:3.12-slim-bookworm`,
+a venv, the CPU build of torch, `tini -s` as PID 1, and any UID in group 0.
+Paths are the same as on aipanda033, so the reference configuration is used
+unchanged.  The image installs exactly the runtime lock, `--no-deps`, then runs
+`pip check`.  It carries the embedding model, bit-identical to the snapshot
+that built the store, and checks it at build time.  The image has a
+`HEALTHCHECK`, records its provenance in `/opt/bamboo/build-info.json` and its
+labels, and `build.sh` always builds linux/amd64, including on an Apple
+Silicon Mac.  The README covers Stage A (the image on aipanda033 with bind
+mounts) and the constraints Stage B (Kubernetes) must meet.
+
+#### Runtime lock (S-21)
+
+`requirements/runtime-py312.txt` pins all 120 packages the installed project
+needs at run time, at the versions running on aipanda033.  It contains no
+development tools and no CUDA packages.  `scripts/make_runtime_lock.py`
+generates it from a `pip freeze`.  It resolves the wheel's dependency
+closure for Linux x86_64 / CPython 3.12 under those versions, so the result
+does not depend on the machine running the script, and regenerating from the
+same freeze reproduces the file byte for byte.  `pyproject.toml` and
+`requirements.txt` now allow only `duckdb>=1.5,<1.6` and `chromadb>=1.5,<1.6`
+(previously `>=0.10` and `>=0.4.0`, against latest releases of 2.0.0 and
+1.5.9).  Both write files bamboo-mcp reads, and bamboo-mcp runs 1.5.3 and 1.5.9.
+
+#### Supervisor heartbeat; `--status` reports on the running supervisor (S-18)
+
+The supervisor rewrites `--heartbeat-file` (default
+`supervisor-heartbeat.json`) atomically after every tick, with its health
+report.  A clean stop writes a final heartbeat in state `stopped`.
+`bamboo-supervisor --status` now reads that file and exits 0 when it is at
+most `--max-age` seconds old (default 120) and the supervisor is `running`,
+and 1 otherwise.  It reads no config and writes no log, so it can serve as a
+liveness probe.  Agent states are reported but never fail the check.  The
+supervisor restarts agents itself.
+
+#### `scripts/fetch_model.py`, `scripts/check_embedding_model.py` (S-15)
+
+`fetch_model.py` downloads exactly the files in a `sha256sum` manifest from
+the Hugging Face Hub, at a 40-character commit hash (never a branch).  It then
+fails on any missing, extra or changed file.  `check_embedding_model.py`
+loads a model directory offline.  It fails unless `modules.json` is present,
+the module chain is Transformer → Pooling → Normalize, and a probe sentence
+embeds to `(1, 384)` with unit norm.
+
 #### `common/fs.py`: atomic file writes (S-7)
 
 `atomic_write_text()` and `atomic_copy()` write to `.<name>.<random>.tmp` in the
@@ -128,6 +175,21 @@ the script is report-only.
 
 ### Changed
 
+#### Supervisor dependency waits no longer block the loop (finding 6)
+
+`depends_on_file` used to be waited for with `time.sleep` inside the supervisor
+loop, for up to `depends_timeout_s`.  Meanwhile no daemon was polled or
+restarted and no scheduled run was dispatched or reaped.  The wait is now a
+`DependencyWait` checked once per tick.  A daemon still waits only before its
+first launch, and a scheduled agent before each run while the file is missing.
+The health report names the file under `waiting_for`.  An agent now starts up
+to `health_poll_interval_s` after its file appears (previously 2 s).  `--once`
+keeps the old semantics.  It waits for dependent daemons before the settle
+period, and for dependent scheduled runs before reporting, without re-running
+an agent that is due again.  The bundled `supervisor-agent.yaml` no longer
+makes ingestion wait for `cric.duckdb`.  Ingestion reads the CVMFS JSON
+itself, so that dependency was never real.
+
 #### `bamboo-supervisor --once` is a pass/fail smoke test
 
 New `--once-settle-s` option (default 15).  Exit status 1 when a daemon is not
@@ -165,6 +227,24 @@ changeset and remain to be renamed separately.
 
 
 ### Fixed
+
+#### The wheel ships the bundled configs and the dashboard page (S-22)
+
+`pyproject.toml` declared no package data, so a non-editable install (the
+container image) had none of `resources/config/*` and no
+`dashboard_agent/static/index.html`; only editable installs, which read the
+source tree, worked.  `[tool.setuptools.package-data]` now lists them, and
+`tests/test_packaging.py` builds a wheel from a copy of the project and fails
+for any non-Python file under the package that the wheel lacks.
+
+#### core-reaper: the liveness rule needs a shared PID namespace (S-23)
+
+Documentation only.  Rule 4 looks up `/proc/<worker_pid>` in the reaper's own
+PID namespace.  From a separate container a *live* Bamboo MCP worker reads as
+dead — the opposite of the old claim that PID reuse could only make the reaper
+more conservative.  The module docstring and README now state the deployment
+invariant: `--pid=host` with Docker, `shareProcessNamespace: true` in
+Kubernetes.  The reaper still removes nothing.
 
 #### document-monitor: an incremental cycle replaced the collection with the changed files only (S-11)
 

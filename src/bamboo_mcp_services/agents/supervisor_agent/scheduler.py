@@ -36,14 +36,24 @@ Counting consecutive short runs — rather than exits inside a time window, as
 earlier versions did — is what lets back-off engage at the default 30 s poll
 interval: a window of 60 s can never hold more than two or three exits
 observed 30 s apart, so a threshold above that was never reached.
+
+Dependency waits
+----------------
+An agent with ``depends_on_file`` is not started until that file exists, or
+until ``depends_timeout_s`` has passed, after which it is started anyway.  The
+wait is a :class:`DependencyWait` checked once per supervisor tick; it never
+sleeps.  An earlier version blocked inside the supervisor loop for up to
+``depends_timeout_s``, and during that time no daemon was polled or restarted
+and no scheduled run was dispatched or reaped.
 """
 from __future__ import annotations
 
 import signal
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from enum import Enum
+from typing import Any, Callable, Optional
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -89,6 +99,80 @@ def describe_exit(returncode: Optional[int]) -> str:
     return f"exited with code {returncode}"
 
 
+# ── Dependency waits ──────────────────────────────────────────────────────────
+
+class DependencyStatus(str, Enum):
+    """Outcome of one :meth:`DependencyWait.check`.
+
+    ``READY``, ``FOUND`` and ``TIMED_OUT`` mean the agent may be started;
+    ``STARTED_WAITING`` and ``WAITING`` mean it may not, yet.
+    """
+
+    READY = "ready"
+    STARTED_WAITING = "started_waiting"
+    WAITING = "waiting"
+    FOUND = "found"
+    TIMED_OUT = "timed_out"
+
+    @property
+    def may_start(self) -> bool:
+        """Whether the agent may be started now."""
+        return self in (DependencyStatus.READY, DependencyStatus.FOUND, DependencyStatus.TIMED_OUT)
+
+
+@dataclass
+class DependencyWait:
+    """Non-blocking wait for an agent's ``depends_on_file``.
+
+    Attributes:
+        deadline: Monotonic time at which the current wait gives up, or
+            ``None`` when no wait is in progress.
+    """
+
+    deadline: Optional[float] = None
+
+    @property
+    def waiting(self) -> bool:
+        """Whether a wait is in progress."""
+        return self.deadline is not None
+
+    def check(
+        self,
+        path: Optional[str],
+        timeout_s: float,
+        now: float,
+        exists: Callable[[str], bool],
+    ) -> DependencyStatus:
+        """Check the dependency once, starting or ending a wait as needed.
+
+        Args:
+            path: The ``depends_on_file`` path, or ``None`` for no dependency.
+            timeout_s: How long a wait lasts before the agent starts anyway.
+            now: Current monotonic time.
+            exists: Predicate telling whether *path* exists (``os.path.exists``
+                in production).
+
+        Returns:
+            ``READY`` if there is no dependency or the file was already there;
+            ``STARTED_WAITING`` on the check that starts a wait; ``WAITING``
+            while it continues; ``FOUND`` when the file appears during a wait;
+            ``TIMED_OUT`` once ``now`` reaches the deadline without it.
+        """
+        if not path:
+            return DependencyStatus.READY
+        if exists(path):
+            was_waiting = self.deadline is not None
+            self.deadline = None
+            return DependencyStatus.FOUND if was_waiting else DependencyStatus.READY
+        if self.deadline is None:
+            self.deadline = now + timeout_s
+            return DependencyStatus.STARTED_WAITING
+        if now >= self.deadline:
+            self.deadline = None
+            return DependencyStatus.TIMED_OUT
+        return DependencyStatus.WAITING
+
+
 # ── Config dataclasses ─────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -103,8 +187,11 @@ class AgentConfig:
         interval_s: Seconds between scheduled one-shot runs (``mode=scheduled``
             only; ignored for daemon agents).
         depends_on_file: Optional filesystem path that must exist before this
-            agent is started.  Useful to express ordering dependencies, e.g.
-            waiting for ``cric.duckdb`` before starting the ingestion agent.
+            agent is started: before a daemon's first launch, and before every
+            dispatch of a scheduled agent.  The wait does not block the
+            supervisor (see :class:`DependencyWait`), and is checked once per
+            tick, so the agent starts up to ``health_poll_interval_s`` after
+            the file appears.
         depends_timeout_s: How long (seconds) to wait for ``depends_on_file``
             before starting the agent anyway with a warning.
         run_timeout_s: Maximum wall-clock time (seconds) allowed for a single
@@ -142,6 +229,10 @@ class DaemonState:
         started_at_utc: UTC timestamp of the most recent ``Popen`` call.
         started_monotonic: Monotonic time of the most recent launch, or
             ``None`` when no process is running.
+        dependency: Wait for ``config.depends_on_file`` before the first
+            launch.
+        dependency_cleared: ``True`` once the dependency no longer holds the
+            agent back.  Only the first launch waits; a restart never does.
     """
     config: AgentConfig
     pid: Optional[int] = None
@@ -151,6 +242,8 @@ class DaemonState:
     last_exit_code: Optional[int] = None
     started_at_utc: Optional[datetime] = None
     started_monotonic: Optional[float] = None
+    dependency: DependencyWait = field(default_factory=DependencyWait)
+    dependency_cleared: bool = False
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -236,6 +329,7 @@ class DaemonState:
             "next_restart_after": (
                 self.next_restart_after if self.next_restart_after > time.monotonic() else None
             ),
+            "waiting_for": self.config.depends_on_file if self.dependency.waiting else None,
         }
 
 
@@ -254,6 +348,8 @@ class ScheduledState:
         run_count: Total number of completed runs (successful or not).
         dispatched_monotonic: Monotonic time of the current run's dispatch,
             or ``None`` when no run is in progress.
+        dependency: Wait for ``config.depends_on_file``, checked before every
+            dispatch.
     """
     config: AgentConfig
     next_run: float = 0.0          # 0.0 ⇒ run immediately on first tick
@@ -262,6 +358,7 @@ class ScheduledState:
     running_pid: Optional[int] = None
     run_count: int = 0
     dispatched_monotonic: Optional[float] = None
+    dependency: DependencyWait = field(default_factory=DependencyWait)
 
     def record_dispatch(self, pid: int) -> None:
         """Record that a one-shot subprocess has been launched.
@@ -346,4 +443,5 @@ class ScheduledState:
             "last_exit_code": self.last_exit_code,
             "running_pid": self.running_pid,
             "run_count": self.run_count,
+            "waiting_for": self.config.depends_on_file if self.dependency.waiting else None,
         }

@@ -1,5 +1,5 @@
 # Core runtime dependencies
-duckdb>=0.10
+duckdb>=1.5,<1.6        # format shared with bamboo-mcp (S-21)
 requests>=2.31
 pyyaml>=6.0
 pandas>=2.0
@@ -15,7 +15,7 @@ langchain-huggingface>=1.2
 langchain-community>=0.4
 
 # Agent dependencies
-chromadb>=0.4.0
+chromadb>=1.5,<1.6      # format shared with bamboo-mcp (S-21)
 pdfminer.six>=20221105
 python-docx>=0.8.11
 
