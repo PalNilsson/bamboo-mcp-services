@@ -228,6 +228,16 @@ changeset and remain to be renamed separately.
 
 ### Fixed
 
+#### document-monitor: a stop during `--once` ended in a traceback and exit 1 (S-32)
+
+Found in the container smoke test.  The SIGTERM handler stops every watch
+pair's agent while one of them is mid-cycle, but the `--once` loop went on
+to call `tick()` on the next agent, now stopped, which raised `RuntimeError`.
+An orderly stop by the supervisor or `docker stop` was therefore reported as a
+failed run.  The `--once` loop now skips agents that are no longer running and
+logs each one, as the daemon loop already did.  No data was at risk: a cycle
+cut short never promotes its slot (S-11).
+
 #### The wheel ships the bundled configs and the dashboard page (S-22)
 
 `pyproject.toml` declared no package data, so a non-editable install (the

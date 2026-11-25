@@ -348,6 +348,11 @@ def _run_agents(agents: list[DocumentMonitorAgent], once: bool = False) -> None:
     are stopped.  In daemon mode the loop iterates over agents in round-robin
     order for as long as every agent is running.
 
+    Both modes tick only agents that are still running.  The SIGTERM handler
+    stops every agent while one of them is mid-tick; ``--once`` used to go on
+    to tick the next, stopped, agent, which raised ``RuntimeError`` and turned
+    an orderly stop into a traceback and exit status 1 (S-32).
+
     Agents are run sequentially (not in threads) to keep the implementation
     simple and to avoid locking complexity between agents that share the same
     ``--chroma-dir``.
@@ -364,6 +369,9 @@ def _run_agents(agents: list[DocumentMonitorAgent], once: bool = False) -> None:
                 "--once flag set: running a single poll cycle per watch pair then exiting."
             )
             for agent in agents:
+                if not _agent_is_running(agent):
+                    logger.info("Agent '%s' is not running; skipping its poll cycle.", agent.name)
+                    continue
                 agent.tick()
             return
         while all(_agent_is_running(a) for a in agents):

@@ -64,8 +64,14 @@ name under the `.hfcache` copy on aipanda033.
 
 ```bash
 docker/build.sh                      # linux/amd64, loaded into the local Docker
-IMAGE=registry.cern.ch/<project>/bamboo-mcp-services docker/build.sh --push
+IMAGE=registry.cern.ch/askpanda/bamboo-mcp-services docker/build.sh --push
 ```
+
+**On aipanda033, add `--network host`** (`build.sh` passes extra arguments
+to Docker). The host firewall rejects traffic from Docker's bridge network,
+DNS included: inside a bridge-networked container, queries to CERN's DNS
+servers come back "Connection refused", while the host network resolves
+normally.  The same applies to `docker run` below.
 
 `docker/build.sh` always builds for **linux/amd64**, because aipanda033 and the
 cluster nodes are x86_64. A plain `docker build` on an Apple Silicon Mac
@@ -82,7 +88,7 @@ The script needs three things:
 - `docker/model-manifest.sha256` must exist;
 - the build needs network access to PyPI, `download.pytorch.org` and
   `huggingface.co`;
-- pushing needs a project on registry.cern.ch (still to be decided).
+- pushing needs push rights in the registry.cern.ch project `askpanda`.
 
 Without a registry, copy the image directly:
 
@@ -110,8 +116,11 @@ versions in bamboo-mcp's environment. Both write files that bamboo-mcp reads.
 
 ### Prerequisites
 
-- **Docker access.** `atlpan` is not in the `docker` group, so the commands
-  below use `sudo`. The container processes still run as atlpan
+- **Docker access.** As root, aipanda033 has Docker Engine with buildx.
+  (`docker` in an ordinary user's shell may be Podman's Docker emulation,
+  rootless, with storage on AFS: do not build or run there.) `atlpan` is not
+  in the `docker` group, so the commands below use `sudo`, or run them from a
+  root shell. The container processes still run as atlpan
   (`--user 29817:1307`). Adding atlpan to the `docker` group would remove the
   need for `sudo`. Membership of that group is equivalent to root on the host,
   so decide that deliberately (on a Puppet-managed host it goes through
@@ -124,8 +133,9 @@ versions in bamboo-mcp's environment. Both write files that bamboo-mcp reads.
 ### Run
 
 ```bash
-IMAGE=registry.cern.ch/<project>/bamboo-mcp-services:<tag>
+IMAGE=registry.cern.ch/askpanda/bamboo-mcp-services:<tag>
 COMMON=(
+  --network host                        # the host firewall blocks bridge traffic
   --user 29817:1307 --group-add 0       # atlpan; group 0 for $HOME (S-17)
   --pid=host                            # core-reaper sees Bamboo MCP's PIDs (S-23)
   -v /data/bamboo:/data/bamboo          # same paths as on the host (S-12)
